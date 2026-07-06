@@ -8,8 +8,8 @@ use trust::auth::TokenMap;
 use trust::config::{Injection, InjectionScheme, Origin, TokenEntry, Upstream, UpstreamKind};
 use trust::proxy::ProxyService;
 use trust::router::Router;
-use trust::secrets::fake::FakeSecretProvider;
 use trust::secrets::SecretProvider;
+use trust::secrets::fake::FakeSecretProvider;
 
 /// Mock upstream: records the first request it receives, replies 200.
 fn start_mock_upstream() -> (u16, Arc<Mutex<Vec<String>>>) {
@@ -19,14 +19,16 @@ fn start_mock_upstream() -> (u16, Arc<Mutex<Vec<String>>>) {
     let sink = received.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
-            let mut stream = match stream { Ok(s) => s, Err(_) => continue };
+            let mut stream = match stream {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
             let mut buf = [0u8; 4096];
             let n = stream.read(&mut buf).unwrap_or(0);
             let req = String::from_utf8_lossy(&buf[..n]).to_string();
             sink.lock().unwrap().push(req);
-            let _ = stream.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
-            );
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
         }
     });
     (port, received)
@@ -72,7 +74,10 @@ fn api_egress_end_to_end() {
             sni: String::new(),
         },
         secret_ref: "ref/api".into(),
-        injection: Injection { header: "x-api-key".into(), scheme: InjectionScheme::Raw },
+        injection: Injection {
+            header: "x-api-key".into(),
+            scheme: InjectionScheme::Raw,
+        },
     });
 
     let router = Router::new(&[upstream]);
@@ -105,11 +110,17 @@ fn api_egress_end_to_end() {
     }
 
     // 404 unknown host.
-    assert_eq!(raw_request(proxy_port, "nope.test", Some("Bearer good")).0, 404);
+    assert_eq!(
+        raw_request(proxy_port, "nope.test", Some("Bearer good")).0,
+        404
+    );
     // 401 missing token.
     assert_eq!(raw_request(proxy_port, "api.test", None).0, 401);
     // 401 wrong token.
-    assert_eq!(raw_request(proxy_port, "api.test", Some("Bearer wrong")).0, 401);
+    assert_eq!(
+        raw_request(proxy_port, "api.test", Some("Bearer wrong")).0,
+        401
+    );
 
     // 200 happy path.
     let (status, _resp) = raw_request(proxy_port, "api.test", Some("Bearer good"));
@@ -121,9 +132,18 @@ fn api_egress_end_to_end() {
     let last = reqs.last().expect("upstream received a request");
     let lower = last.to_lowercase();
     // Secret injected...
-    assert!(lower.contains("x-api-key: injected-secret"), "missing injected secret: {last}");
+    assert!(
+        lower.contains("x-api-key: injected-secret"),
+        "missing injected secret: {last}"
+    );
     // ...and the client's proxy token stripped.
-    assert!(!lower.contains("bearer good"), "client token leaked upstream: {last}");
+    assert!(
+        !lower.contains("bearer good"),
+        "client token leaked upstream: {last}"
+    );
     // ...and Host rewritten to the real upstream.
-    assert!(lower.contains("host: 127.0.0.1"), "host not rewritten: {last}");
+    assert!(
+        lower.contains("host: 127.0.0.1"),
+        "host not rewritten: {last}"
+    );
 }

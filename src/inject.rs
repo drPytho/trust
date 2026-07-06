@@ -17,7 +17,10 @@ pub fn inject(
     let value = match injection.scheme {
         InjectionScheme::Bearer => format!("Bearer {secret}"),
         InjectionScheme::Basic => {
-            format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(secret.as_bytes()))
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(secret.as_bytes())
+            )
         }
         InjectionScheme::Raw => secret.to_string(),
     };
@@ -39,7 +42,10 @@ mod tests {
     #[test]
     fn raw_injects_verbatim() {
         let mut r = req();
-        let inj = Injection { header: "x-api-key".into(), scheme: InjectionScheme::Raw };
+        let inj = Injection {
+            header: "x-api-key".into(),
+            scheme: InjectionScheme::Raw,
+        };
         inject(&mut r, &inj, "sekret").unwrap();
         assert_eq!(r.headers.get("x-api-key").unwrap().as_bytes(), b"sekret");
     }
@@ -47,17 +53,29 @@ mod tests {
     #[test]
     fn bearer_prefixes() {
         let mut r = req();
-        let inj = Injection { header: "authorization".into(), scheme: InjectionScheme::Bearer };
+        let inj = Injection {
+            header: "authorization".into(),
+            scheme: InjectionScheme::Bearer,
+        };
         inject(&mut r, &inj, "sekret").unwrap();
-        assert_eq!(r.headers.get("authorization").unwrap().as_bytes(), b"Bearer sekret");
+        assert_eq!(
+            r.headers.get("authorization").unwrap().as_bytes(),
+            b"Bearer sekret"
+        );
     }
 
     #[test]
     fn basic_base64_encodes() {
         let mut r = req();
-        let inj = Injection { header: "authorization".into(), scheme: InjectionScheme::Basic };
+        let inj = Injection {
+            header: "authorization".into(),
+            scheme: InjectionScheme::Basic,
+        };
         inject(&mut r, &inj, "user:pass").unwrap();
         // base64("user:pass") == "dXNlcjpwYXNz"
-        assert_eq!(r.headers.get("authorization").unwrap().as_bytes(), b"Basic dXNlcjpwYXNz");
+        assert_eq!(
+            r.headers.get("authorization").unwrap().as_bytes(),
+            b"Basic dXNlcjpwYXNz"
+        );
     }
 }

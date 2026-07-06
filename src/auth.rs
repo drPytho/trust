@@ -66,14 +66,23 @@ mod tests {
 
     #[test]
     fn extracts_bearer() {
-        assert_eq!(extract_bearer(Some(b"Bearer client-abc")).unwrap(), "client-abc");
+        assert_eq!(
+            extract_bearer(Some(b"Bearer client-abc")).unwrap(),
+            "client-abc"
+        );
     }
 
     #[test]
     fn rejects_missing_and_malformed() {
         assert!(matches!(extract_bearer(None), Err(AuthError::Missing)));
-        assert!(matches!(extract_bearer(Some(b"Basic xxx")), Err(AuthError::Malformed)));
-        assert!(matches!(extract_bearer(Some(b"Bearer ")), Err(AuthError::Malformed)));
+        assert!(matches!(
+            extract_bearer(Some(b"Basic xxx")),
+            Err(AuthError::Malformed)
+        ));
+        assert!(matches!(
+            extract_bearer(Some(b"Bearer ")),
+            Err(AuthError::Malformed)
+        ));
     }
 
     #[test]

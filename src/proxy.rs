@@ -7,7 +7,7 @@ use pingora::upstreams::peer::HttpPeer;
 
 use crate::auth::TokenMap;
 use crate::config::Upstream;
-use crate::decision::{decide, Decision};
+use crate::decision::{Decision, decide};
 use crate::inject::inject;
 use crate::router::Router;
 use crate::secrets::{Secret, SecretProvider};
@@ -26,7 +26,11 @@ pub struct ProxyService {
 
 impl ProxyService {
     pub fn new(router: Router, tokens: TokenMap, secrets: Arc<dyn SecretProvider>) -> ProxyService {
-        ProxyService { router, tokens, secrets }
+        ProxyService {
+            router,
+            tokens,
+            secrets,
+        }
     }
 }
 
@@ -58,22 +62,23 @@ impl ProxyHttp for ProxyService {
                     .await?;
                 Ok(true)
             }
-            Decision::Forward(upstream) => {
-                match self.secrets.get(&upstream.secret_ref).await {
-                    Ok(secret) => {
-                        ctx.secret = Some(secret);
-                        ctx.upstream = Some(upstream);
-                        Ok(false)
-                    }
-                    Err(e) => {
-                        log::error!("secret fetch failed for {}: {e}", upstream.name);
-                        session
-                            .respond_error_with_body(502, Bytes::from_static(b"upstream secret unavailable"))
-                            .await?;
-                        Ok(true)
-                    }
+            Decision::Forward(upstream) => match self.secrets.get(&upstream.secret_ref).await {
+                Ok(secret) => {
+                    ctx.secret = Some(secret);
+                    ctx.upstream = Some(upstream);
+                    Ok(false)
                 }
-            }
+                Err(e) => {
+                    log::error!("secret fetch failed for {}: {e}", upstream.name);
+                    session
+                        .respond_error_with_body(
+                            502,
+                            Bytes::from_static(b"upstream secret unavailable"),
+                        )
+                        .await?;
+                    Ok(true)
+                }
+            },
         }
     }
 

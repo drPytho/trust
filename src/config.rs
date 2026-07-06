@@ -129,7 +129,12 @@ fn parse_origin(raw: &str) -> Result<Origin, ConfigError> {
         .to_string();
     let port = url.port().unwrap_or(if tls { 443 } else { 80 });
     let sni = host.clone();
-    Ok(Origin { host, port, tls, sni })
+    Ok(Origin {
+        host,
+        port,
+        tls,
+        sni,
+    })
 }
 
 impl Config {
@@ -138,6 +143,7 @@ impl Config {
         Config::from_str(&text)
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(toml_text: &str) -> Result<Config, ConfigError> {
         let raw: RawConfig = toml::from_str(toml_text)?;
 
@@ -221,7 +227,8 @@ injection = { header = "x-api-key", scheme = "raw" }
 
     #[test]
     fn rejects_duplicate_upstream_name() {
-        let dup = GOOD.to_string() + r#"
+        let dup = GOOD.to_string()
+            + r#"
 [[upstreams]]
 name = "anthropic"
 kind = "api"
@@ -230,18 +237,30 @@ origin = "https://api.anthropic.com"
 secret_ref = "projects/p/secrets/x/versions/latest"
 injection = { header = "x-api-key", scheme = "raw" }
 "#;
-        assert!(matches!(Config::from_str(&dup), Err(ConfigError::DuplicateUpstream(_))));
+        assert!(matches!(
+            Config::from_str(&dup),
+            Err(ConfigError::DuplicateUpstream(_))
+        ));
     }
 
     #[test]
     fn rejects_token_referencing_unknown_upstream() {
-        let bad = GOOD.replace(r#"allowed_upstreams = ["anthropic"]"#, r#"allowed_upstreams = ["ghost"]"#);
-        assert!(matches!(Config::from_str(&bad), Err(ConfigError::UnknownUpstreamRef { .. })));
+        let bad = GOOD.replace(
+            r#"allowed_upstreams = ["anthropic"]"#,
+            r#"allowed_upstreams = ["ghost"]"#,
+        );
+        assert!(matches!(
+            Config::from_str(&bad),
+            Err(ConfigError::UnknownUpstreamRef { .. })
+        ));
     }
 
     #[test]
     fn rejects_non_http_origin() {
         let bad = GOOD.replace("https://api.anthropic.com", "ftp://api.anthropic.com");
-        assert!(matches!(Config::from_str(&bad), Err(ConfigError::BadOrigin { .. })));
+        assert!(matches!(
+            Config::from_str(&bad),
+            Err(ConfigError::BadOrigin { .. })
+        ));
     }
 }

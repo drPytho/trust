@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::auth::{extract_bearer, Principal, TokenMap};
+use crate::auth::{Principal, TokenMap, extract_bearer};
 use crate::config::Upstream;
 use crate::router::Router;
 
@@ -21,20 +21,37 @@ pub fn decide(
     tokens: &TokenMap,
 ) -> Decision {
     let Some(host) = host else {
-        return Decision::Reject { status: 404, body: "unknown host" };
+        return Decision::Reject {
+            status: 404,
+            body: "unknown host",
+        };
     };
     let Some(upstream) = router.resolve(host) else {
-        return Decision::Reject { status: 404, body: "unknown host" };
+        return Decision::Reject {
+            status: 404,
+            body: "unknown host",
+        };
     };
     let token = match extract_bearer(auth) {
         Ok(t) => t,
-        Err(_) => return Decision::Reject { status: 401, body: "missing or invalid token" },
+        Err(_) => {
+            return Decision::Reject {
+                status: 401,
+                body: "missing or invalid token",
+            };
+        }
     };
     let Some(principal) = tokens.lookup(&token) else {
-        return Decision::Reject { status: 401, body: "missing or invalid token" };
+        return Decision::Reject {
+            status: 401,
+            body: "missing or invalid token",
+        };
     };
     if !authorize(&principal, &upstream) {
-        return Decision::Reject { status: 403, body: "not allowed for this upstream" };
+        return Decision::Reject {
+            status: 403,
+            body: "not allowed for this upstream",
+        };
     }
     Decision::Forward(upstream)
 }
@@ -52,9 +69,17 @@ mod tests {
             name: name.into(),
             kind: UpstreamKind::Api,
             listen_host: host.into(),
-            origin: Origin { host: "example.com".into(), port: 443, tls: true, sni: "example.com".into() },
+            origin: Origin {
+                host: "example.com".into(),
+                port: 443,
+                tls: true,
+                sni: "example.com".into(),
+            },
             secret_ref: "ref".into(),
-            injection: Injection { header: "x-api-key".into(), scheme: InjectionScheme::Raw },
+            injection: Injection {
+                header: "x-api-key".into(),
+                scheme: InjectionScheme::Raw,
+            },
         })
     }
 
@@ -71,15 +96,32 @@ mod tests {
     #[test]
     fn unknown_host_404() {
         let (r, t) = setup();
-        assert!(matches!(decide(Some("nope"), Some(b"Bearer good"), &r, &t), Decision::Reject { status: 404, .. }));
-        assert!(matches!(decide(None, Some(b"Bearer good"), &r, &t), Decision::Reject { status: 404, .. }));
+        assert!(matches!(
+            decide(Some("nope"), Some(b"Bearer good"), &r, &t),
+            Decision::Reject { status: 404, .. }
+        ));
+        assert!(matches!(
+            decide(None, Some(b"Bearer good"), &r, &t),
+            Decision::Reject { status: 404, .. }
+        ));
     }
 
     #[test]
     fn bad_token_401() {
         let (r, t) = setup();
-        assert!(matches!(decide(Some("anthropic.proxy.internal"), None, &r, &t), Decision::Reject { status: 401, .. }));
-        assert!(matches!(decide(Some("anthropic.proxy.internal"), Some(b"Bearer wrong"), &r, &t), Decision::Reject { status: 401, .. }));
+        assert!(matches!(
+            decide(Some("anthropic.proxy.internal"), None, &r, &t),
+            Decision::Reject { status: 401, .. }
+        ));
+        assert!(matches!(
+            decide(
+                Some("anthropic.proxy.internal"),
+                Some(b"Bearer wrong"),
+                &r,
+                &t
+            ),
+            Decision::Reject { status: 401, .. }
+        ));
     }
 
     #[test]
@@ -91,13 +133,26 @@ mod tests {
             allowed_upstreams: vec![], // allowed to nothing
         }]);
         let r = Router::new(&ups);
-        assert!(matches!(decide(Some("anthropic.proxy.internal"), Some(b"Bearer good"), &r, &tokens), Decision::Reject { status: 403, .. }));
+        assert!(matches!(
+            decide(
+                Some("anthropic.proxy.internal"),
+                Some(b"Bearer good"),
+                &r,
+                &tokens
+            ),
+            Decision::Reject { status: 403, .. }
+        ));
     }
 
     #[test]
     fn happy_path_forwards() {
         let (r, t) = setup();
-        match decide(Some("anthropic.proxy.internal"), Some(b"Bearer good"), &r, &t) {
+        match decide(
+            Some("anthropic.proxy.internal"),
+            Some(b"Bearer good"),
+            &r,
+            &t,
+        ) {
             Decision::Forward(u) => assert_eq!(u.name, "anthropic"),
             other => panic!("expected forward, got {other:?}"),
         }

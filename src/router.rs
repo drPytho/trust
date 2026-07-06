@@ -33,17 +33,31 @@ mod tests {
             name: name.into(),
             kind: UpstreamKind::Api,
             listen_host: host.into(),
-            origin: Origin { host: "example.com".into(), port: 443, tls: true, sni: "example.com".into() },
+            origin: Origin {
+                host: "example.com".into(),
+                port: 443,
+                tls: true,
+                sni: "example.com".into(),
+            },
             secret_ref: "ref".into(),
-            injection: Injection { header: "x-api-key".into(), scheme: InjectionScheme::Raw },
+            injection: Injection {
+                header: "x-api-key".into(),
+                scheme: InjectionScheme::Raw,
+            },
         })
     }
 
     #[test]
     fn resolves_by_host_ignoring_port() {
         let r = Router::new(&[up("anthropic", "anthropic.proxy.internal")]);
-        assert_eq!(r.resolve("anthropic.proxy.internal").unwrap().name, "anthropic");
-        assert_eq!(r.resolve("anthropic.proxy.internal:8443").unwrap().name, "anthropic");
+        assert_eq!(
+            r.resolve("anthropic.proxy.internal").unwrap().name,
+            "anthropic"
+        );
+        assert_eq!(
+            r.resolve("anthropic.proxy.internal:8443").unwrap().name,
+            "anthropic"
+        );
         assert!(r.resolve("unknown.host").is_none());
     }
 }

@@ -57,10 +57,10 @@ impl SecretProvider for CachingSecretProvider {
     async fn get(&self, secret_ref: &str) -> Result<Secret, SecretError> {
         {
             let cache = self.cache.lock().unwrap();
-            if let Some((secret, at)) = cache.get(secret_ref) {
-                if at.elapsed() < self.ttl {
-                    return Ok(secret.clone());
-                }
+            if let Some((secret, at)) = cache.get(secret_ref)
+                && at.elapsed() < self.ttl
+            {
+                return Ok(secret.clone());
             }
         }
         let secret = self.inner.get(secret_ref).await?;
@@ -88,7 +88,10 @@ mod tests {
         let s = p.get("ref/a").await.unwrap();
         assert_eq!(s.expose(), "hunter2");
         assert_eq!(p.calls(), 1);
-        assert!(matches!(p.get("missing").await, Err(SecretError::NotFound(_))));
+        assert!(matches!(
+            p.get("missing").await,
+            Err(SecretError::NotFound(_))
+        ));
     }
 
     #[tokio::test]
