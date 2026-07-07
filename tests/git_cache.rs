@@ -71,6 +71,7 @@ fn git(args: &[&str], cwd: &Path, envs: &[(&str, &str)]) -> String {
     cmd.args(args)
         .current_dir(cwd)
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CREDENTIAL_HELPER", "")
         .env("HOME", "/tmp"); // avoid picking up user git config
     for (k, v) in envs {
         cmd.env(k, v);
@@ -93,12 +94,32 @@ fn git_status(args: &[&str], cwd: &Path, envs: &[(&str, &str)]) -> i32 {
     cmd.args(args)
         .current_dir(cwd)
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CREDENTIAL_HELPER", "")
         .env("HOME", "/tmp");
     for (k, v) in envs {
         cmd.env(k, v);
     }
     let out = cmd.output().unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
     out.status.code().unwrap_or(1)
+}
+
+/// Like `git_status()` but also returns stderr as a String for assertion.
+fn git_status_with_stderr(args: &[&str], cwd: &Path, envs: &[(&str, &str)]) -> (i32, String) {
+    let mut cmd = Command::new("git");
+    cmd.args(args)
+        .current_dir(cwd)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CREDENTIAL_HELPER", "")
+        .env("HOME", "/tmp");
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
+    let code = out.status.code().unwrap_or(1);
+    let mut output = String::from_utf8_lossy(&out.stderr).into_owned();
+    output.push_str("\n--- STDOUT ---\n");
+    output.push_str(&String::from_utf8_lossy(&out.stdout));
+    (code, output)
 }
 
 // ---------------------------------------------------------------------------
@@ -542,13 +563,17 @@ fn git_cache_end_to_end() {
     // ---- ASSERTION 4a: No JWT → 401 ----
     {
         let no_auth_dir = tmp_path.join("no_auth_clone");
-        let code = git_status(
-            &["clone", &proxy_url, no_auth_dir.to_str().unwrap()],
+        let (code, stderr) = git_status_with_stderr(
+            &["-c", "credential.helper=", "clone", &proxy_url, no_auth_dir.to_str().unwrap()],
             tmp_path,
             &[],
         );
         assert_ne!(code, 0, "clone without JWT should fail");
-        println!("401 check (no JWT): git exited {code} ✓");
+        assert!(
+            stderr.contains("could not read Username"),
+            "clone without JWT should trigger 401 auth challenge; actual stderr:\n{stderr}"
+        );
+        println!("401 check (no JWT): git exited {code} with auth challenge ✓");
     }
 
     // ---- ASSERTION 4b: Out-of-scope repo → 403 ----
@@ -556,8 +581,9 @@ fn git_cache_end_to_end() {
     {
         let oos_dir = tmp_path.join("oos_clone");
         let auth_header = format!("Authorization: Bearer {good_jwt}");
-        let code = git_status(
+        let (code, stderr) = git_status_with_stderr(
             &[
+                "-c", "credential.helper=",
                 "-c", &format!("http.extraHeader={auth_header}"),
                 "clone", &other_url, oos_dir.to_str().unwrap(),
             ],
@@ -565,7 +591,11 @@ fn git_cache_end_to_end() {
             &[],
         );
         assert_ne!(code, 0, "clone of out-of-scope repo should fail");
-        println!("403 check (wrong scope): git exited {code} ✓");
+        assert!(
+            stderr.contains("403"),
+            "clone of out-of-scope repo should return 403; actual stderr:\n{stderr}"
+        );
+        println!("403 check (wrong scope): git exited {code} with 403 ✓");
     }
 
     // ---- ASSERTION 1: Clone through proxy succeeds + multi-chunk validation ----
