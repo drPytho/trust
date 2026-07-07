@@ -22,6 +22,8 @@ pub enum ConfigError {
     BadDuration { value: String },
     #[error("invalid scope in issuance policy: {scope}")]
     BadScope { scope: String },
+    #[error("issuance requires a [tls] section (server cert/key)")]
+    MissingTls,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -238,6 +240,11 @@ impl Config {
             }
         }
 
+        // [tls] is required because issuance reuses it for the mTLS server cert/key.
+        if raw.tls.is_none() {
+            return Err(ConfigError::MissingTls);
+        }
+
         let auth = AuthConfig {
             issuer: raw.auth.issuer,
             audience: raw.auth.audience,
@@ -266,6 +273,11 @@ mod tests {
     const GOOD: &str = r#"
 [listen]
 tcp = "0.0.0.0:6191"
+
+[tls]
+addr = "0.0.0.0:6443"
+cert_path = "/etc/trust/server.crt"
+key_path = "/etc/trust/server.key"
 
 [auth]
 issuer = "https://trust.pit.internal/"
@@ -357,6 +369,19 @@ injection = { header = "x-api-key", scheme = "raw" }
         assert!(matches!(
             Config::from_str(&dup),
             Err(ConfigError::DuplicateUpstream(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_missing_tls() {
+        let no_tls = GOOD
+            .replace(
+                "[tls]\naddr = \"0.0.0.0:6443\"\ncert_path = \"/etc/trust/server.crt\"\nkey_path = \"/etc/trust/server.key\"\n\n",
+                "",
+            );
+        assert!(matches!(
+            Config::from_str(&no_tls),
+            Err(ConfigError::MissingTls)
         ));
     }
 }

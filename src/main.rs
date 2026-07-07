@@ -38,14 +38,46 @@ fn main() {
             rt.block_on(async move {
                 install_crypto_provider();
 
+                // 1. Load signing key and store it.
                 let key_provider: Arc<dyn SecretProvider> = Arc::new(GcpSecretProvider::new());
                 let km = fetch(key_provider.as_ref(), &config.auth.signing)
                     .await
                     .expect("failed to load signing key");
                 keystore.store(km);
+
+                // 2. All fallible issuance setup before signalling ready.
+                let tls_cfg = config.tls.as_ref().expect("validated present");
+                let server_cert = std::fs::read_to_string(&tls_cfg.cert_path)
+                    .expect("issuance needs a server cert (reuse [tls] cert/key)");
+                let server_key = std::fs::read_to_string(&tls_cfg.key_path)
+                    .expect("issuance needs a server key");
+                let client_ca = std::fs::read_to_string(&config.issuance.client_ca_path)
+                    .expect("read client CA");
+                let mtls_cfg = build_mtls_server_config(&server_cert, &server_key, &client_ca)
+                    .expect("mtls server config");
+
+                let token_addr: std::net::SocketAddr =
+                    config.issuance.mtls_addr.parse().expect("mtls_addr");
+                let jwks_addr: std::net::SocketAddr =
+                    config.issuance.jwks_addr.parse().expect("jwks_addr");
+
+                let issuer = Issuer::new(
+                    config.auth.issuer.clone(),
+                    config.auth.audience.clone(),
+                    config.auth.signing.token_ttl,
+                );
+                let policy = ClientPolicy::new(&config.issuance.clients)
+                    .expect("invalid issuance client policy");
+                let state = Arc::new(IssuanceState {
+                    keystore: keystore.clone(),
+                    issuer,
+                    policy,
+                });
+
+                // 3. Signal ready only after all setup succeeds.
                 ready_tx.send(()).expect("signal ready");
 
-                // Background key refresh (rotation) every 10 minutes.
+                // 4. Background key refresh (rotation) every 10 minutes.
                 {
                     let keystore = keystore.clone();
                     let provider = key_provider.clone();
@@ -62,51 +94,16 @@ fn main() {
                     });
                 }
 
-                let issuer = Issuer::new(
-                    config.auth.issuer.clone(),
-                    config.auth.audience.clone(),
-                    config.auth.signing.token_ttl,
-                );
-                let policy = ClientPolicy::new(&config.issuance.clients)
-                    .expect("invalid issuance client policy");
-                let state = Arc::new(IssuanceState {
-                    keystore: keystore.clone(),
-                    issuer,
-                    policy,
-                });
-
-                let server_cert = std::fs::read_to_string(
-                    config
-                        .tls
-                        .as_ref()
-                        .map(|t| t.cert_path.as_str())
-                        .unwrap_or(""),
-                )
-                .expect("issuance needs a server cert (reuse [tls] cert/key)");
-                let server_key = std::fs::read_to_string(
-                    config
-                        .tls
-                        .as_ref()
-                        .map(|t| t.key_path.as_str())
-                        .unwrap_or(""),
-                )
-                .expect("issuance needs a server key");
-                let client_ca = std::fs::read_to_string(&config.issuance.client_ca_path)
-                    .expect("read client CA");
-                let tls = build_mtls_server_config(&server_cert, &server_key, &client_ca)
-                    .expect("mtls server config");
-
-                let token_addr = config.issuance.mtls_addr.parse().expect("mtls_addr");
-                let jwks_addr = config.issuance.jwks_addr.parse().expect("jwks_addr");
+                // 5. Serve; if either listener exits the process must stop.
                 let jwks_ks = keystore.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = serve_jwks(jwks_addr, jwks_ks).await {
-                        log::error!("jwks server exited: {e}");
-                    }
+                    let result = serve_jwks(jwks_addr, jwks_ks).await;
+                    log::error!("jwks server exited: {result:?}");
+                    std::process::exit(1);
                 });
-                if let Err(e) = serve_token(token_addr, tls, state).await {
-                    log::error!("token server exited: {e}");
-                }
+                let result = serve_token(token_addr, mtls_cfg, state).await;
+                log::error!("token server exited: {result:?}");
+                std::process::exit(1);
             });
         });
     }
