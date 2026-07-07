@@ -1,5 +1,6 @@
 pub mod config;
 pub mod decision;
+pub mod git;
 pub mod inject;
 pub mod issuance;
 pub mod jwt;
