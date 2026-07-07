@@ -44,6 +44,7 @@ mod tests {
                 scheme: InjectionScheme::Bearer,
             },
             resource,
+            git: None,
         })
     }
 

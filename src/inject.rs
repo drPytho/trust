@@ -9,11 +9,10 @@ pub enum InjectError {
     InvalidValue,
 }
 
-pub fn inject(
-    req: &mut RequestHeader,
+pub fn injection_value(
     injection: &Injection,
     secret: &str,
-) -> Result<(), InjectError> {
+) -> Result<String, InjectError> {
     let value = match injection.scheme {
         InjectionScheme::Bearer => format!("Bearer {secret}"),
         InjectionScheme::Basic => {
@@ -24,6 +23,15 @@ pub fn inject(
         }
         InjectionScheme::Raw => secret.to_string(),
     };
+    Ok(value)
+}
+
+pub fn inject(
+    req: &mut RequestHeader,
+    injection: &Injection,
+    secret: &str,
+) -> Result<(), InjectError> {
+    let value = injection_value(injection, secret)?;
     req.insert_header(injection.header.clone(), value)
         .map_err(|_| InjectError::InvalidValue)?;
     Ok(())
@@ -77,5 +85,35 @@ mod tests {
             r.headers.get("authorization").unwrap().as_bytes(),
             b"Basic dXNlcjpwYXNz"
         );
+    }
+
+    #[test]
+    fn injection_value_bearer() {
+        let inj = Injection {
+            header: "authorization".into(),
+            scheme: InjectionScheme::Bearer,
+        };
+        let val = injection_value(&inj, "x").unwrap();
+        assert_eq!(val, "Bearer x");
+    }
+
+    #[test]
+    fn injection_value_basic() {
+        let inj = Injection {
+            header: "authorization".into(),
+            scheme: InjectionScheme::Basic,
+        };
+        let val = injection_value(&inj, "user:pass").unwrap();
+        assert_eq!(val, "Basic dXNlcjpwYXNz");
+    }
+
+    #[test]
+    fn injection_value_raw() {
+        let inj = Injection {
+            header: "x-api-key".into(),
+            scheme: InjectionScheme::Raw,
+        };
+        let val = injection_value(&inj, "x").unwrap();
+        assert_eq!(val, "x");
     }
 }

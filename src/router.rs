@@ -45,6 +45,7 @@ mod tests {
                 scheme: InjectionScheme::Raw,
             },
             resource: None,
+            git: None,
         })
     }
 

@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use pingora::prelude::*;
 use trust::config::{Injection, InjectionScheme, Origin, Upstream, UpstreamKind};
+use trust::git::mirror::MirrorStore;
+use trust::git::sync::SyncManager;
 use trust::jwt::{Issuer, Verifier};
 use trust::keystore::{Keystore, build_key_material};
 use trust::proxy::ProxyService;
@@ -87,6 +89,7 @@ fn scoped_upstream(mock_port: u16) -> Arc<Upstream> {
             scheme: InjectionScheme::Bearer,
         },
         resource: Some(ResourceKind::GithubRepo),
+        git: None,
     })
 }
 
@@ -117,7 +120,10 @@ fn jwt_scoped_egress_end_to_end() {
     let verifier = Verifier::new("trust".into(), "trust-proxy".into());
     let secrets: Arc<dyn SecretProvider> =
         Arc::new(FakeSecretProvider::new(&[("ref/gh", "INJECTED-TOKEN")]));
-    let service = ProxyService::new(router, verifier, keystore, secrets);
+    // The JWT egress test doesn't exercise git-cache; /tmp is a valid placeholder.
+    let mirrors = Arc::new(MirrorStore::new("/tmp"));
+    let sync = Arc::new(SyncManager::new());
+    let service = ProxyService::new(router, verifier, keystore, secrets, mirrors, sync);
 
     let proxy_port = free_port();
     let addr = format!("127.0.0.1:{proxy_port}");

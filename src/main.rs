@@ -5,7 +5,9 @@ use std::time::Duration;
 use pingora::listeners::tls::TlsSettings;
 use pingora::prelude::*;
 
-use trust::config::Config;
+use trust::config::{Config, UpstreamKind};
+use trust::git::mirror::MirrorStore;
+use trust::git::sync::SyncManager;
 use trust::issuance::policy::ClientPolicy;
 use trust::issuance::server::{
     IssuanceState, build_mtls_server_config, install_crypto_provider, serve_jwks, serve_token,
@@ -119,7 +121,23 @@ fn main() {
         Arc::new(GcpSecretProvider::new()),
         Duration::from_secs(300),
     ));
-    let service = ProxyService::new(router, verifier, keystore, proxy_secrets);
+
+    // Use the storage_path from the first git-cache upstream that has a git block.
+    // A single MirrorStore root is sufficient: MirrorStore.path_for already
+    // namespaces by <upstream>/<owner>/<repo>.git, so all git-cache upstreams
+    // can share one root. If no git-cache upstream is present at runtime,
+    // MirrorStore is constructed anyway (with a fallback path) but never used.
+    let mirror_root = config
+        .upstreams
+        .iter()
+        .find(|u| u.kind == UpstreamKind::GitCache)
+        .and_then(|u| u.git.as_ref())
+        .map(|g| g.storage_path.clone())
+        .unwrap_or_else(|| "/var/cache/trust/mirrors".to_string());
+    let mirrors = Arc::new(MirrorStore::new(mirror_root));
+    let sync = Arc::new(SyncManager::new());
+
+    let service = ProxyService::new(router, verifier, keystore, proxy_secrets, mirrors, sync);
 
     let mut server = Server::new(None).expect("failed to create server");
     server.bootstrap();

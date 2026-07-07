@@ -24,12 +24,24 @@ pub enum ConfigError {
     BadScope { scope: String },
     #[error("issuance requires a [tls] section (server cert/key)")]
     MissingTls,
+    #[error("git-cache upstream '{0}' is missing a [git] block (storage_path required)")]
+    MissingGitBlock(String),
+    #[error("git-cache upstream '{0}' must have resource = {{ kind = \"git-repo\" }}")]
+    GitCacheNeedsGitRepoResource(String),
+    #[error("api upstream '{0}' must not have a [git] block")]
+    UnexpectedGitBlock(String),
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum UpstreamKind {
     Api,
+    GitCache,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitConfig {
+    pub storage_path: String,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -63,6 +75,7 @@ pub struct Upstream {
     pub secret_ref: String,
     pub injection: Injection,
     pub resource: Option<ResourceKind>,
+    pub git: Option<GitConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -140,6 +153,8 @@ struct RawUpstream {
     injection: Injection,
     #[serde(default)]
     resource: Option<RawResource>,
+    #[serde(default)]
+    git: Option<GitConfig>,
 }
 
 #[derive(Deserialize)]
@@ -214,6 +229,24 @@ impl Config {
                 return Err(ConfigError::DuplicateListenHost(ru.listen_host));
             }
             let origin = parse_origin(&ru.origin)?;
+
+            // Validate git-cache-specific rules.
+            match ru.kind {
+                UpstreamKind::GitCache => {
+                    if ru.git.is_none() {
+                        return Err(ConfigError::MissingGitBlock(ru.name));
+                    }
+                    if !matches!(ru.resource, Some(RawResource { kind: ResourceKind::GitRepo })) {
+                        return Err(ConfigError::GitCacheNeedsGitRepoResource(ru.name));
+                    }
+                }
+                UpstreamKind::Api => {
+                    if ru.git.is_some() {
+                        return Err(ConfigError::UnexpectedGitBlock(ru.name));
+                    }
+                }
+            }
+
             upstreams.push(Arc::new(Upstream {
                 name: ru.name,
                 kind: ru.kind,
@@ -222,6 +255,7 @@ impl Config {
                 secret_ref: ru.secret_ref,
                 injection: ru.injection,
                 resource: ru.resource.map(|r| r.kind),
+                git: ru.git,
             }));
         }
 
@@ -382,6 +416,104 @@ injection = { header = "x-api-key", scheme = "raw" }
         assert!(matches!(
             Config::from_str(&no_tls),
             Err(ConfigError::MissingTls)
+        ));
+    }
+
+    // ── git-cache upstream tests ─────────────────────────────────────────────
+
+    const GIT_CACHE_UPSTREAM: &str = r#"
+[[upstreams]]
+name = "git-mirror"
+kind = "git-cache"
+listen_host = "git.proxy.internal"
+origin = "https://github.com"
+secret_ref = "projects/p/secrets/git/versions/latest"
+injection = { header = "authorization", scheme = "bearer" }
+resource = { kind = "git-repo" }
+git = { storage_path = "/m" }
+"#;
+
+    #[test]
+    fn git_cache_upstream_parses() {
+        let toml = GOOD.to_string() + GIT_CACHE_UPSTREAM;
+        let cfg = Config::from_str(&toml).unwrap();
+        let up = cfg.upstreams.iter().find(|u| u.name == "git-mirror").unwrap();
+        assert_eq!(up.kind, UpstreamKind::GitCache);
+        let git = up.git.as_ref().expect("git block should be Some");
+        assert_eq!(git.storage_path, "/m");
+    }
+
+    #[test]
+    fn git_cache_without_git_block_errors() {
+        let upstream_no_git = r#"
+[[upstreams]]
+name = "git-mirror"
+kind = "git-cache"
+listen_host = "git.proxy.internal"
+origin = "https://github.com"
+secret_ref = "projects/p/secrets/git/versions/latest"
+injection = { header = "authorization", scheme = "bearer" }
+resource = { kind = "git-repo" }
+"#;
+        let toml = GOOD.to_string() + upstream_no_git;
+        assert!(matches!(
+            Config::from_str(&toml),
+            Err(ConfigError::MissingGitBlock(_))
+        ));
+    }
+
+    #[test]
+    fn git_cache_without_git_repo_resource_errors() {
+        let upstream_no_resource = r#"
+[[upstreams]]
+name = "git-mirror"
+kind = "git-cache"
+listen_host = "git.proxy.internal"
+origin = "https://github.com"
+secret_ref = "projects/p/secrets/git/versions/latest"
+injection = { header = "authorization", scheme = "bearer" }
+git = { storage_path = "/m" }
+"#;
+        let toml = GOOD.to_string() + upstream_no_resource;
+        assert!(matches!(
+            Config::from_str(&toml),
+            Err(ConfigError::GitCacheNeedsGitRepoResource(_))
+        ));
+
+        let upstream_wrong_resource = r#"
+[[upstreams]]
+name = "git-mirror"
+kind = "git-cache"
+listen_host = "git.proxy.internal"
+origin = "https://github.com"
+secret_ref = "projects/p/secrets/git/versions/latest"
+injection = { header = "authorization", scheme = "bearer" }
+resource = { kind = "github-repo" }
+git = { storage_path = "/m" }
+"#;
+        let toml2 = GOOD.to_string() + upstream_wrong_resource;
+        assert!(matches!(
+            Config::from_str(&toml2),
+            Err(ConfigError::GitCacheNeedsGitRepoResource(_))
+        ));
+    }
+
+    #[test]
+    fn api_upstream_with_git_block_errors() {
+        let upstream_api_git = r#"
+[[upstreams]]
+name = "extra-api"
+kind = "api"
+listen_host = "extra.proxy.internal"
+origin = "https://api.example.com"
+secret_ref = "projects/p/secrets/extra/versions/latest"
+injection = { header = "authorization", scheme = "bearer" }
+git = { storage_path = "/m" }
+"#;
+        let toml = GOOD.to_string() + upstream_api_git;
+        assert!(matches!(
+            Config::from_str(&toml),
+            Err(ConfigError::UnexpectedGitBlock(_))
         ));
     }
 }
