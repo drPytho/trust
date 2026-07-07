@@ -2,6 +2,7 @@ pub mod auth;
 pub mod config;
 pub mod decision;
 pub mod inject;
+pub mod issuance;
 pub mod jwt;
 pub mod keystore;
 pub mod proxy;
