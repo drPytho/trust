@@ -27,6 +27,32 @@ type FetchFn = Arc<
 >;
 
 // ---------------------------------------------------------------------------
+// In-flight entry
+// ---------------------------------------------------------------------------
+
+/// Shared state for a single in-flight fetch.
+///
+/// - `lock`: async mutex held by the leader for the duration of the fetch;
+///   waiters block on acquiring it.
+/// - `outcome`: written by the leader (before releasing `lock`) to convey
+///   success or failure to waiters.  `None` while the fetch is still running.
+struct InFlight {
+    lock: AsyncMutex<()>,
+    /// Stores `Some(Ok(()))` or `Some(Err(<display string>))` after the leader
+    /// finishes.  Protected by std Mutex so it can be set without an `.await`.
+    outcome: Mutex<Option<Result<(), String>>>,
+}
+
+impl InFlight {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            lock: AsyncMutex::new(()),
+            outcome: Mutex::new(None),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SyncManager
 // ---------------------------------------------------------------------------
 
@@ -34,16 +60,16 @@ type FetchFn = Arc<
 ///
 /// **Single-flight by key:** concurrent callers with the same key share one
 /// in-flight fetch.  Once one fetch is running for a key, all other callers
-/// for that key wait for it to finish and then return `Ok(())`.  Different
-/// keys run concurrently.
+/// for that key wait for it to finish and then propagate the leader's result.
+/// Different keys run concurrently.
 ///
 /// SECURITY: `auth_header` is never written to logs or included in any error
 /// variant.  All error variants carry only the key or path, never credentials.
 pub struct SyncManager {
-    /// Per-key async locks.  An entry is present while a fetch is in-flight.
-    /// Using `Weak` allows entries to be garbage-collected after the fetch
-    /// completes and all waiters have finished.
-    in_flight: Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
+    /// Per-key in-flight entries.  An entry is present while a fetch is
+    /// in-flight.  Using `Weak` allows entries to be garbage-collected after
+    /// the fetch completes and all waiters have finished.
+    in_flight: Mutex<HashMap<String, Weak<InFlight>>>,
 
     /// The actual fetch implementation.  Swappable in tests.
     fetch_fn: FetchFn,
@@ -72,7 +98,8 @@ impl SyncManager {
     /// `origin`.
     ///
     /// Concurrent callers for the same `key` share a single in-flight fetch.
-    /// Different keys run concurrently.
+    /// Waiters receive the leader's result: `Ok(())` if the leader succeeded,
+    /// `Err(GitError::Fetch { .. })` if it failed.
     ///
     /// SECURITY: `auth_header` is passed only to `fetch_fn`; it never appears
     /// in error messages returned from this method.
@@ -85,17 +112,14 @@ impl SyncManager {
         // Attempt to find an existing in-flight arc, or create a new one.
         // The std::sync::Mutex guard is dropped before any .await point.
         enum Outcome {
-            Leader(Arc<AsyncMutex<()>>),
-            Waiter(Arc<AsyncMutex<()>>),
+            Leader(Arc<InFlight>),
+            Waiter(Arc<InFlight>),
         }
 
         let outcome: Outcome = {
             let mut map = self.in_flight.lock().map_err(|_| GitError::Spawn {
                 path: git_dir.to_path_buf(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "sync manager lock poisoned",
-                ),
+                source: std::io::Error::other("sync manager lock poisoned"),
             })?;
 
             if let Some(weak) = map.get(key) {
@@ -104,13 +128,13 @@ impl SyncManager {
                     Outcome::Waiter(arc)
                 } else {
                     // Stale entry — become the new leader.
-                    let arc = Arc::new(AsyncMutex::new(()));
+                    let arc = InFlight::new();
                     map.insert(key.to_owned(), Arc::downgrade(&arc));
                     Outcome::Leader(arc)
                 }
             } else {
                 // No entry — become the leader.
-                let arc = Arc::new(AsyncMutex::new(()));
+                let arc = InFlight::new();
                 map.insert(key.to_owned(), Arc::downgrade(&arc));
                 Outcome::Leader(arc)
             }
@@ -118,15 +142,45 @@ impl SyncManager {
         };
 
         match outcome {
-            Outcome::Waiter(arc) => {
-                // Wait for the leader's fetch to complete, then return Ok.
-                let _guard = arc.lock().await;
-                Ok(())
+            Outcome::Waiter(entry) => {
+                // Wait for the leader's fetch to complete (leader holds the lock
+                // for the duration of its fetch).
+                let _guard = entry.lock.lock().await;
+
+                // Read the outcome the leader stored before releasing the lock.
+                let shared = entry
+                    .outcome
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone();
+
+                match shared {
+                    Some(Ok(())) => Ok(()),
+                    Some(Err(msg)) => {
+                        // Leader's fetch failed.  Surface as a Spawn error so
+                        // the reason string (which never contains auth_header,
+                        // since it comes from GitError::Display) is visible to
+                        // the caller.
+                        Err(GitError::Spawn {
+                            path: git_dir.to_path_buf(),
+                            source: std::io::Error::other(msg),
+                        })
+                    }
+                    None => {
+                        // Should not happen: leader always writes before releasing
+                        // the lock.  Treat as a fetch failure to never silently Ok.
+                        Err(GitError::Fetch {
+                            key: key.to_owned(),
+                            path: git_dir.to_path_buf(),
+                            exit_code: None,
+                        })
+                    }
+                }
             }
 
-            Outcome::Leader(arc) => {
+            Outcome::Leader(entry) => {
                 // Acquire the per-key async lock so waiters block on it.
-                let _guard = arc.lock().await;
+                let _guard = entry.lock.lock().await;
 
                 // Run the actual fetch.
                 let result = (self.fetch_fn)(
@@ -135,6 +189,19 @@ impl SyncManager {
                     auth_header.to_owned(),
                 )
                 .await;
+
+                // Store the outcome for waiters BEFORE releasing the lock.
+                {
+                    let shared_outcome = match &result {
+                        Ok(()) => Ok(()),
+                        Err(e) => Err(e.to_string()),
+                    };
+                    // Unwrap: std Mutex poison here means a bug elsewhere; we
+                    // must store before releasing or waiters get None.
+                    if let Ok(mut cell) = entry.outcome.lock() {
+                        *cell = Some(shared_outcome);
+                    }
+                }
 
                 // Remove the in-flight entry so the Weak goes stale.
                 // New callers after this point will start a fresh fetch.
@@ -366,5 +433,98 @@ mod tests {
     #[test]
     fn default_creates_sync_manager() {
         let _m: SyncManager = SyncManager::default();
+    }
+
+    // ── Waiter observes leader failure ───────────────────────────────────────
+
+    /// A waiter coalesced onto a failing leader must receive `Err(...)`, not
+    /// `Ok(())`.  This guards against the silent-masking bug where a waiter
+    /// returns success regardless of whether the leader's fetch succeeded.
+    #[tokio::test]
+    async fn waiter_observes_leader_failure() {
+        // Gate: holds the leader's fetch open until the waiter has joined.
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let gate_clone = gate.clone();
+
+        let manager = Arc::new(SyncManager::with_fetch_fn(move |key, dir, _auth| {
+            let g = gate_clone.clone();
+            async move {
+                // Block until the test opens the gate — this gives the waiter
+                // time to register against the in-flight entry.
+                let _permit = g.acquire().await.expect("semaphore closed");
+                // Leader always fails.
+                Err(GitError::Fetch {
+                    key,
+                    path: dir,
+                    exit_code: Some(128),
+                })
+            }
+        }));
+
+        let path = PathBuf::from("/tmp/test-mirror-fail.git");
+
+        // Task 1: the leader — will fail.
+        let m1 = manager.clone();
+        let p1 = path.clone();
+        let t1 = tokio::spawn(async move { m1.sync("fail-key", &p1, "tok").await });
+
+        // Let t1 start and register as leader (acquire the async lock inside sync).
+        tokio::task::yield_now().await;
+
+        // Task 2: waiter — should join the in-flight entry.
+        let m2 = manager.clone();
+        let p2 = path.clone();
+        let t2 = tokio::spawn(async move { m2.sync("fail-key", &p2, "tok").await });
+
+        // Let t2 register as a waiter.
+        tokio::task::yield_now().await;
+
+        // Open the gate: leader's fetch fails, outcome is stored, lock released.
+        gate.add_permits(1);
+
+        let r1 = t1.await.expect("t1 panicked");
+        let r2 = t2.await.expect("t2 panicked");
+
+        assert!(r1.is_err(), "leader must return Err when fetch fails");
+        assert!(
+            r2.is_err(),
+            "waiter must observe leader failure and return Err, got: {r2:?}"
+        );
+    }
+
+    // ── Waiter observes leader success ───────────────────────────────────────
+
+    /// A waiter coalesced onto a successful leader must receive `Ok(())`.
+    #[tokio::test]
+    async fn waiter_observes_leader_success() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let gate_clone = gate.clone();
+
+        let manager = Arc::new(SyncManager::with_fetch_fn(move |_key, _dir, _auth| {
+            let g = gate_clone.clone();
+            async move {
+                let _permit = g.acquire().await.expect("semaphore closed");
+                Ok(())
+            }
+        }));
+
+        let path = PathBuf::from("/tmp/test-mirror-ok.git");
+
+        let m1 = manager.clone();
+        let p1 = path.clone();
+        let t1 = tokio::spawn(async move { m1.sync("ok-key", &p1, "tok").await });
+
+        tokio::task::yield_now().await;
+
+        let m2 = manager.clone();
+        let p2 = path.clone();
+        let t2 = tokio::spawn(async move { m2.sync("ok-key", &p2, "tok").await });
+
+        tokio::task::yield_now().await;
+
+        gate.add_permits(1);
+
+        t1.await.expect("t1 panicked").expect("leader must Ok");
+        t2.await.expect("t2 panicked").expect("waiter must Ok when leader succeeds");
     }
 }
