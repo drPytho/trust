@@ -76,7 +76,9 @@ fn git(args: &[&str], cwd: &Path, envs: &[(&str, &str)]) -> String {
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    let out = cmd.output().unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
+    let out = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
     if !out.status.success() {
         panic!(
             "git {args:?} failed (exit {:?}):\nstdout: {}\nstderr: {}",
@@ -88,22 +90,7 @@ fn git(args: &[&str], cwd: &Path, envs: &[(&str, &str)]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-/// Same as `git()` but returns the exit code rather than panicking.
-fn git_status(args: &[&str], cwd: &Path, envs: &[(&str, &str)]) -> i32 {
-    let mut cmd = Command::new("git");
-    cmd.args(args)
-        .current_dir(cwd)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_CREDENTIAL_HELPER", "")
-        .env("HOME", "/tmp");
-    for (k, v) in envs {
-        cmd.env(k, v);
-    }
-    let out = cmd.output().unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
-    out.status.code().unwrap_or(1)
-}
-
-/// Like `git_status()` but also returns stderr as a String for assertion.
+/// Like `git_status` (returns exit code) but also returns stderr as a String for assertion.
 fn git_status_with_stderr(args: &[&str], cwd: &Path, envs: &[(&str, &str)]) -> (i32, String) {
     let mut cmd = Command::new("git");
     cmd.args(args)
@@ -114,7 +101,9 @@ fn git_status_with_stderr(args: &[&str], cwd: &Path, envs: &[(&str, &str)]) -> (
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    let out = cmd.output().unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
+    let out = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
     let code = out.status.code().unwrap_or(1);
     let mut output = String::from_utf8_lossy(&out.stderr).into_owned();
     output.push_str("\n--- STDOUT ---\n");
@@ -171,21 +160,19 @@ fn handle_git_http_conn(mut stream: TcpStream, storage_root: &Path) {
             Err(_) => break,
         }
 
-        if !headers_done {
-            if let Some(pos) = find_header_end_bytes(&buf) {
-                headers_done = true;
-                header_end = pos;
-                if let Ok(hdr) = std::str::from_utf8(&buf[..header_end]) {
-                    for line in hdr.lines() {
-                        let lower = line.to_lowercase();
-                        if lower.starts_with("content-length:") {
-                            if let Some(v) = line.splitn(2, ':').nth(1) {
-                                content_length = v.trim().parse().unwrap_or(0);
-                            }
-                        }
-                        if lower.contains("transfer-encoding") && lower.contains("chunked") {
-                            chunked = true;
-                        }
+        if !headers_done && let Some(pos) = find_header_end_bytes(&buf) {
+            headers_done = true;
+            header_end = pos;
+            if let Ok(hdr) = std::str::from_utf8(&buf[..header_end]) {
+                for line in hdr.lines() {
+                    let lower = line.to_lowercase();
+                    if lower.starts_with("content-length:")
+                        && let Some(v) = line.split_once(':').map(|x| x.1)
+                    {
+                        content_length = v.trim().parse().unwrap_or(0);
+                    }
+                    if lower.contains("transfer-encoding") && lower.contains("chunked") {
+                        chunked = true;
                     }
                 }
             }
@@ -196,10 +183,8 @@ fn handle_git_http_conn(mut stream: TcpStream, storage_root: &Path) {
                 if is_chunked_complete(&buf[header_end..]) {
                     break;
                 }
-            } else {
-                if buf.len().saturating_sub(header_end) >= content_length {
-                    break;
-                }
+            } else if buf.len().saturating_sub(header_end) >= content_length {
+                break;
             }
         }
     }
@@ -234,16 +219,29 @@ fn handle_git_http_conn(mut stream: TcpStream, storage_root: &Path) {
     for line in req_str.lines().skip(1) {
         let lower = line.to_lowercase();
         if lower.starts_with("content-type:") {
-            content_type_val = line.splitn(2, ':').nth(1).unwrap_or("").trim().to_string();
+            content_type_val = line
+                .split_once(':')
+                .map(|x| x.1)
+                .unwrap_or("")
+                .trim()
+                .to_string();
         }
         if lower.starts_with("git-protocol:") {
-            git_protocol_val = line.splitn(2, ':').nth(1).unwrap_or("").trim().to_string();
+            git_protocol_val = line
+                .split_once(':')
+                .map(|x| x.1)
+                .unwrap_or("")
+                .trim()
+                .to_string();
         }
     }
 
     // Build CGI environment.
     let mut env: Vec<(String, String)> = vec![
-        ("GIT_PROJECT_ROOT".to_owned(), storage_root.to_string_lossy().into_owned()),
+        (
+            "GIT_PROJECT_ROOT".to_owned(),
+            storage_root.to_string_lossy().into_owned(),
+        ),
         ("GIT_HTTP_EXPORT_ALL".to_owned(), "1".to_owned()),
         ("PATH_INFO".to_owned(), path_only.to_owned()),
         ("QUERY_STRING".to_owned(), query.to_owned()),
@@ -314,10 +312,10 @@ fn handle_git_http_conn(mut stream: TcpStream, storage_root: &Path) {
             break;
         }
         if line.to_lowercase().starts_with("status:") {
-            if let Some(val) = line.splitn(2, ':').nth(1) {
-                if let Some(code_str) = val.trim().split_whitespace().next() {
-                    http_status = code_str.parse().unwrap_or(200);
-                }
+            if let Some(val) = line.split_once(':').map(|x| x.1)
+                && let Some(code_str) = val.split_whitespace().next()
+            {
+                http_status = code_str.parse().unwrap_or(200);
             }
         } else {
             response_headers.push(line.to_string());
@@ -380,7 +378,9 @@ fn decode_chunked(chunked: &[u8]) -> Vec<u8> {
         let rel = chunked[pos..].iter().position(|&b| b == b'\n');
         let Some(rel) = rel else { break };
         let line = &chunked[pos..pos + rel];
-        let line_str = std::str::from_utf8(line).unwrap_or("0").trim_end_matches('\r');
+        let line_str = std::str::from_utf8(line)
+            .unwrap_or("0")
+            .trim_end_matches('\r');
         let size_str = line_str.split(';').next().unwrap_or("0").trim();
         let chunk_size = usize::from_str_radix(size_str, 16).unwrap_or(0);
         pos += rel + 1;
@@ -475,10 +475,16 @@ fn start_proxy(upstream: Arc<Upstream>, keystore: Arc<Keystore>, mirrors_dir: Pa
 
 fn mint_jwt(keystore: &Keystore, scope: &str) -> String {
     let km = keystore.load().unwrap();
-    let issuer = Issuer::new("trust".into(), "trust-proxy".into(), Duration::from_secs(3600));
+    let issuer = Issuer::new(
+        "trust".into(),
+        "trust-proxy".into(),
+        Duration::from_secs(3600),
+    );
     let now = jsonwebtoken::get_current_timestamp();
     let scopes = ScopeSet::parse(scope).unwrap();
-    issuer.mint(&km, "spiffe://pit/ci/test", &scopes, now).unwrap()
+    issuer
+        .mint(&km, "spiffe://pit/ci/test", &scopes, now)
+        .unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -498,14 +504,22 @@ fn git_cache_end_to_end() {
     std::fs::create_dir_all(&origin_dir).unwrap();
     git(&["init", "--bare", "."], &origin_dir, &[]);
     // Set default branch to 'main' so HEAD is not "unborn" after push.
-    git(&["symbolic-ref", "HEAD", "refs/heads/main"], &origin_dir, &[]);
+    git(
+        &["symbolic-ref", "HEAD", "refs/heads/main"],
+        &origin_dir,
+        &[],
+    );
     // Enable push (receive-pack) over HTTP — disabled by default in git http-backend.
     git(&["config", "http.receivepack", "true"], &origin_dir, &[]);
 
     // Clone into a working copy to add commits.
     let work_dir = tmp_path.join("work");
     git(
-        &["clone", origin_dir.to_str().unwrap(), work_dir.to_str().unwrap()],
+        &[
+            "clone",
+            origin_dir.to_str().unwrap(),
+            work_dir.to_str().unwrap(),
+        ],
         tmp_path,
         &[],
     );
@@ -537,9 +551,16 @@ fn git_cache_end_to_end() {
     {
         let sanity_dir = tmp_path.join("sanity_clone");
         let url = format!("http://127.0.0.1:{origin_port}/testorg/testrepo.git");
-        git(&["clone", &url, sanity_dir.to_str().unwrap()], tmp_path, &[]);
+        git(
+            &["clone", &url, sanity_dir.to_str().unwrap()],
+            tmp_path,
+            &[],
+        );
         let data = std::fs::read(sanity_dir.join("large_file.bin")).unwrap();
-        assert_eq!(data, large_data, "sanity clone: large_file.bin content mismatch");
+        assert_eq!(
+            data, large_data,
+            "sanity clone: large_file.bin content mismatch"
+        );
         println!("Origin HTTP sanity check passed");
     }
 
@@ -564,7 +585,13 @@ fn git_cache_end_to_end() {
     {
         let no_auth_dir = tmp_path.join("no_auth_clone");
         let (code, stderr) = git_status_with_stderr(
-            &["-c", "credential.helper=", "clone", &proxy_url, no_auth_dir.to_str().unwrap()],
+            &[
+                "-c",
+                "credential.helper=",
+                "clone",
+                &proxy_url,
+                no_auth_dir.to_str().unwrap(),
+            ],
             tmp_path,
             &[],
         );
@@ -583,9 +610,13 @@ fn git_cache_end_to_end() {
         let auth_header = format!("Authorization: Bearer {good_jwt}");
         let (code, stderr) = git_status_with_stderr(
             &[
-                "-c", "credential.helper=",
-                "-c", &format!("http.extraHeader={auth_header}"),
-                "clone", &other_url, oos_dir.to_str().unwrap(),
+                "-c",
+                "credential.helper=",
+                "-c",
+                &format!("http.extraHeader={auth_header}"),
+                "clone",
+                &other_url,
+                oos_dir.to_str().unwrap(),
             ],
             tmp_path,
             &[],
@@ -604,8 +635,11 @@ fn git_cache_end_to_end() {
         let auth_header = format!("Authorization: Bearer {good_jwt}");
         git(
             &[
-                "-c", &format!("http.extraHeader={auth_header}"),
-                "clone", &proxy_url, clone_dir.to_str().unwrap(),
+                "-c",
+                &format!("http.extraHeader={auth_header}"),
+                "clone",
+                &proxy_url,
+                clone_dir.to_str().unwrap(),
             ],
             tmp_path,
             &[],
@@ -621,7 +655,10 @@ fn git_cache_end_to_end() {
             cloned_data, large_data,
             "proxy clone: file content mismatch (multi-chunk streaming broken?)"
         );
-        println!("Assertion 1 (clone + multi-chunk): ✓ ({} KiB)", cloned_data.len() / 1024);
+        println!(
+            "Assertion 1 (clone + multi-chunk): ✓ ({} KiB)",
+            cloned_data.len() / 1024
+        );
     }
 
     git(&["config", "user.email", "test@test.com"], &clone_dir, &[]);
@@ -638,7 +675,12 @@ fn git_cache_end_to_end() {
         // Fetch through proxy → the proxy syncs the mirror then serves fresh refs.
         let auth_header = format!("Authorization: Bearer {good_jwt}");
         git(
-            &["-c", &format!("http.extraHeader={auth_header}"), "fetch", "origin"],
+            &[
+                "-c",
+                &format!("http.extraHeader={auth_header}"),
+                "fetch",
+                "origin",
+            ],
             &clone_dir,
             &[],
         );
@@ -652,7 +694,11 @@ fn git_cache_end_to_end() {
     // ---- ASSERTION 3: Push through proxy lands on origin ----
     {
         // Point the clone's origin remote at the proxy.
-        git(&["remote", "set-url", "origin", &proxy_url], &clone_dir, &[]);
+        git(
+            &["remote", "set-url", "origin", &proxy_url],
+            &clone_dir,
+            &[],
+        );
 
         // Commit a new file in the clone.
         std::fs::write(clone_dir.join("via_proxy.txt"), b"pushed through proxy").unwrap();
@@ -663,8 +709,11 @@ fn git_cache_end_to_end() {
         let auth_header = format!("Authorization: Bearer {good_jwt}");
         git(
             &[
-                "-c", &format!("http.extraHeader={auth_header}"),
-                "push", "origin", "main",
+                "-c",
+                &format!("http.extraHeader={auth_header}"),
+                "push",
+                "origin",
+                "main",
             ],
             &clone_dir,
             &[],
@@ -673,7 +722,11 @@ fn git_cache_end_to_end() {
         // Verify the commit arrived on the bare origin by cloning it directly.
         let verify_dir = tmp_path.join("verify_push_clone");
         git(
-            &["clone", origin_dir.to_str().unwrap(), verify_dir.to_str().unwrap()],
+            &[
+                "clone",
+                origin_dir.to_str().unwrap(),
+                verify_dir.to_str().unwrap(),
+            ],
             tmp_path,
             &[],
         );

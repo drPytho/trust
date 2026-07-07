@@ -16,6 +16,7 @@ use crate::git::mirror::GitError;
 /// Only the `Some` optional fields are included in the returned vector.
 /// `CONTENT_LENGTH` is intentionally omitted here; callers that know the
 /// length (e.g. a buffered POST body) should append it themselves.
+#[allow(clippy::too_many_arguments)] // CGI env needs all HTTP fields; a struct would be heavier.
 pub fn cgi_env(
     storage_path: &Path,
     owner: &str,
@@ -69,6 +70,7 @@ pub fn cgi_env(
 /// Returns `None` if no blank line (end of headers) is found in `buf`.
 ///
 /// Tolerates both CRLF (`\r\n`) and LF-only (`\n`) line endings.
+#[allow(clippy::type_complexity)] // Return type mirrors CGI output structure; a named struct adds little here.
 pub fn parse_cgi_head(buf: &[u8]) -> Option<(u16, Vec<(String, String)>, usize)> {
     // Find the blank line that terminates the CGI header block.
     // We look for "\r\n\r\n" or "\n\n" (or a mix like "\r\n\n").
@@ -101,10 +103,10 @@ pub fn parse_cgi_head(buf: &[u8]) -> Option<(u16, Vec<(String, String)>, usize)>
             let val = val.trim();
             if key.eq_ignore_ascii_case("Status") {
                 // Parse the leading integer from "404 Not Found"
-                if let Some(code_str) = val.split_whitespace().next() {
-                    if let Ok(code) = code_str.parse::<u16>() {
-                        status = code;
-                    }
+                if let Some(code_str) = val.split_whitespace().next()
+                    && let Ok(code) = code_str.parse::<u16>()
+                {
+                    status = code;
                 }
                 // Status line is excluded from returned headers.
             } else {
@@ -163,10 +165,7 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 /// `git_dir_root` is passed as the working directory for the subprocess;
 /// in practice it is the storage root so `GIT_PROJECT_ROOT` resolves
 /// correctly even if `git http-backend` tries to `chdir`.
-pub async fn spawn(
-    git_dir_root: &Path,
-    env: &[(String, String)],
-) -> Result<Child, GitError> {
+pub async fn spawn(git_dir_root: &Path, env: &[(String, String)]) -> Result<Child, GitError> {
     Command::new("git")
         .arg("http-backend")
         // Clear the inherited environment to avoid leaking secrets that
@@ -194,9 +193,7 @@ mod tests {
     use std::path::Path;
 
     fn env_get<'a>(env: &'a [(String, String)], key: &str) -> Option<&'a str> {
-        env.iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.as_str())
+        env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
     }
 
     fn env_has_key(env: &[(String, String)], key: &str) -> bool {
