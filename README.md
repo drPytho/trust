@@ -7,8 +7,8 @@ Clients authenticate to `trust` with a **short-lived JWT** they mint against the
 **real** upstream secret from a secret manager, injects it, and forwards the request. The upstream
 credential is never handed to clients, and the client's JWT is never forwarded upstream.
 
-> **Status:** Phase 2 (JWT auth + mTLS token issuance) is complete. Phase 3 (git smart-HTTP
-> caching) is designed but not yet built — see [Roadmap](#roadmap).
+> **Status:** Phase 3 (git smart-HTTP caching) is complete. All three upstream kinds — `api`,
+> `github-api` (repo-scoped), and `git-cache` — are production-ready.
 
 ## Why
 
@@ -105,6 +105,9 @@ Rules:
 - **Configurable injection** per upstream: header name + scheme (`bearer` / `basic` / `raw`).
 - **Repo-scoped authz** for `github-repo` upstreams — the request path is parsed for
   `owner/repo`; the JWT scope must cover it.
+- **git-cache upstream** — serves `git clone`/`fetch` from a local bare mirror (fresh refs,
+  cached objects; incremental `git fetch` per read, no TTL); passes `git push` through to
+  the origin. Reuses JWT auth and repo-scoped authz (`git-repo` resource).
 - **Client JWT never leaks** — `Authorization` is stripped before forwarding; secrets are
   never logged (redacted `Debug`, no `Display`).
 
@@ -169,6 +172,18 @@ origin      = "https://api.github.com"
 secret_ref  = "projects/my-proj/secrets/github-token/versions/latest"
 injection   = { header = "authorization", scheme = "bearer" }
 resource    = { kind = "github-repo" }   # enables per-repo scope authz
+
+# git-cache upstream: bare mirror + pass-through push.
+# Requires `git` in PATH where trust runs.
+[[upstreams]]
+name        = "git-mirror"
+kind        = "git-cache"
+listen_host = "git.proxy.internal"
+origin      = "https://github.com"
+secret_ref  = "projects/my-proj/secrets/github-pat/versions/latest"
+injection   = { header = "x-access-token", scheme = "bearer" }
+resource    = { kind = "git-repo" }
+git         = { storage_path = "/var/lib/trust/mirrors" }
 ```
 
 Note: `[[tokens]]` (static token map from Phase 1) is **gone**. All client authentication
@@ -223,10 +238,26 @@ curl -H "Authorization: Bearer $JWT" \
   -H "Host: anthropic.proxy.internal" \
   https://trust.pit.internal:6443/v1/messages
 
-# Git clone via git smart-HTTP (proxy handles auth injection):
+# git clone via the git-cache upstream (cached mirror, fresh refs):
 git -c http.extraHeader="Authorization: Bearer $JWT" \
-  clone https://github.proxy.internal/pitorg/pit-ts
+  clone https://git.proxy.internal/pitorg/pit-ts.git
+
+# git push via the git-cache upstream (passed through to origin):
+git -c http.extraHeader="Authorization: Bearer $JWT" \
+  push https://git.proxy.internal/pitorg/pit-ts.git HEAD:main
 ```
+
+### git-cache behaviour
+
+- **Clone / fetch:** trust serves objects from a local bare mirror. On every read request, it
+  runs `git fetch` to pull fresh refs and any new objects from the origin (no TTL — always
+  up-to-date). Objects already in the mirror are served without hitting the origin.
+- **Push:** classified as passthrough; trust injects the upstream PAT and forwards to the real
+  origin. The mirror is refreshed on the next read.
+- **Auth:** same JWT flow as `api` upstreams. The client's `Authorization` header is stripped;
+  the upstream credential is injected via the configured injection scheme.
+- **Requirement:** `git` must be installed where trust runs (`git http-backend` serves reads;
+  `git fetch` syncs the mirror).
 
 ## Security model
 
@@ -244,7 +275,7 @@ git -c http.extraHeader="Authorization: Bearer $JWT" \
 ## Testing
 
 ```bash
-cargo test                                 # 43 unit + 2 end-to-end integration tests
+cargo test                                 # 102 unit + 3 end-to-end integration tests (105 total)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
@@ -254,6 +285,12 @@ cargo fmt --check
 - end-to-end proxy authz with JWT: unknown host → 404, missing/invalid JWT → 401,
   wrong scope → 403, and on success the upstream received the injected secret with the
   client JWT stripped and the Host rewritten.
+
+`tests/git_cache.rs` spins a real `git http-backend` origin and the full Pingora proxy and asserts:
+- clone through the git-cache upstream populates a local mirror and delivers objects
+- incremental fetch updates the mirror after a new commit is pushed to origin
+- push through the proxy lands on the origin (verified by direct clone from bare origin)
+- unauthorized requests (bad JWT, wrong scope) are rejected before touching the mirror
 
 ## Project layout
 
@@ -276,15 +313,21 @@ src/
     mtls.rs        # SPIFFE URI SAN extraction from client certs
     policy.rs      # ClientPolicy: exact/prefix identity → ScopeSet
     server.rs      # mTLS /token endpoint + plain /.well-known/jwks.json
-  proxy.rs         # ProxyHttp: strip → inject → rewrite Host
+  git/
+    mod.rs
+    classify.rs    # classify HTTP path → GitRequest (Read / Push / Other)
+    mirror.rs      # MirrorStore: bare-repo init, path validation, GitError
+    sync.rs        # SyncManager: single-flight git fetch per repo
+    backend.rs     # CGI env builder + cgi-head parser for git http-backend
+  proxy.rs         # ProxyHttp: strip → inject → rewrite Host; git-cache serve/push
   main.rs          # server bootstrap (proxy + issuance + JWKS + key rotation)
-tests/jwt_egress.rs
+tests/
+  jwt_egress.rs    # JWT egress e2e
+  git_cache.rs     # git-cache e2e (clone, incremental fetch, push, authz rejection)
 ```
 
 ## Roadmap
 
-**Phase 3 — git smart-HTTP caching.** Add a `git-cache` upstream kind alongside `api`: keep
-local bare mirrors, serve `clone`/`fetch` from them (refreshing from upstream with injected
-credentials when refs are stale), and pass pushes through to the real host. The auth /
-routing / injection core is shared; the design is in
-[`docs/superpowers/specs`](docs/superpowers/specs).
+- **Metrics / observability** — Prometheus scrape endpoint; per-upstream latency and error counters.
+- **Hot config reload** — SIGHUP reloads `config.toml` without dropping connections.
+- **Mirror pre-warming** — optional background task to keep mirrors warm before any client request.
