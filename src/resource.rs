@@ -10,14 +10,15 @@ pub enum ResourceKind {
 }
 
 /// Returns `true` if `s` is a safe path component: non-empty, not `.` or `..`,
-/// and contains no `/`, `\`, or NUL bytes.
+/// and contains no `/`, `\`, control characters, or DEL.
 ///
 /// Used by `extract(GitRepo, …)` and will be reused by `MirrorStore` (Task 5).
 pub(crate) fn safe_component(s: &str) -> bool {
     if s.is_empty() || s == "." || s == ".." {
         return false;
     }
-    !s.bytes().any(|b| b == b'/' || b == b'\\' || b == 0)
+    // Reject `/`, `\`, and any control character (< 0x20) or DEL (0x7F)
+    !s.bytes().any(|b| b == b'/' || b == b'\\' || b < 0x20 || b == 0x7F)
 }
 
 /// Git smart-HTTP suffixes we recognise.
@@ -123,6 +124,16 @@ mod tests {
         assert!(!safe_component("a\0b")); // NUL byte
     }
 
+    #[test]
+    fn safe_component_rejects_control_chars() {
+        // Reject BEL (0x07)
+        assert!(!safe_component("a\u{0007}b"));
+        // Reject DEL (0x7F)
+        assert!(!safe_component("a\u{007f}b"));
+        // Still accept normal names
+        assert!(safe_component("a-b.c"));
+    }
+
     // ── GitRepo extraction ───────────────────────────────────────────────────
 
     #[test]
@@ -165,5 +176,11 @@ mod tests {
     fn git_repo_missing_repo_segment_is_none() {
         // /pitorg/info/refs — only one segment before the suffix → None
         assert!(extract(ResourceKind::GitRepo, "/pitorg/info/refs").is_none());
+    }
+
+    #[test]
+    fn git_repo_dot_git_stripping_yields_empty_repo() {
+        // /o/.git/info/refs — after stripping .git, the repo segment becomes empty → None
+        assert!(extract(ResourceKind::GitRepo, "/o/.git/info/refs").is_none());
     }
 }
