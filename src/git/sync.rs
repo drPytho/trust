@@ -18,9 +18,9 @@ use super::mirror::GitError;
 /// logs or error messages. The function is responsible for that invariant.
 type FetchFn = Arc<
     dyn Fn(
-            String,   // key (for error context only, not auth)
-            PathBuf,  // git_dir
-            String,   // auth_header — MUST NOT be logged
+            String,  // key (for error context only, not auth)
+            PathBuf, // git_dir
+            String,  // auth_header — MUST NOT be logged
         ) -> Pin<Box<dyn Future<Output = Result<(), GitError>> + Send>>
         + Send
         + Sync,
@@ -103,12 +103,7 @@ impl SyncManager {
     ///
     /// SECURITY: `auth_header` is passed only to `fetch_fn`; it never appears
     /// in error messages returned from this method.
-    pub async fn sync(
-        &self,
-        key: &str,
-        git_dir: &Path,
-        auth_header: &str,
-    ) -> Result<(), GitError> {
+    pub async fn sync(&self, key: &str, git_dir: &Path, auth_header: &str) -> Result<(), GitError> {
         // Attempt to find an existing in-flight arc, or create a new one.
         // The std::sync::Mutex guard is dropped before any .await point.
         enum Outcome {
@@ -525,6 +520,8 @@ mod tests {
         gate.add_permits(1);
 
         t1.await.expect("t1 panicked").expect("leader must Ok");
-        t2.await.expect("t2 panicked").expect("waiter must Ok when leader succeeds");
+        t2.await
+            .expect("t2 panicked")
+            .expect("waiter must Ok when leader succeeds");
     }
 }

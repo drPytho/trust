@@ -18,7 +18,8 @@ pub(crate) fn safe_component(s: &str) -> bool {
         return false;
     }
     // Reject `/`, `\`, and any control character (< 0x20) or DEL (0x7F)
-    !s.bytes().any(|b| b == b'/' || b == b'\\' || b < 0x20 || b == 0x7F)
+    !s.bytes()
+        .any(|b| b == b'/' || b == b'\\' || b < 0x20 || b == 0x7F)
 }
 
 /// Git smart-HTTP suffixes we recognise.
@@ -116,10 +117,10 @@ mod tests {
 
     #[test]
     fn safe_component_rejects_bad_inputs() {
-        assert!(!safe_component(""));      // empty
-        assert!(!safe_component("."));     // current-dir
-        assert!(!safe_component(".."));    // parent-dir
-        assert!(!safe_component("a/b"));   // embedded slash
+        assert!(!safe_component("")); // empty
+        assert!(!safe_component(".")); // current-dir
+        assert!(!safe_component("..")); // parent-dir
+        assert!(!safe_component("a/b")); // embedded slash
         assert!(!safe_component("a\\b")); // embedded backslash
         assert!(!safe_component("a\0b")); // NUL byte
     }

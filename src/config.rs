@@ -236,7 +236,12 @@ impl Config {
                     if ru.git.is_none() {
                         return Err(ConfigError::MissingGitBlock(ru.name));
                     }
-                    if !matches!(ru.resource, Some(RawResource { kind: ResourceKind::GitRepo })) {
+                    if !matches!(
+                        ru.resource,
+                        Some(RawResource {
+                            kind: ResourceKind::GitRepo
+                        })
+                    ) {
                         return Err(ConfigError::GitCacheNeedsGitRepoResource(ru.name));
                     }
                 }
@@ -437,7 +442,11 @@ git = { storage_path = "/m" }
     fn git_cache_upstream_parses() {
         let toml = GOOD.to_string() + GIT_CACHE_UPSTREAM;
         let cfg = Config::from_str(&toml).unwrap();
-        let up = cfg.upstreams.iter().find(|u| u.name == "git-mirror").unwrap();
+        let up = cfg
+            .upstreams
+            .iter()
+            .find(|u| u.name == "git-mirror")
+            .unwrap();
         assert_eq!(up.kind, UpstreamKind::GitCache);
         let git = up.git.as_ref().expect("git block should be Some");
         assert_eq!(git.storage_path, "/m");

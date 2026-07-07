@@ -9,10 +9,7 @@ pub enum InjectError {
     InvalidValue,
 }
 
-pub fn injection_value(
-    injection: &Injection,
-    secret: &str,
-) -> Result<String, InjectError> {
+pub fn injection_value(injection: &Injection, secret: &str) -> Result<String, InjectError> {
     let value = match injection.scheme {
         InjectionScheme::Bearer => format!("Bearer {secret}"),
         InjectionScheme::Basic => {

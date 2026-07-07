@@ -83,10 +83,7 @@ mod tests {
 
     #[test]
     fn get_info_refs_no_service_is_other() {
-        assert_eq!(
-            classify("GET", "/o/r.git/info/refs", ""),
-            GitRequest::Other
-        );
+        assert_eq!(classify("GET", "/o/r.git/info/refs", ""), GitRequest::Other);
     }
 
     #[test]
