@@ -52,4 +52,7 @@ jobs:
         with:
           tool: cargo-audit
       - name: Audit dependencies (RustSec advisories)
-        run: cargo audit
+        # RUSTSEC-2024-0437 (protobuf 2.28 uncontrolled recursion) is a transitive
+        # dep of pingora; not upgradable here and not reachable from untrusted input
+        # in trust. Revisit when pingora bumps protobuf, then drop this ignore.
+        run: cargo audit --ignore RUSTSEC-2024-0437
