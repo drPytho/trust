@@ -433,7 +433,11 @@ impl ProxyService {
                 return Ok(true);
             }
         };
-        let storage_path = std::path::Path::new(&git_config.storage_path);
+        // MirrorStore stores mirrors at <storage_path>/<upstream_name>/<owner>/<repo>.git.
+        // git http-backend needs GIT_PROJECT_ROOT = <storage_path>/<upstream_name> so that
+        // the PATH_INFO /owner/repo.git/tail resolves to the correct mirror directory.
+        let storage_root = std::path::PathBuf::from(&git_config.storage_path).join(&upstream.name);
+        let storage_path = storage_root.as_path();
 
         let tail = match git_tail(path, &owner, &repo) {
             Some(t) => t.to_string(),
