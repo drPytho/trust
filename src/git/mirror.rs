@@ -1,7 +1,10 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use thiserror::Error;
 use tokio::sync::Mutex;
+use tokio::sync::Mutex as TokioMutex;
 
 use crate::resource::safe_component;
 
@@ -46,12 +49,9 @@ pub enum GitError {
 // ---------------------------------------------------------------------------
 
 /// A per-path async lock entry used to prevent concurrent double-clones of the
-/// same mirror directory.  The outer `DashMap` is keyed by the canonical mirror
+/// same mirror directory.  The outer `HashMap` is keyed by the canonical mirror
 /// path.
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::Mutex as TokioMutex;
-
+///
 /// Holds the bare git mirrors for all repos served by a git-cache upstream.
 ///
 /// Layout on disk: `<root>/<upstream>/<owner>/<repo>.git`
@@ -110,6 +110,20 @@ impl MirrorStore {
         clone_url: &str,
         auth_header: &str,
     ) -> Result<(), GitError> {
+        // Initial check: does the path already exist?
+        match tokio::fs::metadata(path).await {
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Proceed to acquire lock and attempt clone.
+            }
+            Err(e) => {
+                return Err(GitError::Stat {
+                    path: path.to_path_buf(),
+                    source: e,
+                });
+            }
+        }
+
         // Grab (or create) the per-path lock.
         let lock_arc = {
             let mut map = self.locks.lock().await;
@@ -122,8 +136,17 @@ impl MirrorStore {
         let _guard = lock_arc.lock().await;
 
         // Re-check after acquiring the lock — a prior waiter may have cloned.
-        if path.exists() {
-            return Ok(());
+        match tokio::fs::metadata(path).await {
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Proceed to clone.
+            }
+            Err(e) => {
+                return Err(GitError::Stat {
+                    path: path.to_path_buf(),
+                    source: e,
+                });
+            }
         }
 
         // Run: git -c http.extraHeader=Authorization: <auth_header> clone --mirror <url> <path>
@@ -136,8 +159,8 @@ impl MirrorStore {
                 "clone",
                 "--mirror",
                 clone_url,
-                &path.to_string_lossy(),
             ])
+            .arg(path)
             .status()
             .await
             .map_err(|source| GitError::Spawn {
