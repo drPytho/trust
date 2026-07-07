@@ -4,6 +4,8 @@ use std::sync::Arc;
 use serde::Deserialize;
 use url::Url;
 
+use crate::resource::ResourceKind;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("failed to read config file: {0}")]
@@ -14,10 +16,14 @@ pub enum ConfigError {
     DuplicateUpstream(String),
     #[error("duplicate listen_host: {0}")]
     DuplicateListenHost(String),
-    #[error("token for principal {principal} references unknown upstream {name}")]
-    UnknownUpstreamRef { principal: String, name: String },
     #[error("bad origin URL {url}: {reason}")]
     BadOrigin { url: String, reason: String },
+    #[error("invalid duration {value}")]
+    BadDuration { value: String },
+    #[error("invalid scope in issuance policy: {scope}")]
+    BadScope { scope: String },
+    #[error("issuance requires a [tls] section (server cert/key)")]
+    MissingTls,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -56,6 +62,7 @@ pub struct Upstream {
     pub origin: Origin,
     pub secret_ref: String,
     pub injection: Injection,
+    pub resource: Option<ResourceKind>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -71,10 +78,55 @@ pub struct TlsConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct TokenEntry {
-    pub token: String,
-    pub principal: String,
-    pub allowed_upstreams: Vec<String>,
+pub struct RawSigning {
+    pub algorithm: String,
+    pub token_ttl: String,
+    pub key_secret_ref: String,
+    #[serde(default)]
+    pub previous_key_secret_ref: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SigningConfig {
+    pub algorithm: String,
+    pub token_ttl: std::time::Duration,
+    pub key_secret_ref: String,
+    pub previous_key_secret_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RawAuth {
+    pub issuer: String,
+    pub audience: String,
+    pub signing: RawSigning,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthConfig {
+    pub issuer: String,
+    pub audience: String,
+    pub signing: SigningConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClientEntry {
+    pub spiffe: String,
+    pub allowed_scopes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct IssuanceConfig {
+    pub mtls_addr: String,
+    pub client_ca_path: String,
+    pub jwks_addr: String,
+    #[serde(default)]
+    pub clients: Vec<ClientEntry>,
+}
+
+/// TOML shape: `resource = { kind = "github-repo" }`.
+#[derive(Deserialize)]
+struct RawResource {
+    kind: ResourceKind,
 }
 
 // Raw deserialization mirror (origin stays a String until validated).
@@ -86,6 +138,8 @@ struct RawUpstream {
     origin: String,
     secret_ref: String,
     injection: Injection,
+    #[serde(default)]
+    resource: Option<RawResource>,
 }
 
 #[derive(Deserialize)]
@@ -93,7 +147,8 @@ struct RawConfig {
     listen: ListenConfig,
     #[serde(default)]
     tls: Option<TlsConfig>,
-    tokens: Vec<TokenEntry>,
+    auth: RawAuth,
+    issuance: IssuanceConfig,
     upstreams: Vec<RawUpstream>,
 }
 
@@ -101,7 +156,8 @@ struct RawConfig {
 pub struct Config {
     pub listen: ListenConfig,
     pub tls: Option<TlsConfig>,
-    pub tokens: Vec<TokenEntry>,
+    pub auth: AuthConfig,
+    pub issuance: IssuanceConfig,
     pub upstreams: Vec<Arc<Upstream>>,
 }
 
@@ -165,24 +221,46 @@ impl Config {
                 origin,
                 secret_ref: ru.secret_ref,
                 injection: ru.injection,
+                resource: ru.resource.map(|r| r.kind),
             }));
         }
 
-        for t in &raw.tokens {
-            for r in &t.allowed_upstreams {
-                if !names.contains(r) {
-                    return Err(ConfigError::UnknownUpstreamRef {
-                        principal: t.principal.clone(),
-                        name: r.clone(),
-                    });
-                }
+        // Parse token TTL.
+        let token_ttl = humantime::parse_duration(&raw.auth.signing.token_ttl).map_err(|_| {
+            ConfigError::BadDuration {
+                value: raw.auth.signing.token_ttl.clone(),
+            }
+        })?;
+
+        // Validate issuance client scopes.
+        for c in &raw.issuance.clients {
+            for s in &c.allowed_scopes {
+                crate::scope::Scope::parse(s)
+                    .map_err(|_| ConfigError::BadScope { scope: s.clone() })?;
             }
         }
+
+        // [tls] is required because issuance reuses it for the mTLS server cert/key.
+        if raw.tls.is_none() {
+            return Err(ConfigError::MissingTls);
+        }
+
+        let auth = AuthConfig {
+            issuer: raw.auth.issuer,
+            audience: raw.auth.audience,
+            signing: SigningConfig {
+                algorithm: raw.auth.signing.algorithm,
+                token_ttl,
+                key_secret_ref: raw.auth.signing.key_secret_ref,
+                previous_key_secret_ref: raw.auth.signing.previous_key_secret_ref,
+            },
+        };
 
         Ok(Config {
             listen: raw.listen,
             tls: raw.tls,
-            tokens: raw.tokens,
+            auth,
+            issuance: raw.issuance,
             upstreams,
         })
     }
@@ -196,33 +274,84 @@ mod tests {
 [listen]
 tcp = "0.0.0.0:6191"
 
-[[tokens]]
-token = "client-abc"
-principal = "team-x"
-allowed_upstreams = ["anthropic"]
+[tls]
+addr = "0.0.0.0:6443"
+cert_path = "/etc/trust/server.crt"
+key_path = "/etc/trust/server.key"
+
+[auth]
+issuer = "https://trust.pit.internal/"
+audience = "trust-proxy"
+
+[auth.signing]
+algorithm = "ES256"
+token_ttl = "7d"
+key_secret_ref = "projects/p/secrets/sign/versions/latest"
+
+[issuance]
+mtls_addr = "0.0.0.0:8443"
+client_ca_path = "/etc/trust/client-ca.pem"
+jwks_addr = "0.0.0.0:8080"
+
+[[issuance.clients]]
+spiffe = "spiffe://pit/ci/pit-ts"
+allowed_scopes = ["github:pitorg/pit-ts"]
 
 [[upstreams]]
 name = "anthropic"
 kind = "api"
 listen_host = "anthropic.proxy.internal"
 origin = "https://api.anthropic.com"
-secret_ref = "projects/p/secrets/anthropic-key/versions/latest"
+secret_ref = "projects/p/secrets/anthropic/versions/latest"
 injection = { header = "x-api-key", scheme = "raw" }
+
+[[upstreams]]
+name = "github"
+kind = "api"
+listen_host = "github-api.proxy.internal"
+origin = "https://api.github.com"
+secret_ref = "projects/p/secrets/gh/versions/latest"
+injection = { header = "authorization", scheme = "bearer" }
+resource = { kind = "github-repo" }
 "#;
 
     #[test]
-    fn parses_and_resolves_origin() {
+    fn parses_auth_issuance_and_resource() {
         let cfg = Config::from_str(GOOD).unwrap();
-        assert_eq!(cfg.upstreams.len(), 1);
-        let up = &cfg.upstreams[0];
-        assert_eq!(up.name, "anthropic");
-        assert!(matches!(up.kind, UpstreamKind::Api));
-        assert_eq!(up.origin.host, "api.anthropic.com");
-        assert_eq!(up.origin.port, 443);
-        assert!(up.origin.tls);
-        assert_eq!(up.origin.sni, "api.anthropic.com");
-        assert_eq!(up.injection.header, "x-api-key");
-        assert!(matches!(up.injection.scheme, InjectionScheme::Raw));
+        assert_eq!(cfg.auth.issuer, "https://trust.pit.internal/");
+        assert_eq!(cfg.auth.audience, "trust-proxy");
+        assert_eq!(
+            cfg.auth.signing.token_ttl,
+            std::time::Duration::from_secs(7 * 24 * 3600)
+        );
+        assert_eq!(cfg.issuance.clients.len(), 1);
+        assert_eq!(cfg.issuance.clients[0].spiffe, "spiffe://pit/ci/pit-ts");
+        assert!(cfg.upstreams[0].resource.is_none());
+        assert!(matches!(
+            cfg.upstreams[1].resource,
+            Some(crate::resource::ResourceKind::GithubRepo)
+        ));
+    }
+
+    #[test]
+    fn rejects_bad_ttl() {
+        let bad = GOOD.replace(r#"token_ttl = "7d""#, r#"token_ttl = "banana""#);
+        assert!(matches!(
+            Config::from_str(&bad),
+            Err(ConfigError::BadDuration { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_bad_allowed_scope() {
+        let bad = GOOD.replace(
+            r#"allowed_scopes = ["github:pitorg/pit-ts"]"#,
+            r#"allowed_scopes = ["bad:too/many/parts"]"#,
+        );
+        assert!(matches!(
+            Config::from_str(&bad),
+            Err(ConfigError::BadScope { .. })
+        ));
     }
 
     #[test]
@@ -232,7 +361,7 @@ injection = { header = "x-api-key", scheme = "raw" }
 [[upstreams]]
 name = "anthropic"
 kind = "api"
-listen_host = "other.proxy.internal"
+listen_host = "dup.proxy.internal"
 origin = "https://api.anthropic.com"
 secret_ref = "projects/p/secrets/x/versions/latest"
 injection = { header = "x-api-key", scheme = "raw" }
@@ -244,23 +373,15 @@ injection = { header = "x-api-key", scheme = "raw" }
     }
 
     #[test]
-    fn rejects_token_referencing_unknown_upstream() {
-        let bad = GOOD.replace(
-            r#"allowed_upstreams = ["anthropic"]"#,
-            r#"allowed_upstreams = ["ghost"]"#,
-        );
+    fn rejects_missing_tls() {
+        let no_tls = GOOD
+            .replace(
+                "[tls]\naddr = \"0.0.0.0:6443\"\ncert_path = \"/etc/trust/server.crt\"\nkey_path = \"/etc/trust/server.key\"\n\n",
+                "",
+            );
         assert!(matches!(
-            Config::from_str(&bad),
-            Err(ConfigError::UnknownUpstreamRef { .. })
-        ));
-    }
-
-    #[test]
-    fn rejects_non_http_origin() {
-        let bad = GOOD.replace("https://api.anthropic.com", "ftp://api.anthropic.com");
-        assert!(matches!(
-            Config::from_str(&bad),
-            Err(ConfigError::BadOrigin { .. })
+            Config::from_str(&no_tls),
+            Err(ConfigError::MissingTls)
         ));
     }
 }
