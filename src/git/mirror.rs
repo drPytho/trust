@@ -42,6 +42,16 @@ pub enum GitError {
         #[source]
         source: std::io::Error,
     },
+
+    /// `git fetch --prune origin` exited with a non-zero status.
+    ///
+    /// SECURITY: `auth_header` must never appear here — only the key and path.
+    #[error("git fetch failed for {key} at {path} (exit: {exit_code:?})")]
+    Fetch {
+        key: String,
+        path: PathBuf,
+        exit_code: Option<i32>,
+    },
 }
 
 // ---------------------------------------------------------------------------
