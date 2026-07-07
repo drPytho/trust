@@ -30,16 +30,17 @@ COPY . .
 RUN touch src/main.rs src/lib.rs && cargo build --release --locked
 
 # ---- Runtime ------------------------------------------------------------
-# distroless/cc has glibc + libgcc + ca-certificates but NOT libssl, which
-# the binary needs (pingora links system OpenSSL). Copy those .so files in.
-#
-# NOTE: distroless has no `git` binary. When Phase 3 (git-cache) lands it
-# will need `git` at runtime — switch this stage to debian:bookworm-slim
-# with `apt-get install -y git`, or copy the git binary + its deps in.
-FROM gcr.io/distroless/cc-debian12 AS runtime
+# debian-slim provides libssl3 (pingora links system OpenSSL), ca-certificates
+# (outbound TLS to GCP/upstreams), and `git` — required by the git-cache
+# upstream, which shells out to `git http-backend` (serve) and `git fetch` (sync).
+FROM debian:bookworm-slim AS runtime
 
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libssl.so.3 /usr/lib/x86_64-linux-gnu/
-COPY --from=builder /usr/lib/x86_64-linux-gnu/libcrypto.so.3 /usr/lib/x86_64-linux-gnu/
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git \
+        libssl3 \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY --from=builder /app/target/release/trust /usr/local/bin/trust
 
 # Config path (mount your config.toml here); override with -e TRUST_CONFIG=...
