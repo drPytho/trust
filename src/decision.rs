@@ -1,163 +1,68 @@
-use std::sync::Arc;
-
-use crate::auth::{Principal, TokenMap, extract_bearer};
 use crate::config::Upstream;
-use crate::router::Router;
+use crate::resource::extract;
+use crate::scope::ScopeSet;
 
-#[derive(Debug)]
-pub enum Decision {
-    Reject { status: u16, body: &'static str },
-    Forward(Arc<Upstream>),
-}
-
-pub fn authorize(principal: &Principal, upstream: &Upstream) -> bool {
-    principal.allowed.iter().any(|name| name == &upstream.name)
-}
-
-pub fn decide(
-    host: Option<&str>,
-    auth: Option<&[u8]>,
-    router: &Router,
-    tokens: &TokenMap,
-) -> Decision {
-    let Some(host) = host else {
-        return Decision::Reject {
-            status: 404,
-            body: "unknown host",
-        };
-    };
-    let Some(upstream) = router.resolve(host) else {
-        return Decision::Reject {
-            status: 404,
-            body: "unknown host",
-        };
-    };
-    let token = match extract_bearer(auth) {
-        Ok(t) => t,
-        Err(_) => {
-            return Decision::Reject {
-                status: 401,
-                body: "missing or invalid token",
-            };
-        }
-    };
-    let Some(principal) = tokens.lookup(&token) else {
-        return Decision::Reject {
-            status: 401,
-            body: "missing or invalid token",
-        };
-    };
-    if !authorize(&principal, &upstream) {
-        return Decision::Reject {
-            status: 403,
-            body: "not allowed for this upstream",
-        };
+/// Extract the raw bearer token (a JWT here) from an Authorization header value.
+pub fn extract_bearer(header: Option<&[u8]>) -> Option<String> {
+    let raw = header?;
+    let text = std::str::from_utf8(raw).ok()?;
+    let token = text.strip_prefix("Bearer ")?;
+    if token.is_empty() {
+        return None;
     }
-    Decision::Forward(upstream)
+    Some(token.to_string())
+}
+
+/// Authorize a verified token's scopes against an upstream + request path.
+pub fn authorize(scopes: &ScopeSet, upstream: &Upstream, path: &str) -> bool {
+    let resource = upstream.resource.and_then(|kind| extract(kind, path));
+    scopes.permits(&upstream.name, resource.as_ref())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::TokenMap;
-    use crate::auth::TokenEntry;
     use crate::config::{Injection, InjectionScheme, Origin, Upstream, UpstreamKind};
-    use crate::router::Router;
+    use crate::resource::ResourceKind;
+    use crate::scope::ScopeSet;
     use std::sync::Arc;
 
-    fn up(name: &str, host: &str) -> Arc<Upstream> {
+    fn upstream(name: &str, resource: Option<ResourceKind>) -> Arc<Upstream> {
         Arc::new(Upstream {
             name: name.into(),
             kind: UpstreamKind::Api,
-            listen_host: host.into(),
-            origin: Origin {
-                host: "example.com".into(),
-                port: 443,
-                tls: true,
-                sni: "example.com".into(),
-            },
+            listen_host: format!("{name}.proxy"),
+            origin: Origin { host: "h".into(), port: 443, tls: true, sni: "h".into() },
             secret_ref: "ref".into(),
-            injection: Injection {
-                header: "x-api-key".into(),
-                scheme: InjectionScheme::Raw,
-            },
-            resource: None,
+            injection: Injection { header: "authorization".into(), scheme: InjectionScheme::Bearer },
+            resource,
         })
     }
 
-    fn setup() -> (Router, TokenMap) {
-        let ups = vec![up("anthropic", "anthropic.proxy.internal")];
-        let tokens = TokenMap::new(&[TokenEntry {
-            token: "good".into(),
-            principal: "team-x".into(),
-            allowed_upstreams: vec!["anthropic".into()],
-        }]);
-        (Router::new(&ups), tokens)
+    #[test]
+    fn extract_bearer_parses() {
+        assert_eq!(extract_bearer(Some(b"Bearer abc")).as_deref(), Some("abc"));
+        assert!(extract_bearer(None).is_none());
+        assert!(extract_bearer(Some(b"Basic abc")).is_none());
     }
 
     #[test]
-    fn unknown_host_404() {
-        let (r, t) = setup();
-        assert!(matches!(
-            decide(Some("nope"), Some(b"Bearer good"), &r, &t),
-            Decision::Reject { status: 404, .. }
-        ));
-        assert!(matches!(
-            decide(None, Some(b"Bearer good"), &r, &t),
-            Decision::Reject { status: 404, .. }
-        ));
+    fn authorize_unscoped() {
+        let up = upstream("anthropic", None);
+        let s = ScopeSet::parse("anthropic").unwrap();
+        assert!(authorize(&s, &up, "/v1/messages"));
+        let s2 = ScopeSet::parse("mistral").unwrap();
+        assert!(!authorize(&s2, &up, "/v1/messages"));
     }
 
     #[test]
-    fn bad_token_401() {
-        let (r, t) = setup();
-        assert!(matches!(
-            decide(Some("anthropic.proxy.internal"), None, &r, &t),
-            Decision::Reject { status: 401, .. }
-        ));
-        assert!(matches!(
-            decide(
-                Some("anthropic.proxy.internal"),
-                Some(b"Bearer wrong"),
-                &r,
-                &t
-            ),
-            Decision::Reject { status: 401, .. }
-        ));
-    }
-
-    #[test]
-    fn not_allowed_403() {
-        let ups = vec![up("anthropic", "anthropic.proxy.internal")];
-        let tokens = TokenMap::new(&[TokenEntry {
-            token: "good".into(),
-            principal: "team-x".into(),
-            allowed_upstreams: vec![], // allowed to nothing
-        }]);
-
-        let r = Router::new(&ups);
-        assert!(matches!(
-            decide(
-                Some("anthropic.proxy.internal"),
-                Some(b"Bearer good"),
-                &r,
-                &tokens
-            ),
-            Decision::Reject { status: 403, .. }
-        ));
-    }
-
-    #[test]
-    fn happy_path_forwards() {
-        let (r, t) = setup();
-        match decide(
-            Some("anthropic.proxy.internal"),
-            Some(b"Bearer good"),
-            &r,
-            &t,
-        ) {
-            Decision::Forward(u) => assert_eq!(u.name, "anthropic"),
-            other => panic!("expected forward, got {other:?}"),
-        }
+    fn authorize_resource_scoped() {
+        let up = upstream("github", Some(ResourceKind::GithubRepo));
+        let s = ScopeSet::parse("github:pitorg/pit-ts").unwrap();
+        assert!(authorize(&s, &up, "/repos/pitorg/pit-ts/issues"));
+        assert!(!authorize(&s, &up, "/repos/pitorg/other/issues"));
+        // Non-repo path on a scoped upstream: only a bare token authorizes.
+        assert!(!authorize(&s, &up, "/user"));
+        assert!(authorize(&ScopeSet::parse("github").unwrap(), &up, "/user"));
     }
 }
