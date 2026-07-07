@@ -6,13 +6,13 @@ use std::time::Duration;
 use pingora::prelude::*;
 use trust::config::{Injection, InjectionScheme, Origin, Upstream, UpstreamKind};
 use trust::jwt::{Issuer, Verifier};
-use trust::keystore::{build_key_material, Keystore};
+use trust::keystore::{Keystore, build_key_material};
 use trust::proxy::ProxyService;
 use trust::resource::ResourceKind;
 use trust::router::Router;
 use trust::scope::ScopeSet;
-use trust::secrets::fake::FakeSecretProvider;
 use trust::secrets::SecretProvider;
+use trust::secrets::fake::FakeSecretProvider;
 
 fn signing_key_pem() -> String {
     rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
@@ -33,7 +33,9 @@ fn start_mock_upstream() -> (u16, Arc<Mutex<Vec<String>>>) {
             };
             let mut buf = [0u8; 4096];
             let n = stream.read(&mut buf).unwrap_or(0);
-            sink.lock().unwrap().push(String::from_utf8_lossy(&buf[..n]).to_string());
+            sink.lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&buf[..n]).to_string());
             let _ = stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
         }
@@ -42,7 +44,11 @@ fn start_mock_upstream() -> (u16, Arc<Mutex<Vec<String>>>) {
 }
 
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 fn raw_request(proxy_port: u16, host: &str, path: &str, bearer: Option<&str>) -> (u16, String) {
@@ -76,7 +82,10 @@ fn scoped_upstream(mock_port: u16) -> Arc<Upstream> {
             sni: String::new(),
         },
         secret_ref: "ref/gh".into(),
-        injection: Injection { header: "authorization".into(), scheme: InjectionScheme::Bearer },
+        injection: Injection {
+            header: "authorization".into(),
+            scheme: InjectionScheme::Bearer,
+        },
         resource: Some(ResourceKind::GithubRepo),
     })
 }
@@ -91,10 +100,16 @@ fn jwt_scoped_egress_end_to_end() {
     let km = keystore.load().unwrap();
 
     // Mint a token scoped to github:pitorg/pit-ts.
-    let issuer = Issuer::new("trust".into(), "trust-proxy".into(), Duration::from_secs(3600));
+    let issuer = Issuer::new(
+        "trust".into(),
+        "trust-proxy".into(),
+        Duration::from_secs(3600),
+    );
     let now = jsonwebtoken::get_current_timestamp();
     let scopes = ScopeSet::parse("github:pitorg/pit-ts").unwrap();
-    let token = issuer.mint(&km, "spiffe://pit/ci/pit-ts", &scopes, now).unwrap();
+    let token = issuer
+        .mint(&km, "spiffe://pit/ci/pit-ts", &scopes, now)
+        .unwrap();
     let expired = issuer.mint(&km, "s", &scopes, now - 100_000).unwrap();
 
     // Build the proxy with the same keystore + a github upstream pointing at the mock.
@@ -122,10 +137,19 @@ fn jwt_scoped_egress_end_to_end() {
     }
 
     // Missing token → 401.
-    assert_eq!(raw_request(proxy_port, "gh.test", "/repos/pitorg/pit-ts/x", None).0, 401);
+    assert_eq!(
+        raw_request(proxy_port, "gh.test", "/repos/pitorg/pit-ts/x", None).0,
+        401
+    );
     // Expired token → 401.
     assert_eq!(
-        raw_request(proxy_port, "gh.test", "/repos/pitorg/pit-ts/x", Some(&expired)).0,
+        raw_request(
+            proxy_port,
+            "gh.test",
+            "/repos/pitorg/pit-ts/x",
+            Some(&expired)
+        )
+        .0,
         401
     );
     // Valid token, repo OUT of scope → 403.
@@ -134,7 +158,12 @@ fn jwt_scoped_egress_end_to_end() {
         403
     );
     // Valid token, repo IN scope → 200.
-    let (status, _) = raw_request(proxy_port, "gh.test", "/repos/pitorg/pit-ts/x", Some(&token));
+    let (status, _) = raw_request(
+        proxy_port,
+        "gh.test",
+        "/repos/pitorg/pit-ts/x",
+        Some(&token),
+    );
     assert_eq!(status, 200);
 
     std::thread::sleep(Duration::from_millis(100));
@@ -145,8 +174,14 @@ fn jwt_scoped_egress_end_to_end() {
         lower.contains("authorization: bearer injected-token"),
         "secret not injected: {last}"
     );
-    assert!(!lower.contains(&token.to_lowercase()), "client JWT leaked upstream: {last}");
-    assert!(lower.contains("host: 127.0.0.1"), "host not rewritten: {last}");
+    assert!(
+        !lower.contains(&token.to_lowercase()),
+        "client JWT leaked upstream: {last}"
+    );
+    assert!(
+        lower.contains("host: 127.0.0.1"),
+        "host not rewritten: {last}"
+    );
 }
 
 /// Issuance sub-test: proves the `ClientPolicy` → `grant` → `Issuer::mint` path.
@@ -182,16 +217,25 @@ fn issuance_policy_and_grant_decision() {
     let spiffe = "spiffe://pit/ci/pit-ts";
 
     // --- Happy path: request github:pitorg/pit-ts ---
-    let allowed = policy.allowed_scopes(spiffe).expect("policy should know this identity");
+    let allowed = policy
+        .allowed_scopes(spiffe)
+        .expect("policy should know this identity");
     let requested_good = ScopeSet::parse("github:pitorg/pit-ts").unwrap();
-    grant(allowed, &requested_good).expect("github:pitorg/pit-ts should be covered by github:pitorg/*");
+    grant(allowed, &requested_good)
+        .expect("github:pitorg/pit-ts should be covered by github:pitorg/*");
 
-    let issuer = Issuer::new("trust".into(), "trust-proxy".into(), Duration::from_secs(3600));
+    let issuer = Issuer::new(
+        "trust".into(),
+        "trust-proxy".into(),
+        Duration::from_secs(3600),
+    );
     let now = jsonwebtoken::get_current_timestamp();
     let token = issuer.mint(&km, spiffe, &requested_good, now).unwrap();
 
     let verifier = Verifier::new("trust".into(), "trust-proxy".into());
-    let got_scopes = verifier.verify(&km, &token).expect("minted token should verify");
+    let got_scopes = verifier
+        .verify(&km, &token)
+        .expect("minted token should verify");
     assert_eq!(got_scopes.to_scope_string(), "github:pitorg/pit-ts");
 
     // --- Denied: request mistral (not in policy) ---

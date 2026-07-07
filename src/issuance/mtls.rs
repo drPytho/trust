@@ -5,10 +5,10 @@ pub fn extract_spiffe(cert_der: &[u8]) -> Option<String> {
     let (_rem, cert) = X509Certificate::from_der(cert_der).ok()?;
     let san = cert.subject_alternative_name().ok()??;
     for gn in &san.value.general_names {
-        if let GeneralName::URI(uri) = gn {
-            if uri.starts_with("spiffe://") {
-                return Some((*uri).to_string());
-            }
+        if let GeneralName::URI(uri) = gn
+            && uri.starts_with("spiffe://")
+        {
+            return Some((*uri).to_string());
         }
     }
     None
@@ -20,9 +20,9 @@ mod tests {
 
     fn client_cert_der_with_uri(uri: &str) -> Vec<u8> {
         let mut params = rcgen::CertificateParams::new(vec!["client".to_string()]).unwrap();
-        params
-            .subject_alt_names
-            .push(rcgen::SanType::URI(rcgen::string::Ia5String::try_from(uri).unwrap()));
+        params.subject_alt_names.push(rcgen::SanType::URI(
+            rcgen::string::Ia5String::try_from(uri).unwrap(),
+        ));
         let key = rcgen::KeyPair::generate().unwrap();
         let cert = params.self_signed(&key).unwrap();
         cert.der().to_vec()
@@ -31,7 +31,10 @@ mod tests {
     #[test]
     fn extracts_spiffe_uri() {
         let der = client_cert_der_with_uri("spiffe://pit/ci/pit-ts");
-        assert_eq!(extract_spiffe(&der).as_deref(), Some("spiffe://pit/ci/pit-ts"));
+        assert_eq!(
+            extract_spiffe(&der).as_deref(),
+            Some("spiffe://pit/ci/pit-ts")
+        );
     }
 
     #[test]

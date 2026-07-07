@@ -1,5 +1,5 @@
 use jsonwebtoken::errors::ErrorKind;
-use jsonwebtoken::{decode, decode_header, encode, Algorithm, Header, Validation};
+use jsonwebtoken::{Algorithm, Header, Validation, decode, decode_header, encode};
 use serde::{Deserialize, Serialize};
 
 use crate::keystore::KeyMaterial;
@@ -37,7 +37,11 @@ pub struct Issuer {
 
 impl Issuer {
     pub fn new(issuer: String, audience: String, ttl: std::time::Duration) -> Issuer {
-        Issuer { issuer, audience, ttl_secs: ttl.as_secs() }
+        Issuer {
+            issuer,
+            audience,
+            ttl_secs: ttl.as_secs(),
+        }
     }
 
     pub fn ttl_secs(&self) -> u64 {
@@ -112,7 +116,11 @@ mod tests {
     #[test]
     fn mint_then_verify_roundtrip() {
         let km = km();
-        let issuer = Issuer::new("iss".into(), "aud".into(), std::time::Duration::from_secs(3600));
+        let issuer = Issuer::new(
+            "iss".into(),
+            "aud".into(),
+            std::time::Duration::from_secs(3600),
+        );
         let verifier = Verifier::new("iss".into(), "aud".into());
         let scopes = ScopeSet::parse("anthropic github:pitorg/pit-ts").unwrap();
         let token = issuer.mint(&km, "user:filip", &scopes, now()).unwrap();
@@ -123,21 +131,37 @@ mod tests {
     #[test]
     fn rejects_expired() {
         let km = km();
-        let issuer = Issuer::new("iss".into(), "aud".into(), std::time::Duration::from_secs(3600));
+        let issuer = Issuer::new(
+            "iss".into(),
+            "aud".into(),
+            std::time::Duration::from_secs(3600),
+        );
         let verifier = Verifier::new("iss".into(), "aud".into());
         let scopes = ScopeSet::parse("anthropic").unwrap();
         // iat far in the past → exp already elapsed.
         let token = issuer.mint(&km, "s", &scopes, now() - 100_000).unwrap();
-        assert!(matches!(verifier.verify(&km, &token), Err(JwtError::Expired)));
+        assert!(matches!(
+            verifier.verify(&km, &token),
+            Err(JwtError::Expired)
+        ));
     }
 
     #[test]
     fn rejects_wrong_audience() {
         let km = km();
-        let issuer = Issuer::new("iss".into(), "other-aud".into(), std::time::Duration::from_secs(3600));
+        let issuer = Issuer::new(
+            "iss".into(),
+            "other-aud".into(),
+            std::time::Duration::from_secs(3600),
+        );
         let verifier = Verifier::new("iss".into(), "aud".into());
-        let token = issuer.mint(&km, "s", &ScopeSet::parse("anthropic").unwrap(), now()).unwrap();
-        assert!(matches!(verifier.verify(&km, &token), Err(JwtError::Invalid(_))));
+        let token = issuer
+            .mint(&km, "s", &ScopeSet::parse("anthropic").unwrap(), now())
+            .unwrap();
+        assert!(matches!(
+            verifier.verify(&km, &token),
+            Err(JwtError::Invalid(_))
+        ));
     }
 
     #[test]
@@ -145,9 +169,23 @@ mod tests {
         // Token signed by a DIFFERENT key material → its kid isn't in `km`.
         let signer_km = km();
         let verifier_km = km();
-        let issuer = Issuer::new("iss".into(), "aud".into(), std::time::Duration::from_secs(3600));
+        let issuer = Issuer::new(
+            "iss".into(),
+            "aud".into(),
+            std::time::Duration::from_secs(3600),
+        );
         let verifier = Verifier::new("iss".into(), "aud".into());
-        let token = issuer.mint(&signer_km, "s", &ScopeSet::parse("anthropic").unwrap(), now()).unwrap();
-        assert!(matches!(verifier.verify(&verifier_km, &token), Err(JwtError::UnknownKid)));
+        let token = issuer
+            .mint(
+                &signer_km,
+                "s",
+                &ScopeSet::parse("anthropic").unwrap(),
+                now(),
+            )
+            .unwrap();
+        assert!(matches!(
+            verifier.verify(&verifier_km, &token),
+            Err(JwtError::UnknownKid)
+        ));
     }
 }

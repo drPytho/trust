@@ -32,9 +32,17 @@ mod tests {
             name: name.into(),
             kind: UpstreamKind::Api,
             listen_host: format!("{name}.proxy"),
-            origin: Origin { host: "h".into(), port: 443, tls: true, sni: "h".into() },
+            origin: Origin {
+                host: "h".into(),
+                port: 443,
+                tls: true,
+                sni: "h".into(),
+            },
             secret_ref: "ref".into(),
-            injection: Injection { header: "authorization".into(), scheme: InjectionScheme::Bearer },
+            injection: Injection {
+                header: "authorization".into(),
+                scheme: InjectionScheme::Bearer,
+            },
             resource,
         })
     }

@@ -41,7 +41,8 @@ impl Scope {
                     .ok_or_else(|| ScopeError::Malformed(tok.to_string()))?;
                 // Reject `upstream:owner/repo/extra` — split_once('/') only splits on the first /,
                 // so repo can still contain '/' even after split. This guard is load-bearing.
-                if upstream.is_empty() || owner.is_empty() || repo.is_empty() || repo.contains('/') {
+                if upstream.is_empty() || owner.is_empty() || repo.is_empty() || repo.contains('/')
+                {
                     return Err(ScopeError::Malformed(tok.to_string()));
                 }
                 let repo = if repo == "*" {
@@ -61,7 +62,11 @@ impl Scope {
     pub fn to_token(&self) -> String {
         match self {
             Scope::Upstream(u) => u.clone(),
-            Scope::Resource { upstream, owner, repo } => {
+            Scope::Resource {
+                upstream,
+                owner,
+                repo,
+            } => {
                 let r = match repo {
                     RepoPat::Exact(r) => r.as_str(),
                     RepoPat::Wildcard => "*",
@@ -92,7 +97,11 @@ impl ScopeSet {
     }
 
     pub fn to_scope_string(&self) -> String {
-        self.0.iter().map(Scope::to_token).collect::<Vec<_>>().join(" ")
+        self.0
+            .iter()
+            .map(Scope::to_token)
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// Authorization check for a proxied request.
@@ -101,16 +110,19 @@ impl ScopeSet {
             match scope {
                 // Bare upstream grants everything under it.
                 Scope::Upstream(u) if u == upstream => return true,
-                Scope::Resource { upstream: u, owner, repo } if u == upstream => {
-                    if let Some(res) = resource {
-                        if *owner == res.owner
-                            && match repo {
-                                RepoPat::Wildcard => true,
-                                RepoPat::Exact(r) => *r == res.repo,
-                            }
-                        {
-                            return true;
+                Scope::Resource {
+                    upstream: u,
+                    owner,
+                    repo,
+                } if u == upstream => {
+                    if let Some(res) = resource
+                        && *owner == res.owner
+                        && match repo {
+                            RepoPat::Wildcard => true,
+                            RepoPat::Exact(r) => *r == res.repo,
                         }
+                    {
+                        return true;
                     }
                 }
                 _ => {}
@@ -127,8 +139,16 @@ pub fn covers(allowed: &Scope, requested: &Scope) -> bool {
         // A bare upstream grant covers any resource under that upstream.
         (Scope::Upstream(a), Scope::Resource { upstream: r, .. }) => a == r,
         (
-            Scope::Resource { upstream: au, owner: ao, repo: ar },
-            Scope::Resource { upstream: ru, owner: ro, repo: rr },
+            Scope::Resource {
+                upstream: au,
+                owner: ao,
+                repo: ar,
+            },
+            Scope::Resource {
+                upstream: ru,
+                owner: ro,
+                repo: rr,
+            },
         ) => {
             au == ru
                 && ao == ro
@@ -158,14 +178,23 @@ mod tests {
     use super::*;
 
     fn res(owner: &str, repo: &str) -> Resource {
-        Resource { owner: owner.into(), repo: repo.into() }
+        Resource {
+            owner: owner.into(),
+            repo: repo.into(),
+        }
     }
 
     #[test]
     fn parses_tokens() {
-        assert!(matches!(Scope::parse("anthropic").unwrap(), Scope::Upstream(u) if u == "anthropic"));
+        assert!(
+            matches!(Scope::parse("anthropic").unwrap(), Scope::Upstream(u) if u == "anthropic")
+        );
         match Scope::parse("github:pitorg/pit-ts").unwrap() {
-            Scope::Resource { upstream, owner, repo } => {
+            Scope::Resource {
+                upstream,
+                owner,
+                repo,
+            } => {
                 assert_eq!(upstream, "github");
                 assert_eq!(owner, "pitorg");
                 assert!(matches!(repo, RepoPat::Exact(r) if r == "pit-ts"));
@@ -174,7 +203,10 @@ mod tests {
         }
         assert!(matches!(
             Scope::parse("github:pit-customer/*").unwrap(),
-            Scope::Resource { repo: RepoPat::Wildcard, .. }
+            Scope::Resource {
+                repo: RepoPat::Wildcard,
+                ..
+            }
         ));
         assert!(Scope::parse("bad:too/many/parts").is_err());
         assert!(Scope::parse("").is_err());
@@ -196,10 +228,10 @@ mod tests {
     #[test]
     fn permits_resource_scoped() {
         let s = ScopeSet::parse("github:pitorg/pit-ts github:pit-customer/*").unwrap();
-        assert!(s.permits("github", Some(&res("pitorg", "pit-ts"))));       // exact
-        assert!(s.permits("github", Some(&res("pit-customer", "acme"))));   // wildcard
-        assert!(!s.permits("github", Some(&res("pitorg", "other"))));       // not granted
-        assert!(!s.permits("github", None));                               // no bare token
+        assert!(s.permits("github", Some(&res("pitorg", "pit-ts")))); // exact
+        assert!(s.permits("github", Some(&res("pit-customer", "acme")))); // wildcard
+        assert!(!s.permits("github", Some(&res("pitorg", "other")))); // not granted
+        assert!(!s.permits("github", None)); // no bare token
     }
 
     #[test]
@@ -214,10 +246,10 @@ mod tests {
         let bare = Scope::parse("github").unwrap();
         let wild = Scope::parse("github:pitorg/*").unwrap();
         let exact = Scope::parse("github:pitorg/pit-ts").unwrap();
-        assert!(covers(&bare, &exact));            // bare grants any repo
-        assert!(covers(&wild, &exact));            // wildcard grants a specific repo
+        assert!(covers(&bare, &exact)); // bare grants any repo
+        assert!(covers(&wild, &exact)); // wildcard grants a specific repo
         assert!(covers(&wild, &wild));
-        assert!(!covers(&exact, &wild));           // exact does not grant wildcard
+        assert!(!covers(&exact, &wild)); // exact does not grant wildcard
         assert!(!covers(&Scope::parse("github:other/*").unwrap(), &exact));
     }
 
@@ -233,8 +265,14 @@ mod tests {
 
     #[test]
     fn covers_different_upstream_false() {
-        assert!(!covers(&Scope::parse("gitlab").unwrap(), &Scope::parse("github:pitorg/pit-ts").unwrap()));
-        assert!(!covers(&Scope::parse("github").unwrap(), &Scope::parse("gitlab").unwrap()));
+        assert!(!covers(
+            &Scope::parse("gitlab").unwrap(),
+            &Scope::parse("github:pitorg/pit-ts").unwrap()
+        ));
+        assert!(!covers(
+            &Scope::parse("github").unwrap(),
+            &Scope::parse("gitlab").unwrap()
+        ));
     }
 
     #[test]

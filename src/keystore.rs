@@ -2,16 +2,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jsonwebtoken::jwk::{
     AlgorithmParameters, CommonParameters, EllipticCurve, EllipticCurveKeyParameters,
     EllipticCurveKeyType, Jwk, JwkSet, KeyAlgorithm, PublicKeyUse, ThumbprintHash,
 };
 use jsonwebtoken::{DecodingKey, EncodingKey};
+use p256::SecretKey;
 use p256::elliptic_curve::sec1::ToEncodedPoint;
 use p256::pkcs8::{DecodePrivateKey, EncodePublicKey};
-use p256::SecretKey;
 
 use crate::config::SigningConfig;
 use crate::secrets::SecretProvider;
@@ -88,7 +88,12 @@ pub fn build_key_material(
     let jwks_json = serde_json::to_string(&JwkSet { keys: jwks })
         .map_err(|e| KeystoreError::BadKey(e.to_string()))?;
 
-    Ok(KeyMaterial { signing_kid, encoding, decoding, jwks_json })
+    Ok(KeyMaterial {
+        signing_kid,
+        encoding,
+        decoding,
+        jwks_json,
+    })
 }
 
 pub async fn fetch(
@@ -117,7 +122,9 @@ pub struct Keystore {
 
 impl Keystore {
     pub fn new() -> Keystore {
-        Keystore { current: ArcSwapOption::empty() }
+        Keystore {
+            current: ArcSwapOption::empty(),
+        }
     }
 
     pub fn load(&self) -> Option<Arc<KeyMaterial>> {

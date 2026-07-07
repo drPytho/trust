@@ -1,5 +1,5 @@
-use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use pingora::listeners::tls::TlsSettings;
@@ -8,10 +8,10 @@ use pingora::prelude::*;
 use trust::config::Config;
 use trust::issuance::policy::ClientPolicy;
 use trust::issuance::server::{
-    build_mtls_server_config, install_crypto_provider, serve_jwks, serve_token, IssuanceState,
+    IssuanceState, build_mtls_server_config, install_crypto_provider, serve_jwks, serve_token,
 };
 use trust::jwt::{Issuer, Verifier};
-use trust::keystore::{fetch, Keystore};
+use trust::keystore::{Keystore, fetch};
 use trust::proxy::ProxyService;
 use trust::router::Router;
 use trust::secrets::gcp::GcpSecretProvider;
@@ -69,15 +69,26 @@ fn main() {
                 );
                 let policy = ClientPolicy::new(&config.issuance.clients)
                     .expect("invalid issuance client policy");
-                let state =
-                    Arc::new(IssuanceState { keystore: keystore.clone(), issuer, policy });
+                let state = Arc::new(IssuanceState {
+                    keystore: keystore.clone(),
+                    issuer,
+                    policy,
+                });
 
                 let server_cert = std::fs::read_to_string(
-                    config.tls.as_ref().map(|t| t.cert_path.as_str()).unwrap_or(""),
+                    config
+                        .tls
+                        .as_ref()
+                        .map(|t| t.cert_path.as_str())
+                        .unwrap_or(""),
                 )
                 .expect("issuance needs a server cert (reuse [tls] cert/key)");
                 let server_key = std::fs::read_to_string(
-                    config.tls.as_ref().map(|t| t.key_path.as_str()).unwrap_or(""),
+                    config
+                        .tls
+                        .as_ref()
+                        .map(|t| t.key_path.as_str())
+                        .unwrap_or(""),
                 )
                 .expect("issuance needs a server key");
                 let client_ca = std::fs::read_to_string(&config.issuance.client_ca_path)
@@ -101,7 +112,9 @@ fn main() {
     }
 
     // Wait for the first key load so the verifier has keys before serving.
-    ready_rx.recv().expect("management stack failed to load keys");
+    ready_rx
+        .recv()
+        .expect("management stack failed to load keys");
 
     let router = Router::new(&config.upstreams);
     let verifier = Verifier::new(config.auth.issuer.clone(), config.auth.audience.clone());

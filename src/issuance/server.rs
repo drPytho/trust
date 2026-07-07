@@ -15,7 +15,7 @@ use crate::issuance::mtls::extract_spiffe;
 use crate::issuance::policy::ClientPolicy;
 use crate::jwt::Issuer;
 use crate::keystore::Keystore;
-use crate::scope::{grant, ScopeSet};
+use crate::scope::{ScopeSet, grant};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
@@ -142,7 +142,9 @@ async fn jwks_handler(State(keystore): State<Arc<Keystore>>) -> axum::response::
 }
 
 pub fn token_router(state: Arc<IssuanceState>) -> Router {
-    Router::new().route("/token", post(token_handler)).with_state(state)
+    Router::new()
+        .route("/token", post(token_handler))
+        .with_state(state)
 }
 
 pub fn jwks_router(keystore: Arc<Keystore>) -> Router {
@@ -203,7 +205,10 @@ mod tests {
         let ca_pem = ca_cert.pem();
 
         let result = build_mtls_server_config(&server_cert_pem, &server_key_pem, &ca_pem);
-        assert!(result.is_ok(), "build_mtls_server_config failed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "build_mtls_server_config failed: {result:?}"
+        );
     }
 
     #[test]
@@ -211,11 +216,8 @@ mod tests {
         install_crypto_provider();
 
         let (server_cert, server_key) = gen_rcgen_cert_and_key();
-        let result = build_mtls_server_config(
-            &server_cert.pem(),
-            &server_key.serialize_pem(),
-            "not-a-pem",
-        );
+        let result =
+            build_mtls_server_config(&server_cert.pem(), &server_key.serialize_pem(), "not-a-pem");
         // Empty CA roots should cause WebPkiClientVerifier::build() to fail.
         assert!(result.is_err());
     }

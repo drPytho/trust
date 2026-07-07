@@ -33,17 +33,17 @@ impl ClientPolicy {
     pub fn allowed_scopes(&self, spiffe: &str) -> Option<&ScopeSet> {
         // Exact matches win over prefix matches.
         for e in &self.entries {
-            if let Matcher::Exact(id) = &e.matcher {
-                if id == spiffe {
-                    return Some(&e.scopes);
-                }
+            if let Matcher::Exact(id) = &e.matcher
+                && id == spiffe
+            {
+                return Some(&e.scopes);
             }
         }
         for e in &self.entries {
-            if let Matcher::Prefix(p) = &e.matcher {
-                if spiffe.starts_with(p) {
-                    return Some(&e.scopes);
-                }
+            if let Matcher::Prefix(p) = &e.matcher
+                && spiffe.starts_with(p)
+            {
+                return Some(&e.scopes);
             }
         }
         None
@@ -78,7 +78,9 @@ mod tests {
     #[test]
     fn prefix_match() {
         let p = ClientPolicy::new(&entries()).unwrap();
-        let s = p.allowed_scopes("spiffe://pit/team/platform/build-42").unwrap();
+        let s = p
+            .allowed_scopes("spiffe://pit/team/platform/build-42")
+            .unwrap();
         assert_eq!(s.to_scope_string(), "anthropic github:pitorg/*");
     }
 

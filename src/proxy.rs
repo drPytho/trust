@@ -33,7 +33,12 @@ impl ProxyService {
         keystore: Arc<Keystore>,
         secrets: Arc<dyn SecretProvider>,
     ) -> ProxyService {
-        ProxyService { router, verifier, keystore, secrets }
+        ProxyService {
+            router,
+            verifier,
+            keystore,
+            secrets,
+        }
     }
 }
 
@@ -53,11 +58,15 @@ impl ProxyHttp for ProxyService {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
         let Some(host) = host else {
-            session.respond_error_with_body(404, Bytes::from_static(b"unknown host")).await?;
+            session
+                .respond_error_with_body(404, Bytes::from_static(b"unknown host"))
+                .await?;
             return Ok(true);
         };
         let Some(upstream) = self.router.resolve(&host) else {
-            session.respond_error_with_body(404, Bytes::from_static(b"unknown host")).await?;
+            session
+                .respond_error_with_body(404, Bytes::from_static(b"unknown host"))
+                .await?;
             return Ok(true);
         };
 
@@ -68,17 +77,23 @@ impl ProxyHttp for ProxyService {
             .get("authorization")
             .map(|v| v.as_bytes().to_vec());
         let Some(token) = extract_bearer(auth.as_deref()) else {
-            session.respond_error_with_body(401, Bytes::from_static(b"missing token")).await?;
+            session
+                .respond_error_with_body(401, Bytes::from_static(b"missing token"))
+                .await?;
             return Ok(true);
         };
         let Some(km) = self.keystore.load() else {
-            session.respond_error_with_body(503, Bytes::from_static(b"keys unavailable")).await?;
+            session
+                .respond_error_with_body(503, Bytes::from_static(b"keys unavailable"))
+                .await?;
             return Ok(true);
         };
         let scopes = match self.verifier.verify(&km, &token) {
             Ok(s) => s,
             Err(_) => {
-                session.respond_error_with_body(401, Bytes::from_static(b"invalid token")).await?;
+                session
+                    .respond_error_with_body(401, Bytes::from_static(b"invalid token"))
+                    .await?;
                 return Ok(true);
             }
         };
@@ -86,7 +101,9 @@ impl ProxyHttp for ProxyService {
         // Authorize by scope (+ resource path).
         let path = session.req_header().uri.path().to_string();
         if !authorize(&scopes, &upstream, &path) {
-            session.respond_error_with_body(403, Bytes::from_static(b"not allowed")).await?;
+            session
+                .respond_error_with_body(403, Bytes::from_static(b"not allowed"))
+                .await?;
             return Ok(true);
         }
 
@@ -99,7 +116,10 @@ impl ProxyHttp for ProxyService {
             Err(e) => {
                 log::error!("secret fetch failed for {}: {e}", upstream.name);
                 session
-                    .respond_error_with_body(502, Bytes::from_static(b"upstream secret unavailable"))
+                    .respond_error_with_body(
+                        502,
+                        Bytes::from_static(b"upstream secret unavailable"),
+                    )
                     .await?;
                 Ok(true)
             }
@@ -116,7 +136,11 @@ impl ProxyHttp for ProxyService {
             .as_ref()
             .ok_or_else(|| Error::new_str("upstream missing in ctx"))?;
         let o = &upstream.origin;
-        Ok(Box::new(HttpPeer::new((o.host.as_str(), o.port), o.tls, o.sni.clone())))
+        Ok(Box::new(HttpPeer::new(
+            (o.host.as_str(), o.port),
+            o.tls,
+            o.sni.clone(),
+        )))
     }
 
     async fn upstream_request_filter(

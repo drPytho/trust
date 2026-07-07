@@ -224,8 +224,11 @@ impl Config {
         }
 
         // Parse token TTL.
-        let token_ttl = humantime::parse_duration(&raw.auth.signing.token_ttl)
-            .map_err(|_| ConfigError::BadDuration { value: raw.auth.signing.token_ttl.clone() })?;
+        let token_ttl = humantime::parse_duration(&raw.auth.signing.token_ttl).map_err(|_| {
+            ConfigError::BadDuration {
+                value: raw.auth.signing.token_ttl.clone(),
+            }
+        })?;
 
         // Validate issuance client scopes.
         for c in &raw.issuance.clients {
@@ -305,7 +308,10 @@ resource = { kind = "github-repo" }
         let cfg = Config::from_str(GOOD).unwrap();
         assert_eq!(cfg.auth.issuer, "https://trust.pit.internal/");
         assert_eq!(cfg.auth.audience, "trust-proxy");
-        assert_eq!(cfg.auth.signing.token_ttl, std::time::Duration::from_secs(7 * 24 * 3600));
+        assert_eq!(
+            cfg.auth.signing.token_ttl,
+            std::time::Duration::from_secs(7 * 24 * 3600)
+        );
         assert_eq!(cfg.issuance.clients.len(), 1);
         assert_eq!(cfg.issuance.clients[0].spiffe, "spiffe://pit/ci/pit-ts");
         assert!(cfg.upstreams[0].resource.is_none());
@@ -318,18 +324,28 @@ resource = { kind = "github-repo" }
     #[test]
     fn rejects_bad_ttl() {
         let bad = GOOD.replace(r#"token_ttl = "7d""#, r#"token_ttl = "banana""#);
-        assert!(matches!(Config::from_str(&bad), Err(ConfigError::BadDuration { .. })));
+        assert!(matches!(
+            Config::from_str(&bad),
+            Err(ConfigError::BadDuration { .. })
+        ));
     }
 
     #[test]
     fn rejects_bad_allowed_scope() {
-        let bad = GOOD.replace(r#"allowed_scopes = ["github:pitorg/pit-ts"]"#, r#"allowed_scopes = ["bad:too/many/parts"]"#);
-        assert!(matches!(Config::from_str(&bad), Err(ConfigError::BadScope { .. })));
+        let bad = GOOD.replace(
+            r#"allowed_scopes = ["github:pitorg/pit-ts"]"#,
+            r#"allowed_scopes = ["bad:too/many/parts"]"#,
+        );
+        assert!(matches!(
+            Config::from_str(&bad),
+            Err(ConfigError::BadScope { .. })
+        ));
     }
 
     #[test]
     fn rejects_duplicate_upstream_name() {
-        let dup = GOOD.to_string() + r#"
+        let dup = GOOD.to_string()
+            + r#"
 [[upstreams]]
 name = "anthropic"
 kind = "api"
@@ -338,6 +354,9 @@ origin = "https://api.anthropic.com"
 secret_ref = "projects/p/secrets/x/versions/latest"
 injection = { header = "x-api-key", scheme = "raw" }
 "#;
-        assert!(matches!(Config::from_str(&dup), Err(ConfigError::DuplicateUpstream(_))));
+        assert!(matches!(
+            Config::from_str(&dup),
+            Err(ConfigError::DuplicateUpstream(_))
+        ));
     }
 }

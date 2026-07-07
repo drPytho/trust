@@ -26,7 +26,10 @@ pub fn extract(kind: ResourceKind, path: &str) -> Option<Resource> {
             if owner.is_empty() || repo.is_empty() {
                 return None;
             }
-            Some(Resource { owner: owner.to_string(), repo: repo.to_string() })
+            Some(Resource {
+                owner: owner.to_string(),
+                repo: repo.to_string(),
+            })
         }
     }
 }
