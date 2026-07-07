@@ -375,15 +375,12 @@ impl ProxyService {
         };
 
         // --- Resolve the mirror path ---
+        // m2: path_for returns None for invalid/unknown repo path → 404, not 500.
         let mirror_path = match self.mirrors.path_for(&upstream.name, &owner, &repo) {
             Some(p) => p,
             None => {
-                log::error!(
-                    "git-cache: invalid mirror path components for {}/{}/{}",
-                    upstream.name, owner, repo
-                );
                 session
-                    .respond_error_with_body(500, Bytes::from_static(b"internal error"))
+                    .respond_error_with_body(404, Bytes::from_static(b"repo not found"))
                     .await?;
                 return Ok(true);
             }
@@ -460,8 +457,17 @@ impl ProxyService {
             .get("git-protocol")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
+        // m1: Pass Content-Length to git http-backend so it can read POST bodies
+        // correctly. If the client used chunked encoding (no Content-Length header),
+        // we omit it and let git rely on stdin EOF instead.
+        let content_length = session
+            .req_header()
+            .headers
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
 
-        let env = backend::cgi_env(
+        let mut env = backend::cgi_env(
             storage_path,
             &owner,
             &repo,
@@ -472,6 +478,9 @@ impl ProxyService {
             git_protocol.as_deref(),
             None, // remote_user: principal not available (JWT verified but sub not extracted)
         );
+        if let Some(cl) = content_length {
+            env.push(("CONTENT_LENGTH".to_owned(), cl));
+        }
 
         // --- Spawn git http-backend ---
         let mut child = match backend::spawn(storage_path, &env).await {
@@ -485,113 +494,199 @@ impl ProxyService {
             }
         };
 
-        // --- Pump request body → child stdin ---
-        if let Some(mut stdin) = child.stdin.take() {
-            // Read whatever body the client sent (may be None for GET requests).
-            let body_opt = session.read_request_body().await;
-            match body_opt {
-                Ok(Some(body)) => {
-                    if let Err(e) = stdin.write_all(&body).await {
-                        log::error!("git-cache: write to child stdin failed: {e}");
+        // --- C1: Pump request body → child stdin (loop until exhausted) ---
+        //
+        // Pingora delivers the request body in multiple chunks; a single
+        // read_request_body() call only returns one chunk and would truncate
+        // git-upload-pack POST negotiation for non-trivial clones/fetches.
+        // We loop until None (EOF) so the child sees the full body, then drop
+        // stdin to send EOF.
+        //
+        // Task 10 integration test: clone a repo large enough to span multiple
+        // body/stdout chunks to guard against regression of C1/I1.
+        {
+            let mut stdin = match child.stdin.take() {
+                Some(s) => s,
+                None => {
+                    log::error!("git-cache: child stdin unavailable");
+                    let _ = child.kill().await;
+                    session
+                        .respond_error_with_body(500, Bytes::from_static(b"backend io error"))
+                        .await?;
+                    return Ok(true);
+                }
+            };
+            loop {
+                match session.read_request_body().await {
+                    Ok(Some(chunk)) => {
+                        if let Err(e) = stdin.write_all(&chunk).await {
+                            log::error!("git-cache: write to child stdin failed: {e}");
+                            let _ = child.kill().await;
+                            session
+                                .respond_error_with_body(
+                                    500,
+                                    Bytes::from_static(b"backend io error"),
+                                )
+                                .await?;
+                            return Ok(true);
+                        }
+                    }
+                    Ok(None) => break, // body exhausted
+                    Err(e) => {
+                        log::error!("git-cache: read request body failed: {e}");
                         let _ = child.kill().await;
                         session
-                            .respond_error_with_body(500, Bytes::from_static(b"backend io error"))
+                            .respond_error_with_body(
+                                500,
+                                Bytes::from_static(b"body read error"),
+                            )
                             .await?;
                         return Ok(true);
                     }
                 }
-                Ok(None) => {
-                    // No body — drop stdin to signal EOF.
-                }
-                Err(e) => {
-                    log::error!("git-cache: read request body failed: {e}");
-                    let _ = child.kill().await;
-                    session
-                        .respond_error_with_body(500, Bytes::from_static(b"body read error"))
-                        .await?;
-                    return Ok(true);
-                }
             }
-            // stdin is dropped here → EOF sent to child.
+            // Drop stdin → EOF sent to child (git http-backend stops reading).
         }
 
-        // --- Read all child stdout ---
-        let stdout_bytes = if let Some(mut stdout) = child.stdout.take() {
-            let mut buf = Vec::new();
-            match stdout.read_to_end(&mut buf).await {
-                Ok(_) => Bytes::from(buf),
+        // --- I1: Stream child stdout incrementally — no full-body buffering ---
+        //
+        // Strategy:
+        //   1. Read into a growing head-buffer ONLY until the CGI header
+        //      terminator (\r\n\r\n or \n\n) is found, capped at 64 KiB.
+        //   2. Parse the CGI head (status + headers) and send the response header.
+        //   3. Write any body bytes already read (past body_offset) as the first
+        //      chunk, then loop-read stdout in fixed-size chunks until EOF.
+        //   4. Signal end-of-body with write_response_body(None, true).
+        //
+        // This ensures we never buffer a full packfile (potentially hundreds of
+        // MB) in a Vec<u8>.
+        const HEAD_CAP: usize = 64 * 1024; // 64 KiB head-read limit
+        const CHUNK: usize = 64 * 1024;    // streaming chunk size
+
+        let mut stdout = match child.stdout.take() {
+            Some(s) => s,
+            None => {
+                log::error!("git-cache: child stdout unavailable");
+                let _ = child.kill().await;
+                session
+                    .respond_error_with_body(500, Bytes::from_static(b"backend read error"))
+                    .await?;
+                return Ok(true);
+            }
+        };
+
+        // Phase 1: read until we have the full CGI header block.
+        let mut head_buf: Vec<u8> = Vec::with_capacity(4096);
+        let body_offset = loop {
+            let mut tmp = [0u8; 512];
+            let n = match stdout.read(&mut tmp).await {
+                Ok(n) => n,
                 Err(e) => {
-                    log::error!("git-cache: read from child stdout failed: {e}");
+                    log::error!("git-cache: stdout head-read failed: {e}");
                     let _ = child.kill().await;
                     session
                         .respond_error_with_body(500, Bytes::from_static(b"backend read error"))
                         .await?;
                     return Ok(true);
                 }
+            };
+            if n == 0 {
+                // EOF before finding header terminator.
+                log::error!("git-cache: stdout EOF before CGI header terminator");
+                let _ = child.kill().await;
+                session
+                    .respond_error_with_body(500, Bytes::from_static(b"invalid backend response"))
+                    .await?;
+                return Ok(true);
             }
-        } else {
-            Bytes::new()
+            head_buf.extend_from_slice(&tmp[..n]);
+            if head_buf.len() > HEAD_CAP {
+                log::error!("git-cache: CGI head exceeded {HEAD_CAP} bytes without terminator");
+                let _ = child.kill().await;
+                session
+                    .respond_error_with_body(500, Bytes::from_static(b"invalid backend response"))
+                    .await?;
+                return Ok(true);
+            }
+            if let Some((_, _, off)) = backend::parse_cgi_head(&head_buf) {
+                break off;
+            }
         };
 
-        // Wait for the child to exit.
+        // Phase 2: parse CGI head and send response headers.
+        let (cgi_status, cgi_headers, _) = match backend::parse_cgi_head(&head_buf) {
+            Some(parsed) => parsed,
+            None => {
+                // Should be unreachable — we just found the terminator above.
+                log::error!("git-cache: could not parse CGI response head");
+                let _ = child.kill().await;
+                session
+                    .respond_error_with_body(500, Bytes::from_static(b"invalid backend response"))
+                    .await?;
+                return Ok(true);
+            }
+        };
+
+        let mut resp =
+            match pingora::http::ResponseHeader::build(cgi_status, Some(cgi_headers.len())) {
+                Ok(r) => r,
+                Err(e) => {
+                    log::error!("git-cache: build response header failed: {e}");
+                    let _ = child.kill().await;
+                    session
+                        .respond_error_with_body(500, Bytes::from_static(b"response build error"))
+                        .await?;
+                    return Ok(true);
+                }
+            };
+        for (k, v) in cgi_headers {
+            if let Err(e) = resp.insert_header(k, v.as_str()) {
+                log::warn!("git-cache: could not insert header: {e}");
+            }
+        }
+        // Omit Content-Length — body size is unknown (streaming packfile).
+        session
+            .write_response_header(Box::new(resp), false)
+            .await?;
+
+        // Phase 3: stream body — first flush any bytes already read past body_offset,
+        // then continue reading stdout in fixed-size chunks until EOF.
+        if body_offset < head_buf.len() {
+            let already_read = Bytes::copy_from_slice(&head_buf[body_offset..]);
+            session
+                .write_response_body(Some(already_read), false)
+                .await?;
+        }
+
+        let mut chunk_buf = vec![0u8; CHUNK];
+        loop {
+            let n = match stdout.read(&mut chunk_buf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    log::error!("git-cache: stdout body-read failed: {e}");
+                    // Headers already sent — can't switch to error response.
+                    // Close the body and let the client detect the truncation.
+                    break;
+                }
+            };
+            if n == 0 {
+                break; // stdout EOF
+            }
+            let chunk = Bytes::copy_from_slice(&chunk_buf[..n]);
+            session.write_response_body(Some(chunk), false).await?;
+        }
+        session.write_response_body(None, true).await?;
+
+        // Wait for the child to exit (best-effort; headers already sent).
         match child.wait().await {
             Ok(status) if !status.success() => {
                 log::warn!("git http-backend exited with status: {status}");
-                // Still serve whatever the CGI produced — git may have written
-                // a useful error response before exiting non-zero.
             }
             Err(e) => {
                 log::warn!("git http-backend wait error: {e}");
             }
             _ => {}
         }
-
-        // --- Parse CGI response head ---
-        let (cgi_status, cgi_headers, body_offset) =
-            match backend::parse_cgi_head(&stdout_bytes) {
-                Some(parsed) => parsed,
-                None => {
-                    log::error!("git-cache: could not parse CGI response head");
-                    session
-                        .respond_error_with_body(
-                            500,
-                            Bytes::from_static(b"invalid backend response"),
-                        )
-                        .await?;
-                    return Ok(true);
-                }
-            };
-
-        let body = stdout_bytes.slice(body_offset..);
-
-        // --- Stream the response to the client ---
-        // Confirmed Pingora streaming API (plan §Global Constraints):
-        //   session.write_response_header(Box<ResponseHeader>, false)
-        //   loop: session.write_response_body(Some(chunk), false)
-        //   session.write_response_body(None, true)
-        let mut resp = match pingora::http::ResponseHeader::build(cgi_status, Some(cgi_headers.len())) {
-            Ok(r) => r,
-            Err(e) => {
-                log::error!("git-cache: build response header failed: {e}");
-                session
-                    .respond_error_with_body(500, Bytes::from_static(b"response build error"))
-                    .await?;
-                return Ok(true);
-            }
-        };
-        for (k, v) in cgi_headers {
-            if let Err(e) = resp.insert_header(k, v.as_str()) {
-                log::warn!("git-cache: could not insert header: {e}");
-            }
-        }
-        session
-            .write_response_header(Box::new(resp), false)
-            .await?;
-
-        if !body.is_empty() {
-            session.write_response_body(Some(body), false).await?;
-        }
-        session.write_response_body(None, true).await?;
 
         Ok(true)
     }
