@@ -146,9 +146,7 @@ impl ProxyHttp for ProxyService {
 
         // --- git-cache branch ---
         if upstream.kind == UpstreamKind::GitCache {
-            return self
-                .handle_git_cache(session, ctx, upstream, &path)
-                .await;
+            return self.handle_git_cache(session, ctx, upstream, &path).await;
         }
 
         // --- api branch (unchanged) ---
@@ -246,7 +244,9 @@ impl ProxyHttp for ProxyService {
                         None => {
                             log::warn!(
                                 "post-push sync: no mirror path for {}/{}/{}",
-                                upstream_arc.name, owner, repo
+                                upstream_arc.name,
+                                owner,
+                                repo
                             );
                             return;
                         }
@@ -276,8 +276,7 @@ impl ProxyHttp for ProxyService {
                             }
                         };
 
-                    let key =
-                        format!("{}/{}/{}", upstream_arc.name, owner, repo);
+                    let key = format!("{}/{}/{}", upstream_arc.name, owner, repo);
                     if let Err(e) = sync.sync(&key, &mirror_path, &auth_header).await {
                         // SECURITY: `e` contains key/path only, never auth_header.
                         log::warn!("post-push sync failed for {key}: {e}");
@@ -302,22 +301,14 @@ impl ProxyService {
         path: &str,
     ) -> Result<bool> {
         let method = session.req_header().method.as_str().to_string();
-        let query = session
-            .req_header()
-            .uri
-            .query()
-            .unwrap_or("")
-            .to_string();
+        let query = session.req_header().uri.query().unwrap_or("").to_string();
 
         match classify(&method, path, &query) {
             GitRequest::Read => {
                 self.handle_git_read(session, ctx, upstream, path, &method, &query)
                     .await
             }
-            GitRequest::Push => {
-                self.handle_git_push(session, ctx, upstream, path)
-                    .await
-            }
+            GitRequest::Push => self.handle_git_push(session, ctx, upstream, path).await,
             GitRequest::Other => {
                 session
                     .respond_error_with_body(400, Bytes::from_static(b"unsupported git request"))
@@ -357,7 +348,10 @@ impl ProxyService {
             Err(e) => {
                 log::error!("git-cache secret fetch failed for {}: {e}", upstream.name);
                 session
-                    .respond_error_with_body(502, Bytes::from_static(b"upstream secret unavailable"))
+                    .respond_error_with_body(
+                        502,
+                        Bytes::from_static(b"upstream secret unavailable"),
+                    )
                     .await?;
                 return Ok(true);
             }
@@ -398,10 +392,16 @@ impl ProxyService {
         };
 
         // --- Ensure the bare mirror exists (clone if absent) ---
-        if let Err(e) = self.mirrors.ensure(&mirror_path, &clone_url, &auth_header).await {
+        if let Err(e) = self
+            .mirrors
+            .ensure(&mirror_path, &clone_url, &auth_header)
+            .await
+        {
             log::error!(
                 "git-cache ensure failed for {}/{}/{}: {e}",
-                upstream.name, owner, repo
+                upstream.name,
+                owner,
+                repo
             );
             session
                 .respond_error_with_body(502, Bytes::from_static(b"mirror unavailable"))
@@ -461,16 +461,40 @@ impl ProxyService {
             .get("git-protocol")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
-        // m1: Pass Content-Length to git http-backend so it can read POST bodies
-        // correctly. If the client used chunked encoding (no Content-Length header),
-        // we omit it and let git rely on stdin EOF instead.
-        let content_length = session
-            .req_header()
-            .headers
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
 
+        // --- Buffer the FULL request body BEFORE touching child stdin/stdout ---
+        //
+        // DEADLOCK FIX: The previous code wrote stdin in a loop, dropped stdin,
+        // THEN read stdout. This is a classic two-pipe deadlock: git http-backend
+        // can start writing stdout (packfile) before draining all of stdin; if its
+        // stdout pipe (kernel 64 KiB) fills while trust is still blocked writing
+        // stdin, both sides wedge. Reachable on fetch with a large "have" set.
+        //
+        // Fix: buffer the entire request body (negotiation body — modest in size)
+        // into an owned Vec<u8> FIRST, using CONTENT_LENGTH derived from the
+        // ACTUAL buffered bytes (not the client header — avoids client spoofing).
+        // Then spawn a concurrent task to drain stdin while the main task streams
+        // stdout. The ordering constraint is removed entirely.
+        //
+        // SECURITY: request body bytes are never logged.
+        let mut req_body: Vec<u8> = Vec::new();
+        loop {
+            match session.read_request_body().await {
+                Ok(Some(chunk)) => req_body.extend_from_slice(&chunk),
+                Ok(None) => break,
+                Err(e) => {
+                    log::error!("git-cache: read request body failed: {e}");
+                    session
+                        .respond_error_with_body(500, Bytes::from_static(b"body read error"))
+                        .await?;
+                    return Ok(true);
+                }
+            }
+        }
+
+        // Build CGI env now that we know the actual body length.
+        // CONTENT_LENGTH is derived from the buffered bytes — NOT from the client's
+        // Content-Length header — so a malicious client cannot forge it.
         let mut env = backend::cgi_env(
             storage_path,
             &owner,
@@ -482,8 +506,8 @@ impl ProxyService {
             git_protocol.as_deref(),
             None, // remote_user: principal not available (JWT verified but sub not extracted)
         );
-        if let Some(cl) = content_length {
-            env.push(("CONTENT_LENGTH".to_owned(), cl));
+        if !req_body.is_empty() {
+            env.push(("CONTENT_LENGTH".to_owned(), req_body.len().to_string()));
         }
 
         // --- Spawn git http-backend ---
@@ -498,66 +522,42 @@ impl ProxyService {
             }
         };
 
-        // --- C1: Pump request body → child stdin (loop until exhausted) ---
+        // --- Concurrent stdin pump (spawned task) + stdout stream (main task) ---
         //
-        // Pingora delivers the request body in multiple chunks; a single
-        // read_request_body() call only returns one chunk and would truncate
-        // git-upload-pack POST negotiation for non-trivial clones/fetches.
-        // We loop until None (EOF) so the child sees the full body, then drop
-        // stdin to send EOF.
+        // The spawned task owns child.stdin and the buffered body; it writes and
+        // drops stdin (sending EOF) without touching `session`.  The main task
+        // concurrently reads and streams stdout.  Because both pipes are drained
+        // simultaneously, neither can fill and deadlock.
         //
-        // Task 10 integration test: clone a repo large enough to span multiple
-        // body/stdout chunks to guard against regression of C1/I1.
-        {
-            let mut stdin = match child.stdin.take() {
-                Some(s) => s,
-                None => {
-                    log::error!("git-cache: child stdin unavailable");
-                    let _ = child.kill().await;
-                    session
-                        .respond_error_with_body(500, Bytes::from_static(b"backend io error"))
-                        .await?;
-                    return Ok(true);
-                }
-            };
-            loop {
-                match session.read_request_body().await {
-                    Ok(Some(chunk)) => {
-                        if let Err(e) = stdin.write_all(&chunk).await {
-                            log::error!("git-cache: write to child stdin failed: {e}");
-                            let _ = child.kill().await;
-                            session
-                                .respond_error_with_body(
-                                    500,
-                                    Bytes::from_static(b"backend io error"),
-                                )
-                                .await?;
-                            return Ok(true);
-                        }
-                    }
-                    Ok(None) => break, // body exhausted
-                    Err(e) => {
-                        log::error!("git-cache: read request body failed: {e}");
-                        let _ = child.kill().await;
-                        session
-                            .respond_error_with_body(
-                                500,
-                                Bytes::from_static(b"body read error"),
-                            )
-                            .await?;
-                        return Ok(true);
-                    }
-                }
+        // SECURITY: `req_body` (request body bytes) never appear in logs.
+        let mut stdin = match child.stdin.take() {
+            Some(s) => s,
+            None => {
+                log::error!("git-cache: child stdin unavailable");
+                let _ = child.kill().await;
+                session
+                    .respond_error_with_body(500, Bytes::from_static(b"backend io error"))
+                    .await?;
+                return Ok(true);
             }
-            // Drop stdin → EOF sent to child (git http-backend stops reading).
-        }
+        };
+
+        let stdin_task: tokio::task::JoinHandle<Result<(), std::io::Error>> =
+            tokio::spawn(async move {
+                if !req_body.is_empty() {
+                    stdin.write_all(&req_body).await?;
+                }
+                // Drop stdin → EOF to child.
+                drop(stdin);
+                Ok(())
+            });
 
         // --- I1: Stream child stdout incrementally — no full-body buffering ---
         //
         // Strategy:
         //   1. Read into a growing head-buffer ONLY until the CGI header
         //      terminator (\r\n\r\n or \n\n) is found, capped at 64 KiB.
-        //   2. Parse the CGI head (status + headers) and send the response header.
+        //   2. Parse the CGI head (status + headers) once from the loop break value.
         //   3. Write any body bytes already read (past body_offset) as the first
         //      chunk, then loop-read stdout in fixed-size chunks until EOF.
         //   4. Signal end-of-body with write_response_body(None, true).
@@ -565,7 +565,7 @@ impl ProxyService {
         // This ensures we never buffer a full packfile (potentially hundreds of
         // MB) in a Vec<u8>.
         const HEAD_CAP: usize = 64 * 1024; // 64 KiB head-read limit
-        const CHUNK: usize = 64 * 1024;    // streaming chunk size
+        const CHUNK: usize = 64 * 1024; // streaming chunk size
 
         let mut stdout = match child.stdout.take() {
             Some(s) => s,
@@ -580,8 +580,9 @@ impl ProxyService {
         };
 
         // Phase 1: read until we have the full CGI header block.
+        // The loop break value carries the parsed tuple so we avoid a second parse.
         let mut head_buf: Vec<u8> = Vec::with_capacity(4096);
-        let body_offset = loop {
+        let (cgi_status, cgi_headers, body_offset) = loop {
             let mut tmp = [0u8; 512];
             let n = match stdout.read(&mut tmp).await {
                 Ok(n) => n,
@@ -612,25 +613,14 @@ impl ProxyService {
                     .await?;
                 return Ok(true);
             }
-            if let Some((_, _, off)) = backend::parse_cgi_head(&head_buf) {
-                break off;
+            // Parse once per iteration; on success the returned tuple is the
+            // definitive parse — no second call needed after the loop.
+            if let Some(parsed) = backend::parse_cgi_head(&head_buf) {
+                break parsed;
             }
         };
 
-        // Phase 2: parse CGI head and send response headers.
-        let (cgi_status, cgi_headers, _) = match backend::parse_cgi_head(&head_buf) {
-            Some(parsed) => parsed,
-            None => {
-                // Should be unreachable — we just found the terminator above.
-                log::error!("git-cache: could not parse CGI response head");
-                let _ = child.kill().await;
-                session
-                    .respond_error_with_body(500, Bytes::from_static(b"invalid backend response"))
-                    .await?;
-                return Ok(true);
-            }
-        };
-
+        // Phase 2: send response headers (parsed tuple already in hand — no second parse).
         let mut resp =
             match pingora::http::ResponseHeader::build(cgi_status, Some(cgi_headers.len())) {
                 Ok(r) => r,
@@ -649,9 +639,7 @@ impl ProxyService {
             }
         }
         // Omit Content-Length — body size is unknown (streaming packfile).
-        session
-            .write_response_header(Box::new(resp), false)
-            .await?;
+        session.write_response_header(Box::new(resp), false).await?;
 
         // Phase 3: stream body — first flush any bytes already read past body_offset,
         // then continue reading stdout in fixed-size chunks until EOF.
@@ -680,6 +668,19 @@ impl ProxyService {
             session.write_response_body(Some(chunk), false).await?;
         }
         session.write_response_body(None, true).await?;
+
+        // Join the stdin-writer task; surface its error as a warning (headers
+        // already sent, so we cannot return a 500 here).
+        // SECURITY: join/io errors never carry auth_header or req_body content.
+        match stdin_task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                log::warn!("git-cache: stdin writer io error: {e}");
+            }
+            Err(e) => {
+                log::warn!("git-cache: stdin writer task join error: {e}");
+            }
+        }
 
         // Wait for the child to exit (best-effort; headers already sent).
         match child.wait().await {
@@ -724,7 +725,10 @@ impl ProxyService {
                     upstream.name
                 );
                 session
-                    .respond_error_with_body(502, Bytes::from_static(b"upstream secret unavailable"))
+                    .respond_error_with_body(
+                        502,
+                        Bytes::from_static(b"upstream secret unavailable"),
+                    )
                     .await?;
                 return Ok(true);
             }

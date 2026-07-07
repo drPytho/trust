@@ -68,6 +68,11 @@ pub enum GitError {
 pub struct MirrorStore {
     root: PathBuf,
     /// Per-path locks to serialise concurrent first-clones of the same mirror.
+    ///
+    // TODO: entries in this HashMap are never evicted — unbounded small growth
+    // for a long-running proxy mirroring many distinct repos. Future cleanup:
+    // evict entries whose Arc has a strong_count of 1 (no waiters) after the
+    // clone succeeds, or replace with a bounded LRU.
     locks: Mutex<HashMap<PathBuf, Arc<TokioMutex<()>>>>,
 }
 
@@ -163,13 +168,7 @@ impl MirrorStore {
         // Fixed argv only; no shell expansion.
         let header_arg = format!("http.extraHeader=Authorization: {auth_header}");
         let status = tokio::process::Command::new("git")
-            .args([
-                "-c",
-                &header_arg,
-                "clone",
-                "--mirror",
-                clone_url,
-            ])
+            .args(["-c", &header_arg, "clone", "--mirror", clone_url])
             .arg(path)
             .status()
             .await

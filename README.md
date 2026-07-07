@@ -181,7 +181,10 @@ kind        = "git-cache"
 listen_host = "git.proxy.internal"
 origin      = "https://github.com"
 secret_ref  = "projects/my-proj/secrets/github-pat/versions/latest"
-injection   = { header = "x-access-token", scheme = "bearer" }
+# Store the PAT as `x-access-token:<pat>` in the secret; trust injects it as
+# `Authorization: Basic base64(x-access-token:<pat>)`, which GitHub accepts.
+# Alternatively use scheme = "bearer" if your token is a plain Bearer PAT.
+injection   = { header = "authorization", scheme = "basic" }
 resource    = { kind = "git-repo" }
 git         = { storage_path = "/var/lib/trust/mirrors" }
 ```

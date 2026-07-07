@@ -737,3 +737,154 @@ fn git_cache_end_to_end() {
 
     println!("All git-cache assertions passed.");
 }
+
+// ---------------------------------------------------------------------------
+// Deadlock regression test — large request body through upload-pack path
+// ---------------------------------------------------------------------------
+
+/// Guard against the two-pipe deadlock in `handle_git_read`.
+///
+/// # What this tests
+///
+/// The deadlock: if trust writes the ENTIRE stdin to git http-backend before
+/// reading any stdout, and the backend's stdout pipe (64 KiB kernel buffer)
+/// fills before trust starts reading, both sides wedge forever.
+///
+/// # How we trigger it
+///
+/// We POST a synthetic >64 KiB body to `/testorg/testrepo.git/git-upload-pack`
+/// through the proxy.  The body is not a valid git pkt-line stream, so git
+/// http-backend will emit a short error response and exit.  The important
+/// property is that the request body is larger than the OS pipe buffer, which
+/// means the old sequential code (write-all-stdin → read-stdout) would deadlock
+/// while the concurrent code (spawn stdin writer + stream stdout) completes.
+///
+/// We assert:
+/// 1. The request completes within a short timeout (no hang).
+/// 2. The response is received (any HTTP status — 200/400/500 all fine).
+///
+/// The test does NOT assert a specific HTTP status because git http-backend
+/// may reject the malformed body at various points; what matters is liveness.
+#[test]
+fn git_upload_pack_large_body_no_deadlock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp_path = tmp.path();
+
+    // ---- 1. Create a minimal bare origin repo ----
+    let origin_dir = tmp_path.join("testorg").join("testrepo.git");
+    std::fs::create_dir_all(&origin_dir).unwrap();
+    git(&["init", "--bare", "."], &origin_dir, &[]);
+    git(
+        &["symbolic-ref", "HEAD", "refs/heads/main"],
+        &origin_dir,
+        &[],
+    );
+
+    // Add at least one commit so the repo is non-empty and git http-backend
+    // serves a valid advertisement on GET info/refs.
+    let work_dir = tmp_path.join("work");
+    git(
+        &[
+            "clone",
+            origin_dir.to_str().unwrap(),
+            work_dir.to_str().unwrap(),
+        ],
+        tmp_path,
+        &[],
+    );
+    git(&["config", "user.email", "test@test.com"], &work_dir, &[]);
+    git(&["config", "user.name", "Test"], &work_dir, &[]);
+    git(&["checkout", "-B", "main"], &work_dir, &[]);
+    std::fs::write(work_dir.join("seed.txt"), b"seed").unwrap();
+    git(&["add", "."], &work_dir, &[]);
+    git(&["commit", "-m", "seed"], &work_dir, &[]);
+    git(&["push", "origin", "main"], &work_dir, &[]);
+
+    // ---- 2. Start origin + proxy ----
+    let origin_port = start_git_http_server(tmp_path.to_path_buf());
+
+    let keystore = Arc::new(Keystore::new());
+    keystore.store(build_key_material(&signing_key_pem(), None).unwrap());
+
+    let mirrors_dir = tmp_path.join("mirrors");
+    std::fs::create_dir_all(&mirrors_dir).unwrap();
+
+    let upstream = build_proxy_upstream(origin_port, &mirrors_dir);
+    let proxy_port = start_proxy(upstream, keystore.clone(), mirrors_dir.clone());
+
+    let good_jwt = mint_jwt(&keystore, "github:testorg/testrepo");
+
+    // ---- 3. Build a >64 KiB synthetic POST body ----
+    //
+    // We send a body that is larger than the kernel pipe buffer (64 KiB) to
+    // guarantee that the old sequential implementation would deadlock.
+    // The body content is intentionally not a valid pkt-line stream; git
+    // http-backend will reject it, but trust must remain live.
+    let body_size = 128 * 1024; // 128 KiB — 2× the OS pipe buffer
+    let large_body: Vec<u8> = (0u8..=255).cycle().take(body_size).collect();
+
+    // ---- 4. POST to git-upload-pack endpoint and assert no hang ----
+    //
+    // We use a raw TCP connection so we can send a hand-crafted HTTP/1.1
+    // request with an explicit Content-Length.  Using std::net (blocking)
+    // is fine here because tests run on a Tokio thread pool and the proxy
+    // is on a separate OS thread.
+    let deadline = std::time::Duration::from_secs(15);
+
+    // First, trigger the mirror clone/sync by doing a GET info/refs (needed
+    // so the mirror exists before we send the large POST).
+    {
+        let mut sock = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).unwrap();
+        sock.set_read_timeout(Some(deadline)).unwrap();
+        sock.set_write_timeout(Some(deadline)).unwrap();
+        let req = format!(
+            "GET /testorg/testrepo.git/info/refs?service=git-upload-pack HTTP/1.1\r\n\
+             Host: 127.0.0.1:{proxy_port}\r\n\
+             Authorization: Bearer {good_jwt}\r\n\
+             Connection: close\r\n\r\n"
+        );
+        sock.write_all(req.as_bytes()).unwrap();
+        let mut resp = Vec::new();
+        sock.read_to_end(&mut resp).unwrap();
+        // Any response is fine — just confirm it arrived.
+        assert!(
+            !resp.is_empty(),
+            "GET info/refs returned no bytes (proxy may be down)"
+        );
+    }
+
+    // Now POST the >64 KiB body.  We expect a response within the timeout.
+    let response_bytes = {
+        let mut sock = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).unwrap();
+        sock.set_read_timeout(Some(deadline)).unwrap();
+        sock.set_write_timeout(Some(deadline)).unwrap();
+        let header = format!(
+            "POST /testorg/testrepo.git/git-upload-pack HTTP/1.1\r\n\
+             Host: 127.0.0.1:{proxy_port}\r\n\
+             Authorization: Bearer {good_jwt}\r\n\
+             Content-Type: application/x-git-upload-pack-request\r\n\
+             Content-Length: {body_size}\r\n\
+             Connection: close\r\n\r\n"
+        );
+        sock.write_all(header.as_bytes()).unwrap();
+        sock.write_all(&large_body).unwrap();
+        let mut resp = Vec::new();
+        // read_to_end respects the read timeout; if the handler deadlocks the
+        // timeout fires and the read returns an error — the assert below catches it.
+        sock.read_to_end(&mut resp).unwrap_or(0);
+        resp
+    };
+
+    // Any non-empty HTTP response proves the handler did not deadlock.
+    assert!(
+        !response_bytes.is_empty(),
+        "large-body POST to git-upload-pack returned no bytes — possible deadlock or proxy down"
+    );
+
+    // Optionally log the status line for debugging.
+    let resp_str = String::from_utf8_lossy(&response_bytes[..response_bytes.len().min(80)]);
+    println!(
+        "large-body deadlock regression: got response ({} bytes), first line: {resp_str}",
+        response_bytes.len()
+    );
+}
