@@ -1,0 +1,12 @@
+{
+  "name": "trust-anthropic-js-example",
+  "private": true,
+  "type": "module",
+  "description": "Query Anthropic through the trust proxy with on-the-fly secret injection",
+  "scripts": {
+    "start": "node query.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.68.0"
+  }
+}
