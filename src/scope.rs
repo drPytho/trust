@@ -39,6 +39,8 @@ impl Scope {
                 let (owner, repo) = resource
                     .split_once('/')
                     .ok_or_else(|| ScopeError::Malformed(tok.to_string()))?;
+                // Reject `upstream:owner/repo/extra` — split_once('/') only splits on the first /,
+                // so repo can still contain '/' even after split. This guard is load-bearing.
                 if upstream.is_empty() || owner.is_empty() || repo.is_empty() || repo.contains('/') {
                     return Err(ScopeError::Malformed(tok.to_string()));
                 }
@@ -227,5 +229,22 @@ mod tests {
             grant(&allowed, &ScopeSet::parse("mistral").unwrap()),
             Err("mistral".to_string())
         );
+    }
+
+    #[test]
+    fn covers_different_upstream_false() {
+        assert!(!covers(&Scope::parse("gitlab").unwrap(), &Scope::parse("github:pitorg/pit-ts").unwrap()));
+        assert!(!covers(&Scope::parse("github").unwrap(), &Scope::parse("gitlab").unwrap()));
+    }
+
+    #[test]
+    fn permits_wildcard_wrong_owner_denied() {
+        let s = ScopeSet::parse("github:acme/*").unwrap();
+        assert!(!s.permits("github", Some(&res("other", "repo"))));
+    }
+
+    #[test]
+    fn scopeset_parse_empty() {
+        assert!(matches!(ScopeSet::parse(""), Err(ScopeError::Empty)));
     }
 }
