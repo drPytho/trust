@@ -1,7 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::config::TokenEntry;
+/// Legacy token-based auth entry — kept for backward compat until Phase-2 auth lands.
+#[derive(Debug, Clone)]
+pub struct TokenEntry {
+    pub token: String,
+    pub principal: String,
+    pub allowed_upstreams: Vec<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Principal {
@@ -54,7 +60,6 @@ pub fn extract_bearer(header: Option<&[u8]>) -> Result<String, AuthError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::TokenEntry;
 
     fn entries() -> Vec<TokenEntry> {
         vec![TokenEntry {

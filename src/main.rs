@@ -4,7 +4,7 @@ use std::time::Duration;
 use pingora::listeners::tls::TlsSettings;
 use pingora::prelude::*;
 
-use trust::auth::TokenMap;
+use trust::auth::{TokenEntry, TokenMap};
 use trust::config::Config;
 use trust::proxy::ProxyService;
 use trust::router::Router;
@@ -18,7 +18,8 @@ fn main() {
     let config = Config::load(&config_path).expect("failed to load config");
 
     let router = Router::new(&config.upstreams);
-    let tokens = TokenMap::new(&config.tokens);
+    // TODO(later-task): replace with JWT-based auth; using empty token map as placeholder.
+    let tokens = TokenMap::new(&[] as &[TokenEntry]);
 
     let base: Arc<dyn SecretProvider> = Arc::new(GcpSecretProvider::new());
     let secrets: Arc<dyn SecretProvider> =

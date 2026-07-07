@@ -60,7 +60,8 @@ pub fn decide(
 mod tests {
     use super::*;
     use crate::auth::TokenMap;
-    use crate::config::{Injection, InjectionScheme, Origin, TokenEntry, Upstream, UpstreamKind};
+    use crate::auth::TokenEntry;
+    use crate::config::{Injection, InjectionScheme, Origin, Upstream, UpstreamKind};
     use crate::router::Router;
     use std::sync::Arc;
 
@@ -80,6 +81,7 @@ mod tests {
                 header: "x-api-key".into(),
                 scheme: InjectionScheme::Raw,
             },
+            resource: None,
         })
     }
 
@@ -132,6 +134,7 @@ mod tests {
             principal: "team-x".into(),
             allowed_upstreams: vec![], // allowed to nothing
         }]);
+
         let r = Router::new(&ups);
         assert!(matches!(
             decide(

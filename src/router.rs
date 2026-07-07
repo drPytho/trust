@@ -44,6 +44,7 @@ mod tests {
                 header: "x-api-key".into(),
                 scheme: InjectionScheme::Raw,
             },
+            resource: None,
         })
     }
 

@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pingora::prelude::*;
-use trust::auth::TokenMap;
-use trust::config::{Injection, InjectionScheme, Origin, TokenEntry, Upstream, UpstreamKind};
+use trust::auth::{TokenEntry, TokenMap};
+use trust::config::{Injection, InjectionScheme, Origin, Upstream, UpstreamKind};
 use trust::proxy::ProxyService;
 use trust::router::Router;
 use trust::secrets::SecretProvider;
@@ -78,6 +78,7 @@ fn api_egress_end_to_end() {
             header: "x-api-key".into(),
             scheme: InjectionScheme::Raw,
         },
+        resource: None,
     });
 
     let router = Router::new(&[upstream]);
