@@ -87,6 +87,7 @@ fn scoped_upstream(mock_port: u16) -> Arc<Upstream> {
             scheme: InjectionScheme::Bearer,
         },
         resource: Some(ResourceKind::GithubRepo),
+        git: None,
     })
 }
 
