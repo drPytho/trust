@@ -1,0 +1,13 @@
+target/
+.git/
+.superpowers/
+docs/
+*.md
+!README.md
+# secrets / local dev artifacts — never bake into the image
+config.toml
+*.pem
+*.crt
+*.key
+certs/
+mirrors/
