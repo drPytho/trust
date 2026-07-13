@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -15,11 +16,11 @@ use crate::git::sync::SyncManager;
 use crate::inject::{inject, injection_value};
 use crate::jwt::Verifier;
 use crate::keystore::Keystore;
+use crate::metrics::ProxyMetrics;
 use crate::resource::{ResourceKind, extract};
 use crate::router::Router;
 use crate::secrets::{Secret, SecretProvider};
 
-#[derive(Default)]
 pub struct RequestCtx {
     pub upstream: Option<Arc<Upstream>>,
     pub secret: Option<Secret>,
@@ -27,6 +28,40 @@ pub struct RequestCtx {
     /// background mirror sync after the upstream push succeeds.
     /// Tuple: (upstream_name, owner, repo).
     pub push_repo: Option<(String, String, String)>,
+    started_at: Instant,
+    metrics: Arc<ProxyMetrics>,
+    metrics_finished: bool,
+}
+
+impl RequestCtx {
+    fn new(metrics: Arc<ProxyMetrics>) -> RequestCtx {
+        metrics.request_started();
+        RequestCtx {
+            upstream: None,
+            secret: None,
+            push_repo: None,
+            started_at: Instant::now(),
+            metrics,
+            metrics_finished: false,
+        }
+    }
+
+    fn finish_metrics(&mut self, upstream: &str, status: u16) {
+        if self.metrics_finished {
+            return;
+        }
+        self.metrics
+            .request_finished(upstream, status, self.started_at.elapsed().as_secs_f64());
+        self.metrics_finished = true;
+    }
+}
+
+impl Drop for RequestCtx {
+    fn drop(&mut self) {
+        if !self.metrics_finished {
+            self.metrics.request_abandoned();
+        }
+    }
 }
 
 pub struct ProxyService {
@@ -36,6 +71,7 @@ pub struct ProxyService {
     pub secrets: Arc<dyn SecretProvider>,
     pub mirrors: Arc<MirrorStore>,
     pub sync: Arc<SyncManager>,
+    pub metrics: Arc<ProxyMetrics>,
 }
 
 impl ProxyService {
@@ -47,6 +83,26 @@ impl ProxyService {
         mirrors: Arc<MirrorStore>,
         sync: Arc<SyncManager>,
     ) -> ProxyService {
+        Self::with_metrics(
+            router,
+            verifier,
+            keystore,
+            secrets,
+            mirrors,
+            sync,
+            Arc::new(ProxyMetrics::new()),
+        )
+    }
+
+    pub fn with_metrics(
+        router: Router,
+        verifier: Verifier,
+        keystore: Arc<Keystore>,
+        secrets: Arc<dyn SecretProvider>,
+        mirrors: Arc<MirrorStore>,
+        sync: Arc<SyncManager>,
+        metrics: Arc<ProxyMetrics>,
+    ) -> ProxyService {
         ProxyService {
             router,
             verifier,
@@ -54,7 +110,39 @@ impl ProxyService {
             secrets,
             mirrors,
             sync,
+            metrics,
         }
+    }
+
+    async fn reject(
+        &self,
+        session: &mut Session,
+        ctx: &RequestCtx,
+        status: u16,
+        reason: &'static str,
+        body: &'static [u8],
+    ) -> Result<bool> {
+        let upstream = ctx
+            .upstream
+            .as_ref()
+            .map(|upstream| upstream.name.as_str())
+            .unwrap_or("unrouted");
+        self.metrics.rejection(upstream, reason, status);
+
+        let request = session.req_header();
+        let method = request.method.as_str();
+        let host = request.headers.get("host").and_then(|v| v.to_str().ok());
+        let path = request.uri.path();
+        let client = session.client_addr();
+        log::warn!(
+            "proxy request rejected status={status} reason={reason} upstream={upstream} \
+             client={client:?} method={method:?} host={host:?} path={path:?}"
+        );
+
+        session
+            .respond_error_with_body(status, Bytes::from_static(body))
+            .await?;
+        Ok(true)
     }
 }
 
@@ -84,7 +172,7 @@ impl ProxyHttp for ProxyService {
     type CTX = RequestCtx;
 
     fn new_ctx(&self) -> Self::CTX {
-        RequestCtx::default()
+        RequestCtx::new(self.metrics.clone())
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
@@ -95,17 +183,16 @@ impl ProxyHttp for ProxyService {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
         let Some(host) = host else {
-            session
-                .respond_error_with_body(404, Bytes::from_static(b"unknown host"))
-                .await?;
-            return Ok(true);
+            return self
+                .reject(session, ctx, 404, "missing_host", b"unknown host")
+                .await;
         };
         let Some(upstream) = self.router.resolve(&host) else {
-            session
-                .respond_error_with_body(404, Bytes::from_static(b"unknown host"))
-                .await?;
-            return Ok(true);
+            return self
+                .reject(session, ctx, 404, "unknown_host", b"unknown host")
+                .await;
         };
+        ctx.upstream = Some(upstream.clone());
 
         // Verify the JWT.
         let auth = session
@@ -114,34 +201,36 @@ impl ProxyHttp for ProxyService {
             .get("authorization")
             .map(|v| v.as_bytes().to_vec());
         let Some(token) = extract_bearer(auth.as_deref()) else {
-            session
-                .respond_error_with_body(401, Bytes::from_static(b"missing token"))
-                .await?;
-            return Ok(true);
+            return self
+                .reject(session, ctx, 401, "missing_token", b"missing token")
+                .await;
         };
         let Some(km) = self.keystore.load() else {
-            session
-                .respond_error_with_body(503, Bytes::from_static(b"keys unavailable"))
-                .await?;
-            return Ok(true);
+            return self
+                .reject(
+                    session,
+                    ctx,
+                    503,
+                    "signing_keys_unavailable",
+                    b"keys unavailable",
+                )
+                .await;
         };
         let scopes = match self.verifier.verify(&km, &token) {
             Ok(s) => s,
             Err(_) => {
-                session
-                    .respond_error_with_body(401, Bytes::from_static(b"invalid token"))
-                    .await?;
-                return Ok(true);
+                return self
+                    .reject(session, ctx, 401, "invalid_token", b"invalid token")
+                    .await;
             }
         };
 
         // Authorize by scope (+ resource path).
         let path = session.req_header().uri.path().to_string();
         if !authorize(&scopes, &upstream, &path) {
-            session
-                .respond_error_with_body(403, Bytes::from_static(b"not allowed"))
-                .await?;
-            return Ok(true);
+            return self
+                .reject(session, ctx, 403, "forbidden_scope", b"not allowed")
+                .await;
         }
 
         // --- git-cache branch ---
@@ -285,6 +374,19 @@ impl ProxyHttp for ProxyService {
             }
         }
         Ok(())
+    }
+
+    async fn logging(&self, session: &mut Session, _e: Option<&Error>, ctx: &mut Self::CTX) {
+        let status = session
+            .response_written()
+            .map(|response| response.status.as_u16())
+            .unwrap_or(0);
+        let upstream = ctx
+            .upstream
+            .as_ref()
+            .map(|upstream| upstream.name.clone())
+            .unwrap_or_else(|| "unrouted".to_string());
+        ctx.finish_metrics(&upstream, status);
     }
 }
 

@@ -9,6 +9,7 @@ use trust::git::mirror::MirrorStore;
 use trust::git::sync::SyncManager;
 use trust::jwt::{Issuer, Verifier};
 use trust::keystore::{Keystore, build_key_material};
+use trust::metrics::ProxyMetrics;
 use trust::proxy::ProxyService;
 use trust::resource::ResourceKind;
 use trust::router::Router;
@@ -123,7 +124,16 @@ fn jwt_scoped_egress_end_to_end() {
     // The JWT egress test doesn't exercise git-cache; /tmp is a valid placeholder.
     let mirrors = Arc::new(MirrorStore::new("/tmp"));
     let sync = Arc::new(SyncManager::new());
-    let service = ProxyService::new(router, verifier, keystore, secrets, mirrors, sync);
+    let metrics = Arc::new(ProxyMetrics::new());
+    let service = ProxyService::with_metrics(
+        router,
+        verifier,
+        keystore,
+        secrets,
+        mirrors,
+        sync,
+        metrics.clone(),
+    );
 
     let proxy_port = free_port();
     let addr = format!("127.0.0.1:{proxy_port}");
@@ -142,6 +152,8 @@ fn jwt_scoped_egress_end_to_end() {
         std::thread::sleep(Duration::from_millis(100));
     }
 
+    // Unknown host → 404.
+    assert_eq!(raw_request(proxy_port, "unknown.test", "/", None).0, 404);
     // Missing token → 401.
     assert_eq!(
         raw_request(proxy_port, "gh.test", "/repos/pitorg/pit-ts/x", None).0,
@@ -173,6 +185,19 @@ fn jwt_scoped_egress_end_to_end() {
     assert_eq!(status, 200);
 
     std::thread::sleep(Duration::from_millis(100));
+    let rendered_metrics = String::from_utf8(metrics.encode().unwrap()).unwrap();
+    for expected in [
+        "trust_proxy_rejections_total{reason=\"unknown_host\",status=\"404\",upstream=\"unrouted\"} 1",
+        "trust_proxy_rejections_total{reason=\"missing_token\",status=\"401\",upstream=\"github\"} 1",
+        "trust_proxy_rejections_total{reason=\"invalid_token\",status=\"401\",upstream=\"github\"} 1",
+        "trust_proxy_rejections_total{reason=\"forbidden_scope\",status=\"403\",upstream=\"github\"} 1",
+    ] {
+        assert!(
+            rendered_metrics.contains(expected),
+            "missing rejection metric: {expected}"
+        );
+    }
+
     let reqs = upstream_reqs.lock().unwrap();
     let last = reqs.last().expect("upstream got a request");
     let lower = last.to_lowercase();

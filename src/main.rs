@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -10,10 +11,12 @@ use trust::git::mirror::MirrorStore;
 use trust::git::sync::SyncManager;
 use trust::issuance::policy::ClientPolicy;
 use trust::issuance::server::{
-    IssuanceState, build_mtls_server_config, install_crypto_provider, serve_jwks, serve_token,
+    IssuanceState, ManagementState, build_mtls_server_config, install_crypto_provider,
+    serve_management, serve_token,
 };
 use trust::jwt::{Issuer, Verifier};
 use trust::keystore::{Keystore, fetch};
+use trust::metrics::ProxyMetrics;
 use trust::proxy::ProxyService;
 use trust::router::Router;
 use trust::secrets::gcp::GcpSecretProvider;
@@ -26,11 +29,15 @@ fn main() {
     let config = Config::load(&config_path).expect("failed to load config");
 
     let keystore = Arc::new(Keystore::new());
+    let metrics = Arc::new(ProxyMetrics::new());
+    let proxy_ready = Arc::new(AtomicBool::new(false));
 
     // Management stack on its own runtime/thread with its own secret provider.
     let (ready_tx, ready_rx) = mpsc::channel::<()>();
     {
         let keystore = keystore.clone();
+        let metrics = metrics.clone();
+        let proxy_ready = proxy_ready.clone();
         let config = config.clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
@@ -40,14 +47,29 @@ fn main() {
             rt.block_on(async move {
                 install_crypto_provider();
 
-                // 1. Load signing key and store it.
+                // 1. Start liveness/metrics immediately. Readiness remains false until
+                // the signing key is loaded and the proxy lifecycle has started.
+                let management_addr: std::net::SocketAddr =
+                    config.issuance.jwks_addr.parse().expect("jwks_addr");
+                let management_state = Arc::new(ManagementState {
+                    keystore: keystore.clone(),
+                    metrics,
+                    proxy_ready,
+                });
+                tokio::spawn(async move {
+                    let result = serve_management(management_addr, management_state).await;
+                    log::error!("management server exited: {result:?}");
+                    std::process::exit(1);
+                });
+
+                // 2. Load signing key and store it.
                 let key_provider: Arc<dyn SecretProvider> = Arc::new(GcpSecretProvider::new());
                 let km = fetch(key_provider.as_ref(), &config.auth.signing)
                     .await
                     .expect("failed to load signing key");
                 keystore.store(km);
 
-                // 2. All fallible issuance setup before signalling ready.
+                // 3. All fallible issuance setup before signalling ready.
                 let tls_cfg = config.tls.as_ref().expect("validated present");
                 let server_cert = std::fs::read_to_string(&tls_cfg.cert_path)
                     .expect("issuance needs a server cert (reuse [tls] cert/key)");
@@ -60,8 +82,6 @@ fn main() {
 
                 let token_addr: std::net::SocketAddr =
                     config.issuance.mtls_addr.parse().expect("mtls_addr");
-                let jwks_addr: std::net::SocketAddr =
-                    config.issuance.jwks_addr.parse().expect("jwks_addr");
 
                 let issuer = Issuer::new(
                     config.auth.issuer.clone(),
@@ -76,10 +96,10 @@ fn main() {
                     policy,
                 });
 
-                // 3. Signal ready only after all setup succeeds.
+                // 4. Signal ready only after all setup succeeds.
                 ready_tx.send(()).expect("signal ready");
 
-                // 4. Background key refresh (rotation) every 10 minutes.
+                // 5. Background key refresh (rotation) every 10 minutes.
                 {
                     let keystore = keystore.clone();
                     let provider = key_provider.clone();
@@ -96,13 +116,7 @@ fn main() {
                     });
                 }
 
-                // 5. Serve; if either listener exits the process must stop.
-                let jwks_ks = keystore.clone();
-                tokio::spawn(async move {
-                    let result = serve_jwks(jwks_addr, jwks_ks).await;
-                    log::error!("jwks server exited: {result:?}");
-                    std::process::exit(1);
-                });
+                // 6. Serve token issuance; if it exits the process must stop.
                 let result = serve_token(token_addr, mtls_cfg, state).await;
                 log::error!("token server exited: {result:?}");
                 std::process::exit(1);
@@ -137,7 +151,15 @@ fn main() {
     let mirrors = Arc::new(MirrorStore::new(mirror_root));
     let sync = Arc::new(SyncManager::new());
 
-    let service = ProxyService::new(router, verifier, keystore, proxy_secrets, mirrors, sync);
+    let service = ProxyService::with_metrics(
+        router,
+        verifier,
+        keystore,
+        proxy_secrets,
+        mirrors,
+        sync,
+        metrics,
+    );
 
     let mut server = Server::new(None).expect("failed to create server");
     server.bootstrap();
@@ -151,6 +173,7 @@ fn main() {
         proxy.add_tls_with_settings(&tls.addr, None, settings);
     }
     server.add_service(proxy);
+    proxy_ready.store(true, Ordering::Release);
     log::info!("trust starting (config: {config_path})");
     server.run_forever();
 }
