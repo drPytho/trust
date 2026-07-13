@@ -20,6 +20,8 @@ const GOOGLE_CLOUD_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform
 
 #[derive(Debug, thiserror::Error)]
 pub enum CredentialError {
+    #[error("upstream does not have a credential provider")]
+    MissingCredential,
     #[error("static secret unavailable: {0}")]
     StaticSecret(String),
     #[error("GitHub App configuration is missing")]
@@ -239,7 +241,11 @@ impl CredentialProvider for CredentialManager {
         _method: &str,
         path: &str,
     ) -> Result<ResolvedCredential, CredentialError> {
-        match &upstream.credential {
+        let credential = upstream
+            .credential
+            .as_ref()
+            .ok_or(CredentialError::MissingCredential)?;
+        match credential {
             CredentialSource::StaticSecret { secret_ref } => {
                 let secret = self
                     .secrets
@@ -292,7 +298,7 @@ mod tests {
     use super::*;
     use crate::config::{
         CredentialSource, GithubInstallation, Injection, InjectionScheme, Origin, Upstream,
-        UpstreamKind,
+        UpstreamKind, UpstreamMode,
     };
     use crate::resource::ResourceKind;
     use crate::secrets::fake::FakeSecretProvider;
@@ -389,16 +395,17 @@ mod tests {
                 tls: true,
                 sni: "api.github.com".into(),
             },
-            credential: CredentialSource::GithubApp {
+            mode: UpstreamMode::Inject,
+            credential: Some(CredentialSource::GithubApp {
                 permissions: [("contents".to_string(), "read".to_string())]
                     .into_iter()
                     .collect(),
                 basic_username: None,
-            },
-            injection: Injection {
+            }),
+            injection: Some(Injection {
                 header: "authorization".into(),
                 scheme: InjectionScheme::Bearer,
-            },
+            }),
             resource: Some(ResourceKind::GithubRepo),
             git: None,
             allowed_methods: vec!["GET".into()],
@@ -416,8 +423,10 @@ mod tests {
         assert_eq!(cached.secret.expose(), "token-111");
         let mut git_upstream = upstream.clone();
         git_upstream.resource = Some(ResourceKind::GitRepo);
-        git_upstream.injection.scheme = InjectionScheme::Basic;
-        if let CredentialSource::GithubApp { basic_username, .. } = &mut git_upstream.credential {
+        git_upstream.injection.as_mut().unwrap().scheme = InjectionScheme::Basic;
+        if let Some(CredentialSource::GithubApp { basic_username, .. }) =
+            &mut git_upstream.credential
+        {
             *basic_username = Some("x-access-token".into());
         }
         let git = manager

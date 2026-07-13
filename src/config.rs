@@ -32,6 +32,12 @@ pub enum ConfigError {
     UnexpectedGitBlock(String),
     #[error("upstream '{0}' must configure exactly one of secret_ref or credential")]
     BadCredentialConfig(String),
+    #[error("inject upstream '{0}' is missing injection configuration")]
+    MissingInjection(String),
+    #[error("passthrough upstream '{0}' must not configure credentials or injection")]
+    PassthroughConfig(String),
+    #[error("git-cache upstream '{0}' cannot use passthrough mode")]
+    PassthroughGitCache(String),
     #[error("upstream '{0}' uses github-app credentials but [github_app] is missing")]
     MissingGithubApp(String),
     #[error("duplicate GitHub App installation owner: {0}")]
@@ -51,6 +57,14 @@ pub enum ConfigError {
 pub enum UpstreamKind {
     Api,
     GitCache,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum UpstreamMode {
+    #[default]
+    Inject,
+    Passthrough,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -146,8 +160,9 @@ pub struct Upstream {
     pub kind: UpstreamKind,
     pub listen_host: String,
     pub origin: Origin,
-    pub credential: CredentialSource,
-    pub injection: Injection,
+    pub mode: UpstreamMode,
+    pub credential: Option<CredentialSource>,
+    pub injection: Option<Injection>,
     pub resource: Option<ResourceKind>,
     pub git: Option<GitConfig>,
     pub allowed_methods: Vec<String>,
@@ -225,10 +240,13 @@ struct RawUpstream {
     listen_host: String,
     origin: String,
     #[serde(default)]
+    mode: UpstreamMode,
+    #[serde(default)]
     secret_ref: Option<String>,
     #[serde(default)]
     credential: Option<CredentialSource>,
-    injection: Injection,
+    #[serde(default)]
+    injection: Option<Injection>,
     #[serde(default)]
     resource: Option<RawResource>,
     #[serde(default)]
@@ -343,16 +361,32 @@ impl Config {
                 return Err(ConfigError::DuplicateListenHost(ru.listen_host));
             }
             let origin = parse_origin(&ru.origin)?;
-            let credential = match (ru.secret_ref, ru.credential) {
-                (Some(secret_ref), None) => CredentialSource::StaticSecret { secret_ref },
-                (None, Some(credential)) => credential,
-                _ => return Err(ConfigError::BadCredentialConfig(ru.name)),
+            let (credential, injection) = match ru.mode {
+                UpstreamMode::Inject => {
+                    let credential = match (ru.secret_ref, ru.credential) {
+                        (Some(secret_ref), None) => CredentialSource::StaticSecret { secret_ref },
+                        (None, Some(credential)) => credential,
+                        _ => return Err(ConfigError::BadCredentialConfig(ru.name)),
+                    };
+                    let injection = ru
+                        .injection
+                        .ok_or_else(|| ConfigError::MissingInjection(ru.name.clone()))?;
+                    (Some(credential), Some(injection))
+                }
+                UpstreamMode::Passthrough => {
+                    if ru.secret_ref.is_some() || ru.credential.is_some() || ru.injection.is_some()
+                    {
+                        return Err(ConfigError::PassthroughConfig(ru.name));
+                    }
+                    (None, None)
+                }
             };
-            if matches!(credential, CredentialSource::GithubApp { .. }) && raw.github_app.is_none()
+            if matches!(credential, Some(CredentialSource::GithubApp { .. }))
+                && raw.github_app.is_none()
             {
                 return Err(ConfigError::MissingGithubApp(ru.name));
             }
-            if let CredentialSource::GithubApp { basic_username, .. } = &credential {
+            if let Some(CredentialSource::GithubApp { basic_username, .. }) = &credential {
                 if !matches!(
                     ru.resource,
                     Some(RawResource {
@@ -372,15 +406,20 @@ impl Config {
                     ));
                 }
             }
-            if matches!(credential, CredentialSource::GcpAdc { .. })
-                && (!ru.injection.header.eq_ignore_ascii_case("authorization")
-                    || ru.injection.scheme != InjectionScheme::Bearer)
+            if matches!(credential, Some(CredentialSource::GcpAdc { .. }))
+                && !matches!(
+                    injection,
+                    Some(Injection {
+                        ref header,
+                        scheme: InjectionScheme::Bearer,
+                    }) if header.eq_ignore_ascii_case("authorization")
+                )
             {
                 return Err(ConfigError::GcpAdcNeedsBearer(ru.name));
             }
-            if let CredentialSource::GcpAdc {
+            if let Some(CredentialSource::GcpAdc {
                 rewrite_registry_to: Some(base),
-            } = &credential
+            }) = &credential
             {
                 let url = Url::parse(base).map_err(|error| ConfigError::BadOrigin {
                     url: base.clone(),
@@ -415,6 +454,9 @@ impl Config {
             // Validate git-cache-specific rules.
             match ru.kind {
                 UpstreamKind::GitCache => {
+                    if ru.mode == UpstreamMode::Passthrough {
+                        return Err(ConfigError::PassthroughGitCache(ru.name));
+                    }
                     if ru.git.is_none() {
                         return Err(ConfigError::MissingGitBlock(ru.name));
                     }
@@ -439,8 +481,9 @@ impl Config {
                 kind: ru.kind,
                 listen_host: ru.listen_host,
                 origin,
+                mode: ru.mode,
                 credential,
-                injection: ru.injection,
+                injection,
                 resource: ru.resource.map(|r| r.kind),
                 git: ru.git,
                 allowed_methods,
@@ -550,6 +593,7 @@ resource = { kind = "github-repo" }
         assert_eq!(cfg.issuance.clients.len(), 1);
         assert_eq!(cfg.issuance.clients[0].spiffe, "spiffe://pit/ci/pit-ts");
         assert!(cfg.upstreams[0].resource.is_none());
+        assert_eq!(cfg.upstreams[0].mode, UpstreamMode::Inject);
         assert!(matches!(
             cfg.upstreams[1].resource,
             Some(crate::resource::ResourceKind::GithubRepo)
@@ -760,7 +804,62 @@ allowed_methods = ["GET", "HEAD"]
             .find(|upstream| upstream.name == "npm-artifacts")
             .unwrap();
         assert_eq!(npm.allowed_methods, ["GET", "HEAD"]);
-        assert!(matches!(npm.credential, CredentialSource::GcpAdc { .. }));
+        assert!(matches!(
+            npm.credential,
+            Some(CredentialSource::GcpAdc { .. })
+        ));
+    }
+
+    #[test]
+    fn parses_explicit_passthrough_without_credentials() {
+        let passthrough = r#"
+[[upstreams]]
+name = "public-api"
+kind = "api"
+mode = "passthrough"
+listen_host = "public.proxy.internal"
+origin = "https://api.example.com"
+allowed_methods = ["GET", "HEAD"]
+"#;
+        let cfg = Config::from_str(&(GOOD.to_string() + passthrough)).unwrap();
+        let upstream = cfg
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.name == "public-api")
+            .unwrap();
+        assert_eq!(upstream.mode, UpstreamMode::Passthrough);
+        assert!(upstream.credential.is_none());
+        assert!(upstream.injection.is_none());
+    }
+
+    #[test]
+    fn rejects_passthrough_credentials_and_inject_without_injection() {
+        let passthrough_with_secret = r#"
+[[upstreams]]
+name = "bad-passthrough"
+kind = "api"
+mode = "passthrough"
+listen_host = "bad-passthrough.proxy.internal"
+origin = "https://api.example.com"
+secret_ref = "projects/p/secrets/bad/versions/latest"
+"#;
+        assert!(matches!(
+            Config::from_str(&(GOOD.to_string() + passthrough_with_secret)),
+            Err(ConfigError::PassthroughConfig(_))
+        ));
+
+        let inject_without_injection = r#"
+[[upstreams]]
+name = "bad-inject"
+kind = "api"
+listen_host = "bad-inject.proxy.internal"
+origin = "https://api.example.com"
+secret_ref = "projects/p/secrets/bad/versions/latest"
+"#;
+        assert!(matches!(
+            Config::from_str(&(GOOD.to_string() + inject_without_injection)),
+            Err(ConfigError::MissingInjection(_))
+        ));
     }
 
     #[test]

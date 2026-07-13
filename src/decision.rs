@@ -28,7 +28,7 @@ pub fn authorize(scopes: &ScopeSet, upstream: &Upstream, method: &str, path: &st
         && upstream.resource.is_some()
         && matches!(
             upstream.credential,
-            CredentialSource::GithubApp { .. } | CredentialSource::GcpAdc { .. }
+            Some(CredentialSource::GithubApp { .. } | CredentialSource::GcpAdc { .. })
         )
     {
         return false;
@@ -39,7 +39,7 @@ pub fn authorize(scopes: &ScopeSet, upstream: &Upstream, method: &str, path: &st
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Injection, InjectionScheme, Origin, Upstream, UpstreamKind};
+    use crate::config::{Injection, InjectionScheme, Origin, Upstream, UpstreamKind, UpstreamMode};
     use crate::resource::ResourceKind;
     use crate::scope::ScopeSet;
     use std::sync::Arc;
@@ -55,13 +55,14 @@ mod tests {
                 tls: true,
                 sni: "h".into(),
             },
-            credential: crate::config::CredentialSource::StaticSecret {
+            mode: UpstreamMode::Inject,
+            credential: Some(crate::config::CredentialSource::StaticSecret {
                 secret_ref: "ref".into(),
-            },
-            injection: Injection {
+            }),
+            injection: Some(Injection {
                 header: "authorization".into(),
                 scheme: InjectionScheme::Bearer,
-            },
+            }),
             resource,
             git: None,
             allowed_methods: Vec::new(),
@@ -103,10 +104,10 @@ mod tests {
     #[test]
     fn dynamic_credentials_fail_closed_without_resource_and_on_bad_method() {
         let mut github = (*upstream("github", Some(ResourceKind::GithubRepo))).clone();
-        github.credential = crate::config::CredentialSource::GithubApp {
+        github.credential = Some(crate::config::CredentialSource::GithubApp {
             permissions: Default::default(),
             basic_username: None,
-        };
+        });
         github.allowed_methods = vec!["GET".into()];
         let bare = ScopeSet::parse("github").unwrap();
         assert!(!authorize(&bare, &github, "GET", "/user"));

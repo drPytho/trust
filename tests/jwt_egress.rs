@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pingora::prelude::*;
-use trust::config::{CredentialSource, Injection, InjectionScheme, Origin, Upstream, UpstreamKind};
+use trust::config::{
+    CredentialSource, Injection, InjectionScheme, Origin, Upstream, UpstreamKind, UpstreamMode,
+};
 use trust::git::mirror::MirrorStore;
 use trust::git::sync::SyncManager;
 use trust::jwt::{Issuer, Verifier};
@@ -73,6 +75,33 @@ fn raw_request(proxy_port: u16, host: &str, path: &str, bearer: Option<&str>) ->
     (status, resp)
 }
 
+fn passthrough_request(
+    proxy_port: u16,
+    host: &str,
+    proxy_bearer: Option<&str>,
+    authorization: Option<&str>,
+) -> (u16, String) {
+    let mut stream = TcpStream::connect(("127.0.0.1", proxy_port)).unwrap();
+    let mut req = format!("GET /resource HTTP/1.1\r\nHost: {host}\r\n");
+    if let Some(token) = proxy_bearer {
+        req.push_str(&format!("Proxy-Authorization: Bearer {token}\r\n"));
+    }
+    if let Some(value) = authorization {
+        req.push_str(&format!("Authorization: {value}\r\n"));
+    }
+    req.push_str("Connection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).unwrap();
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).unwrap();
+    let status = resp
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(0);
+    (status, resp)
+}
+
 fn scoped_upstream(mock_port: u16) -> Arc<Upstream> {
     Arc::new(Upstream {
         name: "github".into(),
@@ -84,16 +113,37 @@ fn scoped_upstream(mock_port: u16) -> Arc<Upstream> {
             tls: false,
             sni: String::new(),
         },
-        credential: CredentialSource::StaticSecret {
+        mode: UpstreamMode::Inject,
+        credential: Some(CredentialSource::StaticSecret {
             secret_ref: "ref/gh".into(),
-        },
-        injection: Injection {
+        }),
+        injection: Some(Injection {
             header: "authorization".into(),
             scheme: InjectionScheme::Bearer,
-        },
+        }),
         resource: Some(ResourceKind::GithubRepo),
         git: None,
         allowed_methods: Vec::new(),
+    })
+}
+
+fn passthrough_upstream(mock_port: u16) -> Arc<Upstream> {
+    Arc::new(Upstream {
+        name: "public-api".into(),
+        kind: UpstreamKind::Api,
+        listen_host: "public.test".into(),
+        origin: Origin {
+            host: "127.0.0.1".into(),
+            port: mock_port,
+            tls: false,
+            sni: String::new(),
+        },
+        mode: UpstreamMode::Passthrough,
+        credential: None,
+        injection: None,
+        resource: None,
+        git: None,
+        allowed_methods: vec!["GET".into()],
     })
 }
 
@@ -216,6 +266,80 @@ fn jwt_scoped_egress_end_to_end() {
         lower.contains("host: 127.0.0.1"),
         "host not rewritten: {last}"
     );
+}
+
+#[test]
+fn authenticated_passthrough_preserves_caller_authorization() {
+    let (mock_port, upstream_reqs) = start_mock_upstream();
+    let keystore = Arc::new(Keystore::new());
+    keystore.store(build_key_material(&signing_key_pem(), None).unwrap());
+    let km = keystore.load().unwrap();
+    let issuer = Issuer::new(
+        "trust".into(),
+        "trust-proxy".into(),
+        Duration::from_secs(3600),
+    );
+    let token = issuer
+        .mint(
+            &km,
+            "spiffe://pit/workloads/client",
+            &ScopeSet::parse("public-api").unwrap(),
+            jsonwebtoken::get_current_timestamp(),
+        )
+        .unwrap();
+
+    let router = Router::new(&[passthrough_upstream(mock_port)]);
+    let verifier = Verifier::new("trust".into(), "trust-proxy".into());
+    let secrets: Arc<dyn SecretProvider> = Arc::new(FakeSecretProvider::new(&[]));
+    let service = ProxyService::new(
+        router,
+        verifier,
+        keystore,
+        secrets,
+        Arc::new(MirrorStore::new("/tmp")),
+        Arc::new(SyncManager::new()),
+    );
+    let proxy_port = free_port();
+    let addr = format!("127.0.0.1:{proxy_port}");
+    std::thread::spawn(move || {
+        let mut server = Server::new(None).unwrap();
+        server.bootstrap();
+        let mut proxy = http_proxy_service(&server.configuration, service);
+        proxy.add_tcp(&addr);
+        server.add_service(proxy);
+        server.run_forever();
+    });
+    for _ in 0..50 {
+        if TcpStream::connect(("127.0.0.1", proxy_port)).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // A caller Authorization header is not accepted as proxy authentication in
+    // passthrough mode because it must remain available to the upstream.
+    assert_eq!(
+        passthrough_request(proxy_port, "public.test", None, Some("Bearer caller-token")).0,
+        401
+    );
+    assert_eq!(
+        passthrough_request(
+            proxy_port,
+            "public.test",
+            Some(&token),
+            Some("Bearer caller-token"),
+        )
+        .0,
+        200
+    );
+
+    std::thread::sleep(Duration::from_millis(100));
+    let requests = upstream_reqs.lock().unwrap();
+    let request = requests.last().expect("upstream got passthrough request");
+    let lower = request.to_lowercase();
+    assert!(lower.contains("authorization: bearer caller-token"));
+    assert!(!lower.contains("proxy-authorization"));
+    assert!(!lower.contains(&token.to_lowercase()));
 }
 
 /// Issuance sub-test: proves the `ClientPolicy` → `grant` → `Issuer::mint` path.

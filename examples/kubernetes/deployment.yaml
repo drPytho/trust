@@ -33,7 +33,7 @@ data:
 
     [[issuance.clients]]
     spiffe = "spiffe://example/workloads/*"
-    allowed_scopes = ["anthropic"]
+    allowed_scopes = ["anthropic", "public-api"]
 
     [[upstreams]]
     name = "anthropic"
@@ -42,6 +42,14 @@ data:
     origin = "https://api.anthropic.com"
     secret_ref = "projects/PROJECT_ID/secrets/anthropic-key/versions/latest"
     injection = { header = "x-api-key", scheme = "raw" }
+
+    [[upstreams]]
+    name = "public-api"
+    kind = "api"
+    mode = "passthrough"
+    listen_host = "public.proxy.internal"
+    origin = "https://api.example.com"
+    allowed_methods = ["GET", "HEAD"]
 ---
 apiVersion: apps/v1
 kind: Deployment

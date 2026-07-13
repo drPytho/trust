@@ -26,7 +26,7 @@ impl Router {
 mod tests {
     use super::*;
     use crate::config::{
-        CredentialSource, Injection, InjectionScheme, Origin, Upstream, UpstreamKind,
+        CredentialSource, Injection, InjectionScheme, Origin, Upstream, UpstreamKind, UpstreamMode,
     };
     use std::sync::Arc;
 
@@ -41,13 +41,14 @@ mod tests {
                 tls: true,
                 sni: "example.com".into(),
             },
-            credential: CredentialSource::StaticSecret {
+            mode: UpstreamMode::Inject,
+            credential: Some(CredentialSource::StaticSecret {
                 secret_ref: "ref".into(),
-            },
-            injection: Injection {
+            }),
+            injection: Some(Injection {
                 header: "x-api-key".into(),
                 scheme: InjectionScheme::Raw,
-            },
+            }),
             resource: None,
             git: None,
             allowed_methods: Vec::new(),

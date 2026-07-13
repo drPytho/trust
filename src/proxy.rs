@@ -7,7 +7,7 @@ use pingora::prelude::*;
 use pingora::upstreams::peer::HttpPeer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::config::{Upstream, UpstreamKind};
+use crate::config::{Upstream, UpstreamKind, UpstreamMode};
 use crate::credentials::{CredentialManager, CredentialProvider};
 use crate::decision::{authorize, extract_bearer};
 use crate::git::backend;
@@ -252,9 +252,9 @@ impl ProxyHttp for ProxyService {
                 .await;
         };
         ctx.upstream = Some(upstream.clone());
-        if let crate::config::CredentialSource::GcpAdc {
+        if let Some(crate::config::CredentialSource::GcpAdc {
             rewrite_registry_to: Some(to),
-        } = &upstream.credential
+        }) = &upstream.credential
         {
             let origin = &upstream.origin;
             let scheme = if origin.tls { "https" } else { "http" };
@@ -271,12 +271,18 @@ impl ProxyHttp for ProxyService {
             });
         }
 
-        // Verify the JWT.
-        let auth = session
-            .req_header()
-            .headers
-            .get("authorization")
-            .map(|v| v.as_bytes().to_vec());
+        // Verify the JWT. Proxy-Authorization is accepted for every mode and
+        // required for passthrough so the caller's Authorization header can be
+        // forwarded unchanged. Inject mode retains Authorization compatibility.
+        let headers = &session.req_header().headers;
+        let auth = headers
+            .get("proxy-authorization")
+            .or_else(|| {
+                (upstream.mode == UpstreamMode::Inject)
+                    .then(|| headers.get("authorization"))
+                    .flatten()
+            })
+            .map(|value| value.as_bytes().to_vec());
         let Some(token) = extract_bearer(auth.as_deref()) else {
             return self
                 .reject(session, ctx, 401, "missing_token", b"missing token")
@@ -316,9 +322,18 @@ impl ProxyHttp for ProxyService {
             return self.handle_git_cache(session, ctx, upstream, &path).await;
         }
 
-        // --- api branch (unchanged) ---
+        if upstream.mode == UpstreamMode::Passthrough {
+            ctx.upstream = Some(upstream);
+            return Ok(false);
+        }
+
+        // --- credential-injecting API branch ---
         let credential_started = Instant::now();
-        let provider = upstream.credential.provider_name();
+        let provider = upstream
+            .credential
+            .as_ref()
+            .ok_or_else(|| Error::new_str("inject upstream missing credential"))?
+            .provider_name();
         match self.credentials.resolve(&upstream, &method, &path).await {
             Ok(credential) => {
                 self.metrics.credential_resolution(
@@ -374,20 +389,28 @@ impl ProxyHttp for ProxyService {
         upstream_request: &mut RequestHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
-        upstream_request.remove_header("authorization");
+        // Proxy credentials are hop-local and must never reach any upstream.
+        upstream_request.remove_header("proxy-authorization");
         let upstream = ctx
             .upstream
             .as_ref()
             .ok_or_else(|| Error::new_str("upstream missing in ctx"))?;
-        let secret = ctx
-            .secret
-            .as_ref()
-            .ok_or_else(|| Error::new_str("secret missing in ctx"))?;
-        inject(upstream_request, &upstream.injection, secret.expose())
-            .map_err(|_| Error::new_str("secret injection failed"))?;
+        if upstream.mode == UpstreamMode::Inject {
+            upstream_request.remove_header("authorization");
+            let secret = ctx
+                .secret
+                .as_ref()
+                .ok_or_else(|| Error::new_str("secret missing in ctx"))?;
+            let injection = upstream
+                .injection
+                .as_ref()
+                .ok_or_else(|| Error::new_str("inject upstream missing injection"))?;
+            inject(upstream_request, injection, secret.expose())
+                .map_err(|_| Error::new_str("secret injection failed"))?;
+        }
         if matches!(
             upstream.credential,
-            crate::config::CredentialSource::GcpAdc { .. }
+            Some(crate::config::CredentialSource::GcpAdc { .. })
         ) {
             // Metadata must be uncompressed so absolute tarball URLs can be
             // rewritten without exposing a direct Artifact Registry bypass.
@@ -499,17 +522,23 @@ impl ProxyHttp for ProxyService {
                     }
                 };
                 // Build the auth header — SECURITY: never log this value.
-                let auth_header =
-                    match injection_value(&upstream_arc.injection, credential.secret.expose()) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            log::warn!(
-                                "post-push sync: injection failed for {}: {e}",
-                                upstream_arc.name
-                            );
-                            return;
-                        }
-                    };
+                let Some(injection) = upstream_arc.injection.as_ref() else {
+                    log::warn!(
+                        "post-push sync: injection missing for {}",
+                        upstream_arc.name
+                    );
+                    return;
+                };
+                let auth_header = match injection_value(injection, credential.secret.expose()) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log::warn!(
+                            "post-push sync: injection failed for {}: {e}",
+                            upstream_arc.name
+                        );
+                        return;
+                    }
+                };
 
                 let key = format!("{}/{}/{}", upstream_arc.name, owner, repo);
                 if let Err(e) = sync.sync(&key, &mirror_path, &auth_header).await {
@@ -635,7 +664,14 @@ impl ProxyService {
             }
         };
         // SECURITY: auth_header is the injected git credential — never logged.
-        let auth_header = match injection_value(&upstream.injection, credential.secret.expose()) {
+        let Some(injection) = upstream.injection.as_ref() else {
+            log::error!("git-cache upstream {} has no injection", upstream.name);
+            session
+                .respond_error_with_body(500, Bytes::from_static(b"injection error"))
+                .await?;
+            return Ok(true);
+        };
+        let auth_header = match injection_value(injection, credential.secret.expose()) {
             Ok(v) => v,
             Err(e) => {
                 log::error!("git-cache injection failed for {}: {e}", upstream.name);

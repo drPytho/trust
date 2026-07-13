@@ -134,6 +134,12 @@ Keep the JWT in process memory, send it to the proxy as
 `Authorization: Bearer <token>`, and refresh it shortly before it expires. Do
 not store minted JWTs in Kubernetes Secrets.
 
+For an upstream configured with `mode = "passthrough"`, send the trust JWT in
+`Proxy-Authorization` instead. `trust` removes that header and forwards the
+caller's regular `Authorization` header unchanged. Passthrough hosts are still
+explicitly allowlisted, JWT-authenticated, and scope-authorized; unknown hosts
+remain denied.
+
 In production, restrict ingress to the token port with NetworkPolicy, prefer
 short JWT lifetimes, and tightly control who may request certificates or choose
 URI SANs from the client issuer. Deleting a client certificate does not revoke

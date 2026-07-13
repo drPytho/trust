@@ -107,8 +107,9 @@ Rules:
 
 ## Features
 
-- **JWT client auth** — clients send `Authorization: Bearer <jwt>`; `trust` verifies ES256,
-  `iss`, `aud`, and `exp`.
+- **JWT client auth** — clients send `Authorization: Bearer <jwt>` for injected upstreams or
+  `Proxy-Authorization: Bearer <jwt>` when their own `Authorization` must pass through; `trust`
+  verifies ES256, `iss`, `aud`, and `exp`.
 - **mTLS token issuance** — OAuth2 `client_credentials` on a dedicated mTLS listener; client
   identity = SPIFFE URI SAN.
 - **Scope-capped issuance** — requested scopes are intersected against the per-identity policy;
@@ -125,6 +126,8 @@ Rules:
 - **Artifact Registry credentials via ADC** — obtains Google access tokens through Application
   Default Credentials/Workload Identity, without placing Google tokens in worker `.npmrc` files.
 - **Configurable injection** per upstream: header name + scheme (`bearer` / `basic` / `raw`).
+- **Authenticated passthrough** — explicitly allowlisted hosts can proxy without credential
+  injection while retaining scoped JWT authorization and preserving the caller's headers.
 - **Repo-scoped authz** for `github-repo` upstreams — the request path is parsed for
   `owner/repo`; the JWT scope must cover it.
 - **git-cache upstream** — serves `git clone`/`fetch` from a local bare mirror (fresh refs,
@@ -194,6 +197,7 @@ owner = "pit-customer"
 installation_id = 222222
 
 # Upstreams. Each owns a listen_host; the Host header routes to it.
+# Unknown hosts are denied. The default mode is "inject" for backward compatibility.
 [[upstreams]]
 name        = "anthropic"
 kind        = "api"
@@ -221,6 +225,16 @@ origin          = "https://europe-north1-npm.pkg.dev"
 credential      = { kind = "gcp-adc", rewrite_registry_to = "https://npm.proxy.internal" }
 injection       = { header = "authorization", scheme = "bearer" }
 resource        = { kind = "artifact-registry-repo" }
+allowed_methods = ["GET", "HEAD"]
+
+# Explicitly allowlisted passthrough. No secret is fetched or injected. Clients must put their
+# trust JWT in Proxy-Authorization; their normal Authorization header is forwarded unchanged.
+[[upstreams]]
+name            = "public-api"
+kind            = "api"
+mode            = "passthrough"
+listen_host     = "public.proxy.internal"
+origin          = "https://api.example.com"
 allowed_methods = ["GET", "HEAD"]
 
 # git-cache upstream: bare mirror + pass-through push.
@@ -308,6 +322,13 @@ curl -H "Authorization: Bearer $JWT" \
   -H "Host: anthropic.proxy.internal" \
   https://trust.pit.internal:6443/v1/messages
 
+# Authenticated passthrough. The trust JWT is consumed by the proxy while the caller's
+# upstream credential is forwarded in Authorization without modification:
+curl -H "Proxy-Authorization: Bearer $JWT" \
+  -H "Authorization: Bearer $CALLER_UPSTREAM_TOKEN" \
+  -H "Host: public.proxy.internal" \
+  https://trust.pit.internal:6443/resource
+
 # git clone via the git-cache upstream (cached mirror, fresh refs):
 git -c http.extraHeader="Authorization: Bearer $JWT" \
   clone https://git.proxy.internal/pitorg/pit-ts.git
@@ -331,12 +352,15 @@ git -c http.extraHeader="Authorization: Bearer $JWT" \
 
 ## Security model
 
-- The client's `Authorization` header is **removed before** the upstream secret is injected —
-  so even when injecting into `authorization`, the client JWT cannot leak upstream.
+- `Proxy-Authorization` is always removed before forwarding. In inject mode, the client's
+  `Authorization` is also removed before the upstream secret is injected. In passthrough mode,
+  the caller's `Authorization` is preserved and the trust JWT is accepted only from
+  `Proxy-Authorization`.
 - Upstream secrets are fetched server-side, held only in memory with a TTL, and **never logged**
   (`Secret` has a redacted `Debug` and no `Display`).
 - No request reaches an upstream without a valid, authorized JWT (verified ES256, `iss`, `aud`,
   `exp`, and scope).
+- Unknown hosts are denied, and passthrough must be enabled explicitly per configured upstream.
 - The issuance server is mTLS-only — unauthenticated clients cannot reach the `/token` endpoint.
 - Scopes are capped at issuance to the per-identity policy; clients cannot self-escalate.
 - The config file contains no plaintext secrets — only secret-manager references. Keep your
