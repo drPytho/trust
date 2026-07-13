@@ -48,6 +48,20 @@ JWKS (public keys for verification) is served at `/.well-known/jwks.json` on a p
 listener (`jwks_addr`). Key rotation (current + previous) is backed by GCP Secret Manager;
 the server refreshes keys every 10 minutes without restarting.
 
+The same listener exposes `/healthz` for liveness, `/readyz` for readiness, and `/metrics`
+in Prometheus text format. Readiness requires the proxy lifecycle to be started and a signing
+key to be loaded. The exported proxy metrics are:
+
+- `trust_proxy_requests_total{upstream,status}`
+- `trust_proxy_rejections_total{upstream,reason,status}`
+- `trust_proxy_request_duration_seconds{upstream}`
+- `trust_proxy_in_flight_requests`
+
+Rejected proxy calls are also logged at `WARN` with bounded reasons (`missing_host`,
+`unknown_host`, `missing_token`, `signing_keys_unavailable`, `invalid_token`, or
+`forbidden_scope`) and safe request metadata. Credentials and authorization headers are never
+logged.
+
 ### Proxying a request
 
 Each upstream owns a proxy **hostname**; the incoming `Host` header selects it.
@@ -110,6 +124,8 @@ Rules:
   the origin. Reuses JWT auth and repo-scoped authz (`git-repo` resource).
 - **Client JWT never leaks** — `Authorization` is stripped before forwarding; secrets are
   never logged (redacted `Debug`, no `Display`).
+- **Health and metrics** — the management listener exposes Kubernetes-compatible liveness and
+  readiness probes plus Prometheus proxy metrics.
 
 ## Configuration
 
@@ -140,7 +156,7 @@ key_secret_ref          = "projects/my-proj/secrets/trust-signing-key/versions/l
 # Optional: previous key (verify-only during rotation).
 # previous_key_secret_ref = "projects/my-proj/secrets/trust-signing-key/versions/3"
 
-# mTLS token-issuance server + plain JWKS server.
+# mTLS token-issuance server + plain JWKS/health/metrics management server.
 [issuance]
 mtls_addr       = "0.0.0.0:8443"
 client_ca_path  = "/etc/trust/client-ca.pem"

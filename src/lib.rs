@@ -5,6 +5,7 @@ pub mod inject;
 pub mod issuance;
 pub mod jwt;
 pub mod keystore;
+pub mod metrics;
 pub mod proxy;
 pub mod resource;
 pub mod router;

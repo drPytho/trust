@@ -1,0 +1,134 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: trust
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trust-config
+data:
+  config.toml: |
+    [listen]
+    tcp = "0.0.0.0:6191"
+
+    [tls]
+    addr = "0.0.0.0:6443"
+    cert_path = "/etc/trust/tls/server.crt"
+    key_path = "/etc/trust/tls/server.key"
+
+    [auth]
+    issuer = "https://trust.example.com/"
+    audience = "trust-proxy"
+
+    [auth.signing]
+    algorithm = "ES256"
+    token_ttl = "1h"
+    key_secret_ref = "projects/PROJECT_ID/secrets/trust-signing-key/versions/latest"
+
+    [issuance]
+    mtls_addr = "0.0.0.0:8443"
+    client_ca_path = "/etc/trust/tls/client-ca.pem"
+    jwks_addr = "0.0.0.0:8080"
+
+    [[issuance.clients]]
+    spiffe = "spiffe://example/workloads/*"
+    allowed_scopes = ["anthropic"]
+
+    [[upstreams]]
+    name = "anthropic"
+    kind = "api"
+    listen_host = "anthropic.proxy.internal"
+    origin = "https://api.anthropic.com"
+    secret_ref = "projects/PROJECT_ID/secrets/anthropic-key/versions/latest"
+    injection = { header = "x-api-key", scheme = "raw" }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trust
+  labels:
+    app.kubernetes.io/name: trust
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: trust
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: trust
+    spec:
+      serviceAccountName: trust
+      containers:
+        - name: trust
+          image: ghcr.io/drpytho/trust:latest
+          imagePullPolicy: Always
+          env:
+            - name: TRUST_CONFIG
+              value: /etc/trust/config.toml
+            - name: RUST_LOG
+              value: info
+          ports:
+            - name: proxy-http
+              containerPort: 6191
+            - name: proxy-tls
+              containerPort: 6443
+            - name: token-mtls
+              containerPort: 8443
+            - name: jwks
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: jwks
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: jwks
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/trust/config.toml
+              subPath: config.toml
+              readOnly: true
+            - name: tls
+              mountPath: /etc/trust/tls
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: trust-config
+        - name: tls
+          secret:
+            secretName: trust-tls
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: trust
+spec:
+  selector:
+    app.kubernetes.io/name: trust
+  ports:
+    - name: proxy-http
+      port: 6191
+      targetPort: proxy-http
+    - name: proxy-tls
+      port: 6443
+      targetPort: proxy-tls
+    - name: token-mtls
+      port: 8443
+      targetPort: token-mtls
+    - name: jwks
+      port: 8080
+      targetPort: jwks

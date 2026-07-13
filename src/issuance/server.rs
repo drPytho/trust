@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::extract::{Extension, State};
 use axum::http::StatusCode;
@@ -15,6 +16,7 @@ use crate::issuance::mtls::extract_spiffe;
 use crate::issuance::policy::ClientPolicy;
 use crate::jwt::Issuer;
 use crate::keystore::Keystore;
+use crate::metrics::ProxyMetrics;
 use crate::scope::{ScopeSet, grant};
 
 #[derive(Debug, thiserror::Error)]
@@ -29,6 +31,12 @@ pub struct IssuanceState {
     pub keystore: Arc<Keystore>,
     pub issuer: Issuer,
     pub policy: ClientPolicy,
+}
+
+pub struct ManagementState {
+    pub keystore: Arc<Keystore>,
+    pub metrics: Arc<ProxyMetrics>,
+    pub proxy_ready: Arc<AtomicBool>,
 }
 
 /// Install the rustls aws-lc-rs crypto provider (idempotent).
@@ -130,8 +138,8 @@ async fn token_handler(
     }
 }
 
-async fn jwks_handler(State(keystore): State<Arc<Keystore>>) -> axum::response::Response {
-    match keystore.load() {
+async fn jwks_handler(State(state): State<Arc<ManagementState>>) -> axum::response::Response {
+    match state.keystore.load() {
         Some(km) => (
             [(axum::http::header::CONTENT_TYPE, "application/json")],
             km.jwks_json.clone(),
@@ -141,16 +149,48 @@ async fn jwks_handler(State(keystore): State<Arc<Keystore>>) -> axum::response::
     }
 }
 
+async fn health_handler() -> impl IntoResponse {
+    (StatusCode::OK, "ok\n")
+}
+
+async fn readiness_handler(State(state): State<Arc<ManagementState>>) -> axum::response::Response {
+    if state.proxy_ready.load(Ordering::Acquire) && state.keystore.load().is_some() {
+        (StatusCode::OK, "ready\n").into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "not ready\n").into_response()
+    }
+}
+
+async fn metrics_handler(State(state): State<Arc<ManagementState>>) -> axum::response::Response {
+    match state.metrics.encode() {
+        Ok(body) => (
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            )],
+            body,
+        )
+            .into_response(),
+        Err(e) => {
+            log::error!("failed to encode metrics: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "metrics unavailable\n").into_response()
+        }
+    }
+}
+
 pub fn token_router(state: Arc<IssuanceState>) -> Router {
     Router::new()
         .route("/token", post(token_handler))
         .with_state(state)
 }
 
-pub fn jwks_router(keystore: Arc<Keystore>) -> Router {
+pub fn management_router(state: Arc<ManagementState>) -> Router {
     Router::new()
         .route("/.well-known/jwks.json", get(jwks_handler))
-        .with_state(keystore)
+        .route("/healthz", get(health_handler))
+        .route("/readyz", get(readiness_handler))
+        .route("/metrics", get(metrics_handler))
+        .with_state(state)
 }
 
 pub async fn serve_token(
@@ -169,14 +209,14 @@ pub async fn serve_token(
         .map_err(|e| ServerError::Serve(e.to_string()))
 }
 
-pub async fn serve_jwks(
+pub async fn serve_management(
     addr: std::net::SocketAddr,
-    keystore: Arc<Keystore>,
+    state: Arc<ManagementState>,
 ) -> Result<(), ServerError> {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| ServerError::Serve(e.to_string()))?;
-    axum::serve(listener, jwks_router(keystore).into_make_service())
+    axum::serve(listener, management_router(state).into_make_service())
         .await
         .map_err(|e| ServerError::Serve(e.to_string()))
 }
@@ -185,6 +225,14 @@ pub async fn serve_jwks(
 mod tests {
     use super::*;
     use crate::keystore::build_key_material;
+
+    fn management_state(keystore: Arc<Keystore>, ready: bool) -> Arc<ManagementState> {
+        Arc::new(ManagementState {
+            keystore,
+            metrics: Arc::new(ProxyMetrics::new()),
+            proxy_ready: Arc::new(AtomicBool::new(ready)),
+        })
+    }
 
     fn gen_rcgen_cert_and_key() -> (rcgen::Certificate, rcgen::KeyPair) {
         let key = rcgen::KeyPair::generate().unwrap();
@@ -229,7 +277,7 @@ mod tests {
         use tower::ServiceExt;
 
         let ks = Arc::new(Keystore::new());
-        let router = jwks_router(ks);
+        let router = management_router(management_state(ks, false));
 
         let resp = router
             .oneshot(
@@ -254,7 +302,7 @@ mod tests {
         let km = build_key_material(&key.serialize_pem(), None).unwrap();
         let ks = Arc::new(Keystore::new());
         ks.store(km);
-        let router = jwks_router(ks);
+        let router = management_router(management_state(ks, true));
 
         let resp = router
             .oneshot(
@@ -269,5 +317,82 @@ mod tests {
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json.get("keys").is_some());
+    }
+
+    #[tokio::test]
+    async fn health_is_live_while_readiness_tracks_proxy_and_keys() {
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let ks = Arc::new(Keystore::new());
+        let state = management_state(ks.clone(), false);
+        let router = management_router(state.clone());
+
+        let live = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(live.status(), StatusCode::OK);
+
+        let not_ready = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(not_ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        ks.store(build_key_material(&key.serialize_pem(), None).unwrap());
+        state.proxy_ready.store(true, Ordering::Release);
+
+        let ready = router
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_uses_prometheus_content_type() {
+        use axum::body::to_bytes;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let state = management_state(Arc::new(Keystore::new()), false);
+        state.metrics.request_started();
+        state.metrics.request_finished("unrouted", 404, 0.01);
+
+        let response = management_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "text/plain; version=0.0.4; charset=utf-8"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("trust_proxy_requests_total"));
     }
 }
