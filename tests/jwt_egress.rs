@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pingora::prelude::*;
-use trust::config::{Injection, InjectionScheme, Origin, Upstream, UpstreamKind};
+use trust::config::{CredentialSource, Injection, InjectionScheme, Origin, Upstream, UpstreamKind};
 use trust::git::mirror::MirrorStore;
 use trust::git::sync::SyncManager;
 use trust::jwt::{Issuer, Verifier};
@@ -84,13 +84,16 @@ fn scoped_upstream(mock_port: u16) -> Arc<Upstream> {
             tls: false,
             sni: String::new(),
         },
-        secret_ref: "ref/gh".into(),
+        credential: CredentialSource::StaticSecret {
+            secret_ref: "ref/gh".into(),
+        },
         injection: Injection {
             header: "authorization".into(),
             scheme: InjectionScheme::Bearer,
         },
         resource: Some(ResourceKind::GithubRepo),
         git: None,
+        allowed_methods: Vec::new(),
     })
 }
 

@@ -1,0 +1,22 @@
+# This certificate identifies one workload to the trust token endpoint. The
+# URI must exactly match an [[issuance.clients]] entry in trust's config.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: my-service-trust-client
+  namespace: workloads
+spec:
+  secretName: my-service-trust-client
+  duration: 24h
+  renewBefore: 8h
+  uris:
+    - spiffe://example/workloads/my-service
+  usages:
+    - client auth
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  issuerRef:
+    name: trust-client-ca
+    kind: ClusterIssuer

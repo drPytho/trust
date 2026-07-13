@@ -7,8 +7,9 @@ Clients authenticate to `trust` with a **short-lived JWT** they mint against the
 **real** upstream secret from a secret manager, injects it, and forwards the request. The upstream
 credential is never handed to clients, and the client's JWT is never forwarded upstream.
 
-> **Status:** Phase 3 (git smart-HTTP caching) is complete. All three upstream kinds — `api`,
-> `github-api` (repo-scoped), and `git-cache` — are production-ready.
+> **Status:** API proxying and git smart-HTTP caching are implemented. API credentials may be
+> static Secret Manager values, repository-scoped GitHub App installation tokens, or Google ADC
+> access tokens for services such as Artifact Registry.
 
 ## Why
 
@@ -56,6 +57,8 @@ key to be loaded. The exported proxy metrics are:
 - `trust_proxy_rejections_total{upstream,reason,status}`
 - `trust_proxy_request_duration_seconds{upstream}`
 - `trust_proxy_in_flight_requests`
+- `trust_credential_resolutions_total{upstream,provider,result}`
+- `trust_credential_resolution_duration_seconds{provider}`
 
 Rejected proxy calls are also logged at `WARN` with bounded reasons (`missing_host`,
 `unknown_host`, `missing_token`, `signing_keys_unavailable`, `invalid_token`, or
@@ -116,6 +119,11 @@ Rules:
 - **Per-upstream host routing** via the `Host` header.
 - **GCP Secret Manager** backend behind a swappable `SecretProvider` trait, with an
   in-memory TTL cache (default 5 min).
+- **Dynamic GitHub App credentials** — selects an installation by repository owner, mints a token
+  restricted to the exact repository and configured permissions, and caches it until five minutes
+  before expiry.
+- **Artifact Registry credentials via ADC** — obtains Google access tokens through Application
+  Default Credentials/Workload Identity, without placing Google tokens in worker `.npmrc` files.
 - **Configurable injection** per upstream: header name + scheme (`bearer` / `basic` / `raw`).
 - **Repo-scoped authz** for `github-repo` upstreams — the request path is parsed for
   `owner/repo`; the JWT scope must cover it.
@@ -169,7 +177,21 @@ allowed_scopes = ["github:pitorg/pit-ts"]
 
 [[issuance.clients]]
 spiffe         = "spiffe://pit/team/platform/*"
-allowed_scopes = ["anthropic", "github:pitorg/*"]
+allowed_scopes = ["anthropic", "github:pitorg/*", "npm-artifacts:my-proj/npm-private"]
+
+# One GitHub App can have a different installation in each organization. Owner matching is
+# case-insensitive and requests for an unmapped owner fail closed.
+[github_app]
+app_id = 123456
+private_key_secret_ref = "projects/my-proj/secrets/github-app-key/versions/latest"
+
+[[github_app.installations]]
+owner = "pitorg"
+installation_id = 111111
+
+[[github_app.installations]]
+owner = "pit-customer"
+installation_id = 222222
 
 # Upstreams. Each owns a listen_host; the Host header routes to it.
 [[upstreams]]
@@ -181,13 +203,25 @@ secret_ref  = "projects/my-proj/secrets/anthropic-key/versions/latest"
 injection   = { header = "x-api-key", scheme = "raw" }
 
 [[upstreams]]
-name        = "github-api"
+name        = "github"
 kind        = "api"
 listen_host = "github.proxy.internal"
 origin      = "https://api.github.com"
-secret_ref  = "projects/my-proj/secrets/github-token/versions/latest"
+credential  = { kind = "github-app", permissions = { contents = "read", pull_requests = "read" } }
 injection   = { header = "authorization", scheme = "bearer" }
 resource    = { kind = "github-repo" }   # enables per-repo scope authz
+
+# Read-only npm access through GCP Artifact Registry. The proxy obtains the upstream token via
+# ADC; grant its workload identity Artifact Registry Reader on only this repository.
+[[upstreams]]
+name            = "npm-artifacts"
+kind            = "api"
+listen_host     = "npm.proxy.internal"
+origin          = "https://europe-north1-npm.pkg.dev"
+credential      = { kind = "gcp-adc", rewrite_registry_to = "https://npm.proxy.internal" }
+injection       = { header = "authorization", scheme = "bearer" }
+resource        = { kind = "artifact-registry-repo" }
+allowed_methods = ["GET", "HEAD"]
 
 # git-cache upstream: bare mirror + pass-through push.
 # Requires `git` in PATH where trust runs.
@@ -196,10 +230,8 @@ name        = "git-mirror"
 kind        = "git-cache"
 listen_host = "git.proxy.internal"
 origin      = "https://github.com"
-secret_ref  = "projects/my-proj/secrets/github-pat/versions/latest"
-# Store the PAT as `x-access-token:<pat>` in the secret; trust injects it as
-# `Authorization: Basic base64(x-access-token:<pat>)`, which GitHub accepts.
-# Alternatively use scheme = "bearer" if your token is a plain Bearer PAT.
+credential  = { kind = "github-app", permissions = { contents = "read" }, basic_username = "x-access-token" }
+# GitHub receives `Authorization: Basic base64(x-access-token:<installation-token>)`.
 injection   = { header = "authorization", scheme = "basic" }
 resource    = { kind = "git-repo" }
 git         = { storage_path = "/var/lib/trust/mirrors" }
@@ -217,7 +249,26 @@ is now JWT-based via the issuance endpoint.
 | `basic`  | `Basic base64(<secret>)`           | HTTP Basic (secret is the `user:pass` string) |
 
 Config is validated at startup: duplicate upstream names/listen hosts and malformed origins
-are rejected before the server binds.
+are rejected before the server binds. `secret_ref = "..."` remains supported as shorthand for
+`credential = { kind = "static-secret", secret_ref = "..." }`.
+
+### npm client configuration
+
+Workers need only non-secret routing configuration and their short-lived `trust` JWT. The npm CLI
+expands the environment variable at runtime:
+
+```ini
+@company:registry=https://npm.proxy.internal/my-proj/npm-private/
+//npm.proxy.internal/my-proj/npm-private/:_authToken=${TRUST_TOKEN}
+always-auth=true
+```
+
+No `gcloud` CLI or `google-artifactregistry-auth` invocation is required in the worker. The
+`rewrite_registry_to` setting rewrites absolute Artifact Registry tarball URLs and redirects back
+through the proxy. Existing lockfiles should still be regenerated against the proxy, or tested
+with `replace-registry-host=always`, so previously stored direct `*.pkg.dev` URLs cannot bypass it.
+Publishing should use a separate upstream, workload identity, and method policy with Artifact
+Registry Writer access.
 
 ## Running
 

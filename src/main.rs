@@ -7,6 +7,7 @@ use pingora::listeners::tls::TlsSettings;
 use pingora::prelude::*;
 
 use trust::config::{Config, UpstreamKind};
+use trust::credentials::CredentialManager;
 use trust::git::mirror::MirrorStore;
 use trust::git::sync::SyncManager;
 use trust::issuance::policy::ClientPolicy;
@@ -135,6 +136,10 @@ fn main() {
         Arc::new(GcpSecretProvider::new()),
         Duration::from_secs(300),
     ));
+    let credentials = Arc::new(CredentialManager::new(
+        proxy_secrets,
+        config.github_app.clone(),
+    ));
 
     // Use the storage_path from the first git-cache upstream that has a git block.
     // A single MirrorStore root is sufficient: MirrorStore.path_for already
@@ -151,11 +156,11 @@ fn main() {
     let mirrors = Arc::new(MirrorStore::new(mirror_root));
     let sync = Arc::new(SyncManager::new());
 
-    let service = ProxyService::with_metrics(
+    let service = ProxyService::with_credentials_and_metrics(
         router,
         verifier,
         keystore,
-        proxy_secrets,
+        credentials,
         mirrors,
         sync,
         metrics,

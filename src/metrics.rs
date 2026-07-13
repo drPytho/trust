@@ -7,6 +7,8 @@ pub struct ProxyMetrics {
     rejections: IntCounterVec,
     request_duration: HistogramVec,
     in_flight: IntGauge,
+    credential_resolutions: IntCounterVec,
+    credential_resolution_duration: HistogramVec,
 }
 
 impl ProxyMetrics {
@@ -41,6 +43,22 @@ impl ProxyMetrics {
             "Number of proxy requests currently being processed.",
         )
         .expect("valid in-flight metric");
+        let credential_resolutions = IntCounterVec::new(
+            Opts::new(
+                "trust_credential_resolutions_total",
+                "Credential resolutions by upstream, provider, and result.",
+            ),
+            &["upstream", "provider", "result"],
+        )
+        .expect("valid credential resolutions metric");
+        let credential_resolution_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "trust_credential_resolution_duration_seconds",
+                "Credential resolution duration by provider.",
+            ),
+            &["provider"],
+        )
+        .expect("valid credential resolution duration metric");
 
         registry
             .register(Box::new(requests.clone()))
@@ -54,6 +72,12 @@ impl ProxyMetrics {
         registry
             .register(Box::new(in_flight.clone()))
             .expect("register in-flight metric");
+        registry
+            .register(Box::new(credential_resolutions.clone()))
+            .expect("register credential resolutions metric");
+        registry
+            .register(Box::new(credential_resolution_duration.clone()))
+            .expect("register credential resolution duration metric");
 
         ProxyMetrics {
             registry,
@@ -61,6 +85,8 @@ impl ProxyMetrics {
             rejections,
             request_duration,
             in_flight,
+            credential_resolutions,
+            credential_resolution_duration,
         }
     }
 
@@ -88,6 +114,21 @@ impl ProxyMetrics {
         self.in_flight.dec();
     }
 
+    pub fn credential_resolution(
+        &self,
+        upstream: &str,
+        provider: &str,
+        result: &str,
+        elapsed_seconds: f64,
+    ) {
+        self.credential_resolutions
+            .with_label_values(&[upstream, provider, result])
+            .inc();
+        self.credential_resolution_duration
+            .with_label_values(&[provider])
+            .observe(elapsed_seconds);
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>, prometheus::Error> {
         let encoder = prometheus::TextEncoder::new();
         let families = self.registry.gather();
@@ -112,6 +153,7 @@ mod tests {
         let metrics = ProxyMetrics::new();
         metrics.request_started();
         metrics.rejection("anthropic", "invalid_token", 401);
+        metrics.credential_resolution("anthropic", "static-secret", "static", 0.01);
         metrics.request_finished("anthropic", 200, 0.25);
 
         let output = String::from_utf8(metrics.encode().unwrap()).unwrap();
@@ -125,5 +167,8 @@ mod tests {
             "trust_proxy_rejections_total{reason=\"invalid_token\",status=\"401\",upstream=\"anthropic\"} 1"
         ));
         assert!(output.contains("trust_proxy_in_flight_requests 0"));
+        assert!(output.contains(
+            "trust_credential_resolutions_total{provider=\"static-secret\",result=\"static\",upstream=\"anthropic\"} 1"
+        ));
     }
 }

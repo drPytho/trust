@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -30,6 +30,20 @@ pub enum ConfigError {
     GitCacheNeedsGitRepoResource(String),
     #[error("api upstream '{0}' must not have a [git] block")]
     UnexpectedGitBlock(String),
+    #[error("upstream '{0}' must configure exactly one of secret_ref or credential")]
+    BadCredentialConfig(String),
+    #[error("upstream '{0}' uses github-app credentials but [github_app] is missing")]
+    MissingGithubApp(String),
+    #[error("duplicate GitHub App installation owner: {0}")]
+    DuplicateGithubOwner(String),
+    #[error("invalid allowed method '{method}' on upstream '{upstream}'")]
+    BadAllowedMethod { upstream: String, method: String },
+    #[error("invalid GitHub App configuration: {0}")]
+    BadGithubApp(String),
+    #[error("github-app upstream '{0}' requires a GitHub repository resource")]
+    GithubAppNeedsResource(String),
+    #[error("gcp-adc upstream '{0}' requires Authorization bearer injection")]
+    GcpAdcNeedsBearer(String),
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -58,6 +72,66 @@ pub struct Injection {
     pub scheme: InjectionScheme,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum CredentialSource {
+    StaticSecret {
+        secret_ref: String,
+    },
+    GithubApp {
+        #[serde(default)]
+        permissions: BTreeMap<String, String>,
+        /// For Git smart-HTTP, GitHub expects the installation token as the
+        /// password in HTTP Basic authentication (normally user `x-access-token`).
+        #[serde(default)]
+        basic_username: Option<String>,
+    },
+    GcpAdc {
+        /// When set, rewrite absolute Artifact Registry metadata/tarball URLs
+        /// back to this externally reachable proxy base URL.
+        #[serde(default)]
+        rewrite_registry_to: Option<String>,
+    },
+}
+
+impl CredentialSource {
+    pub fn provider_name(&self) -> &'static str {
+        match self {
+            CredentialSource::StaticSecret { .. } => "static-secret",
+            CredentialSource::GithubApp { .. } => "github-app",
+            CredentialSource::GcpAdc { .. } => "gcp-adc",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GithubInstallation {
+    pub owner: String,
+    pub installation_id: u64,
+}
+
+fn default_github_api_base() -> String {
+    "https://api.github.com".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GithubAppConfig {
+    pub app_id: u64,
+    pub private_key_secret_ref: String,
+    #[serde(default = "default_github_api_base")]
+    pub api_base: String,
+    #[serde(default)]
+    pub installations: Vec<GithubInstallation>,
+}
+
+impl GithubAppConfig {
+    pub fn installation_for(&self, owner: &str) -> Option<&GithubInstallation> {
+        self.installations
+            .iter()
+            .find(|installation| installation.owner.eq_ignore_ascii_case(owner))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Origin {
     pub host: String,
@@ -72,10 +146,11 @@ pub struct Upstream {
     pub kind: UpstreamKind,
     pub listen_host: String,
     pub origin: Origin,
-    pub secret_ref: String,
+    pub credential: CredentialSource,
     pub injection: Injection,
     pub resource: Option<ResourceKind>,
     pub git: Option<GitConfig>,
+    pub allowed_methods: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -149,12 +224,17 @@ struct RawUpstream {
     kind: UpstreamKind,
     listen_host: String,
     origin: String,
-    secret_ref: String,
+    #[serde(default)]
+    secret_ref: Option<String>,
+    #[serde(default)]
+    credential: Option<CredentialSource>,
     injection: Injection,
     #[serde(default)]
     resource: Option<RawResource>,
     #[serde(default)]
     git: Option<GitConfig>,
+    #[serde(default)]
+    allowed_methods: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -164,6 +244,8 @@ struct RawConfig {
     tls: Option<TlsConfig>,
     auth: RawAuth,
     issuance: IssuanceConfig,
+    #[serde(default)]
+    github_app: Option<GithubAppConfig>,
     upstreams: Vec<RawUpstream>,
 }
 
@@ -173,6 +255,7 @@ pub struct Config {
     pub tls: Option<TlsConfig>,
     pub auth: AuthConfig,
     pub issuance: IssuanceConfig,
+    pub github_app: Option<GithubAppConfig>,
     pub upstreams: Vec<Arc<Upstream>>,
 }
 
@@ -221,6 +304,37 @@ impl Config {
         let mut names = HashSet::new();
         let mut hosts = HashSet::new();
         let mut upstreams = Vec::with_capacity(raw.upstreams.len());
+        if let Some(github_app) = &raw.github_app {
+            if github_app.app_id == 0 || github_app.private_key_secret_ref.is_empty() {
+                return Err(ConfigError::BadGithubApp(
+                    "app_id and private_key_secret_ref are required".to_string(),
+                ));
+            }
+            let api_base = Url::parse(&github_app.api_base)
+                .map_err(|error| ConfigError::BadGithubApp(format!("invalid api_base: {error}")))?;
+            if !matches!(api_base.scheme(), "http" | "https") || api_base.host_str().is_none() {
+                return Err(ConfigError::BadGithubApp(
+                    "api_base must be an HTTP(S) URL".to_string(),
+                ));
+            }
+            let mut owners = HashSet::new();
+            for installation in &github_app.installations {
+                if installation.installation_id == 0
+                    || !crate::resource::safe_component(&installation.owner)
+                {
+                    return Err(ConfigError::BadGithubApp(format!(
+                        "invalid installation for owner '{}'",
+                        installation.owner
+                    )));
+                }
+                let owner = installation.owner.to_ascii_lowercase();
+                if !owners.insert(owner) {
+                    return Err(ConfigError::DuplicateGithubOwner(
+                        installation.owner.clone(),
+                    ));
+                }
+            }
+        }
         for ru in raw.upstreams {
             if !names.insert(ru.name.clone()) {
                 return Err(ConfigError::DuplicateUpstream(ru.name));
@@ -229,6 +343,74 @@ impl Config {
                 return Err(ConfigError::DuplicateListenHost(ru.listen_host));
             }
             let origin = parse_origin(&ru.origin)?;
+            let credential = match (ru.secret_ref, ru.credential) {
+                (Some(secret_ref), None) => CredentialSource::StaticSecret { secret_ref },
+                (None, Some(credential)) => credential,
+                _ => return Err(ConfigError::BadCredentialConfig(ru.name)),
+            };
+            if matches!(credential, CredentialSource::GithubApp { .. }) && raw.github_app.is_none()
+            {
+                return Err(ConfigError::MissingGithubApp(ru.name));
+            }
+            if let CredentialSource::GithubApp { basic_username, .. } = &credential {
+                if !matches!(
+                    ru.resource,
+                    Some(RawResource {
+                        kind: ResourceKind::GithubRepo | ResourceKind::GitRepo
+                    })
+                ) {
+                    return Err(ConfigError::GithubAppNeedsResource(ru.name));
+                }
+                if basic_username.as_deref().is_some_and(|username| {
+                    username.is_empty()
+                        || username
+                            .bytes()
+                            .any(|byte| byte == b':' || byte.is_ascii_control())
+                }) {
+                    return Err(ConfigError::BadGithubApp(
+                        "basic_username must be a non-empty HTTP Basic username".to_string(),
+                    ));
+                }
+            }
+            if matches!(credential, CredentialSource::GcpAdc { .. })
+                && (!ru.injection.header.eq_ignore_ascii_case("authorization")
+                    || ru.injection.scheme != InjectionScheme::Bearer)
+            {
+                return Err(ConfigError::GcpAdcNeedsBearer(ru.name));
+            }
+            if let CredentialSource::GcpAdc {
+                rewrite_registry_to: Some(base),
+            } = &credential
+            {
+                let url = Url::parse(base).map_err(|error| ConfigError::BadOrigin {
+                    url: base.clone(),
+                    reason: format!("invalid rewrite_registry_to: {error}"),
+                })?;
+                if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+                    return Err(ConfigError::BadOrigin {
+                        url: base.clone(),
+                        reason: "rewrite_registry_to must be an HTTP(S) URL".to_string(),
+                    });
+                }
+            }
+            let allowed_methods = ru
+                .allowed_methods
+                .into_iter()
+                .map(|method| {
+                    if method.is_empty()
+                        || !method
+                            .bytes()
+                            .all(|byte| byte.is_ascii_uppercase() || byte == b'-')
+                    {
+                        Err(ConfigError::BadAllowedMethod {
+                            upstream: ru.name.clone(),
+                            method,
+                        })
+                    } else {
+                        Ok(method)
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
 
             // Validate git-cache-specific rules.
             match ru.kind {
@@ -257,10 +439,11 @@ impl Config {
                 kind: ru.kind,
                 listen_host: ru.listen_host,
                 origin,
-                secret_ref: ru.secret_ref,
+                credential,
                 injection: ru.injection,
                 resource: ru.resource.map(|r| r.kind),
                 git: ru.git,
+                allowed_methods,
             }));
         }
 
@@ -300,6 +483,7 @@ impl Config {
             tls: raw.tls,
             auth,
             issuance: raw.issuance,
+            github_app: raw.github_app,
             upstreams,
         })
     }
@@ -523,6 +707,98 @@ git = { storage_path = "/m" }
         assert!(matches!(
             Config::from_str(&toml),
             Err(ConfigError::UnexpectedGitBlock(_))
+        ));
+    }
+
+    #[test]
+    fn parses_multi_installation_github_app_and_gcp_adc() {
+        let dynamic = r#"
+[github_app]
+app_id = 123
+private_key_secret_ref = "projects/p/secrets/github-app-key/versions/latest"
+
+[[github_app.installations]]
+owner = "org-one"
+installation_id = 111
+
+[[github_app.installations]]
+owner = "org-two"
+installation_id = 222
+
+[[upstreams]]
+name = "github-dynamic"
+kind = "api"
+listen_host = "github-dynamic.proxy.internal"
+origin = "https://api.github.com"
+credential = { kind = "github-app", permissions = { contents = "read" } }
+injection = { header = "authorization", scheme = "bearer" }
+resource = { kind = "github-repo" }
+
+[[upstreams]]
+name = "npm-artifacts"
+kind = "api"
+listen_host = "npm.proxy.internal"
+origin = "https://europe-north1-npm.pkg.dev"
+credential = { kind = "gcp-adc", rewrite_registry_to = "https://npm.proxy.internal" }
+injection = { header = "authorization", scheme = "bearer" }
+resource = { kind = "artifact-registry-repo" }
+allowed_methods = ["GET", "HEAD"]
+"#;
+        let cfg = Config::from_str(&(GOOD.to_string() + dynamic)).unwrap();
+        let app = cfg.github_app.unwrap();
+        assert_eq!(
+            app.installation_for("ORG-ONE").unwrap().installation_id,
+            111
+        );
+        assert_eq!(
+            app.installation_for("org-two").unwrap().installation_id,
+            222
+        );
+        let npm = cfg
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.name == "npm-artifacts")
+            .unwrap();
+        assert_eq!(npm.allowed_methods, ["GET", "HEAD"]);
+        assert!(matches!(npm.credential, CredentialSource::GcpAdc { .. }));
+    }
+
+    #[test]
+    fn rejects_duplicate_github_owner_case_insensitively() {
+        let duplicate = r#"
+[github_app]
+app_id = 123
+private_key_secret_ref = "key"
+
+[[github_app.installations]]
+owner = "Org-One"
+installation_id = 111
+
+[[github_app.installations]]
+owner = "org-one"
+installation_id = 222
+"#;
+        assert!(matches!(
+            Config::from_str(&(GOOD.to_string() + duplicate)),
+            Err(ConfigError::DuplicateGithubOwner(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_github_credentials_without_app_config() {
+        let upstream = r#"
+[[upstreams]]
+name = "github-dynamic"
+kind = "api"
+listen_host = "github-dynamic.proxy.internal"
+origin = "https://api.github.com"
+credential = { kind = "github-app" }
+injection = { header = "authorization", scheme = "bearer" }
+resource = { kind = "github-repo" }
+"#;
+        assert!(matches!(
+            Config::from_str(&(GOOD.to_string() + upstream)),
+            Err(ConfigError::MissingGithubApp(_))
         ));
     }
 }

@@ -1,0 +1,25 @@
+# This policy isolates ingress to trust Pods and permits only the example
+# workload to reach the mTLS token port. Add rules for the proxy and management
+# ports before applying it when those ports must remain reachable.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: trust-token-clients
+  namespace: trust-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: trust
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: workloads
+          podSelector:
+            matchLabels:
+              trust.example.com/token-client: "true"
+      ports:
+        - protocol: TCP
+          port: 8443

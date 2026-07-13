@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -8,6 +8,7 @@ use pingora::upstreams::peer::HttpPeer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::{Upstream, UpstreamKind};
+use crate::credentials::{CredentialManager, CredentialProvider};
 use crate::decision::{authorize, extract_bearer};
 use crate::git::backend;
 use crate::git::classify::{GitRequest, classify};
@@ -24,6 +25,8 @@ use crate::secrets::{Secret, SecretProvider};
 pub struct RequestCtx {
     pub upstream: Option<Arc<Upstream>>,
     pub secret: Option<Secret>,
+    pub credential_cache_key: Option<String>,
+    npm_rewrite: Option<NpmRewrite>,
     /// Set for git-cache push requests so `response_filter` can trigger a
     /// background mirror sync after the upstream push succeeds.
     /// Tuple: (upstream_name, owner, repo).
@@ -39,6 +42,8 @@ impl RequestCtx {
         RequestCtx {
             upstream: None,
             secret: None,
+            credential_cache_key: None,
+            npm_rewrite: None,
             push_repo: None,
             started_at: Instant::now(),
             metrics,
@@ -56,6 +61,40 @@ impl RequestCtx {
     }
 }
 
+const MAX_NPM_METADATA_BYTES: usize = 64 * 1024 * 1024;
+
+struct NpmRewrite {
+    from: String,
+    to: String,
+    buffer_body: bool,
+    buffer: Vec<u8>,
+}
+
+fn rewrite_registry_json(body: &[u8], from: &str, to: &str) -> Result<Vec<u8>, serde_json::Error> {
+    fn rewrite(value: &mut serde_json::Value, from: &str, to: &str) {
+        match value {
+            serde_json::Value::String(value) if value.starts_with(from) => {
+                *value = format!("{to}{}", &value[from.len()..]);
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    rewrite(value, from, to);
+                }
+            }
+            serde_json::Value::Object(values) => {
+                for value in values.values_mut() {
+                    rewrite(value, from, to);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut value: serde_json::Value = serde_json::from_slice(body)?;
+    rewrite(&mut value, from, to);
+    serde_json::to_vec(&value)
+}
+
 impl Drop for RequestCtx {
     fn drop(&mut self) {
         if !self.metrics_finished {
@@ -68,7 +107,7 @@ pub struct ProxyService {
     pub router: Router,
     pub verifier: Verifier,
     pub keystore: Arc<Keystore>,
-    pub secrets: Arc<dyn SecretProvider>,
+    pub credentials: Arc<dyn CredentialProvider>,
     pub mirrors: Arc<MirrorStore>,
     pub sync: Arc<SyncManager>,
     pub metrics: Arc<ProxyMetrics>,
@@ -103,11 +142,31 @@ impl ProxyService {
         sync: Arc<SyncManager>,
         metrics: Arc<ProxyMetrics>,
     ) -> ProxyService {
+        Self::with_credentials_and_metrics(
+            router,
+            verifier,
+            keystore,
+            Arc::new(CredentialManager::new(secrets, None)),
+            mirrors,
+            sync,
+            metrics,
+        )
+    }
+
+    pub fn with_credentials_and_metrics(
+        router: Router,
+        verifier: Verifier,
+        keystore: Arc<Keystore>,
+        credentials: Arc<dyn CredentialProvider>,
+        mirrors: Arc<MirrorStore>,
+        sync: Arc<SyncManager>,
+        metrics: Arc<ProxyMetrics>,
+    ) -> ProxyService {
         ProxyService {
             router,
             verifier,
             keystore,
-            secrets,
+            credentials,
             mirrors,
             sync,
             metrics,
@@ -193,6 +252,24 @@ impl ProxyHttp for ProxyService {
                 .await;
         };
         ctx.upstream = Some(upstream.clone());
+        if let crate::config::CredentialSource::GcpAdc {
+            rewrite_registry_to: Some(to),
+        } = &upstream.credential
+        {
+            let origin = &upstream.origin;
+            let scheme = if origin.tls { "https" } else { "http" };
+            let from = if (origin.tls && origin.port == 443) || (!origin.tls && origin.port == 80) {
+                format!("{scheme}://{}", origin.host)
+            } else {
+                format!("{scheme}://{}:{}", origin.host, origin.port)
+            };
+            ctx.npm_rewrite = Some(NpmRewrite {
+                from,
+                to: to.trim_end_matches('/').to_string(),
+                buffer_body: false,
+                buffer: Vec::new(),
+            });
+        }
 
         // Verify the JWT.
         let auth = session
@@ -227,7 +304,8 @@ impl ProxyHttp for ProxyService {
 
         // Authorize by scope (+ resource path).
         let path = session.req_header().uri.path().to_string();
-        if !authorize(&scopes, &upstream, &path) {
+        let method = session.req_header().method.as_str().to_string();
+        if !authorize(&scopes, &upstream, &method, &path) {
             return self
                 .reject(session, ctx, 403, "forbidden_scope", b"not allowed")
                 .await;
@@ -239,14 +317,29 @@ impl ProxyHttp for ProxyService {
         }
 
         // --- api branch (unchanged) ---
-        match self.secrets.get(&upstream.secret_ref).await {
-            Ok(secret) => {
-                ctx.secret = Some(secret);
+        let credential_started = Instant::now();
+        let provider = upstream.credential.provider_name();
+        match self.credentials.resolve(&upstream, &method, &path).await {
+            Ok(credential) => {
+                self.metrics.credential_resolution(
+                    &upstream.name,
+                    provider,
+                    credential.result,
+                    credential_started.elapsed().as_secs_f64(),
+                );
+                ctx.secret = Some(credential.secret);
+                ctx.credential_cache_key = credential.cache_key;
                 ctx.upstream = Some(upstream);
                 Ok(false)
             }
             Err(e) => {
-                log::error!("secret fetch failed for {}: {e}", upstream.name);
+                self.metrics.credential_resolution(
+                    &upstream.name,
+                    provider,
+                    "error",
+                    credential_started.elapsed().as_secs_f64(),
+                );
+                log::error!("credential resolution failed for {}: {e}", upstream.name);
                 session
                     .respond_error_with_body(
                         502,
@@ -292,6 +385,14 @@ impl ProxyHttp for ProxyService {
             .ok_or_else(|| Error::new_str("secret missing in ctx"))?;
         inject(upstream_request, &upstream.injection, secret.expose())
             .map_err(|_| Error::new_str("secret injection failed"))?;
+        if matches!(
+            upstream.credential,
+            crate::config::CredentialSource::GcpAdc { .. }
+        ) {
+            // Metadata must be uncompressed so absolute tarball URLs can be
+            // rewritten without exposing a direct Artifact Registry bypass.
+            upstream_request.remove_header("accept-encoding");
+        }
         upstream_request
             .insert_header("host", upstream.origin.host.as_str())
             .map_err(|_| Error::new_str("failed to set host header"))?;
@@ -300,80 +401,152 @@ impl ProxyHttp for ProxyService {
 
     async fn response_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         upstream_response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
+        let status = upstream_response.status.as_u16();
+        if status == 401
+            && let Some(cache_key) = ctx.credential_cache_key.as_deref()
+        {
+            self.credentials.invalidate(cache_key).await;
+        }
+
+        if let Some(rewrite) = ctx.npm_rewrite.as_mut() {
+            if let Some(location) = upstream_response
+                .headers
+                .get("location")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+            {
+                if location.starts_with(&rewrite.from) {
+                    let location = format!("{}{}", rewrite.to, &location[rewrite.from.len()..]);
+                    upstream_response
+                        .insert_header("location", location)
+                        .map_err(|_| Error::new_str("failed to rewrite registry redirect"))?;
+                } else if location.starts_with("http://") || location.starts_with("https://") {
+                    // Never hand a credential-bearing signed redirect URL to an
+                    // untrusted npm client. Same-origin redirects are rewritten;
+                    // other absolute redirects fail closed.
+                    return Err(Error::new_str("external registry redirect refused"));
+                }
+            }
+
+            let is_json = upstream_response
+                .headers
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.to_ascii_lowercase().contains("json"));
+            if is_json
+                && (200..300).contains(&status)
+                && status != 204
+                && session.req_header().method.as_str() != "HEAD"
+            {
+                if upstream_response.headers.contains_key("content-encoding") {
+                    return Err(Error::new_str(
+                        "compressed registry metadata cannot be rewritten",
+                    ));
+                }
+                rewrite.buffer_body = true;
+                upstream_response.remove_header("content-length");
+            }
+        }
+
         // If this was a git push passthrough and it succeeded, trigger a
         // background mirror sync so the local bare repo is updated.
-        if let Some((ref name, ref owner, ref repo)) = ctx.push_repo {
-            let status = upstream_response.status.as_u16();
-            if (200..300).contains(&status) {
-                // Clone the pieces we need for the background task.
-                // ctx.upstream is set in handle_git_push, so it is always Some here.
-                let upstream_arc = match ctx.upstream.clone() {
-                    Some(u) => u,
+        if let Some((ref name, ref owner, ref repo)) = ctx.push_repo
+            && (200..300).contains(&status)
+        {
+            // Clone the pieces we need for the background task.
+            // ctx.upstream is set in handle_git_push, so it is always Some here.
+            let upstream_arc = match ctx.upstream.clone() {
+                Some(u) => u,
+                None => {
+                    log::warn!("post-push sync: upstream missing in ctx for {name}/{owner}/{repo}");
+                    return Ok(());
+                }
+            };
+            let credentials = self.credentials.clone();
+            let mirrors = self.mirrors.clone();
+            let sync = self.sync.clone();
+            let owner = owner.clone();
+            let repo = repo.clone();
+
+            // SECURITY: auth_header is never logged inside this task.
+            tokio::spawn(async move {
+                let mirror_path = match mirrors.path_for(&upstream_arc.name, &owner, &repo) {
+                    Some(p) => p,
                     None => {
                         log::warn!(
-                            "post-push sync: upstream missing in ctx for {name}/{owner}/{repo}"
+                            "post-push sync: no mirror path for {}/{}/{}",
+                            upstream_arc.name,
+                            owner,
+                            repo
                         );
-                        return Ok(());
+                        return;
                     }
                 };
-                let secrets = self.secrets.clone();
-                let mirrors = self.mirrors.clone();
-                let sync = self.sync.clone();
-                let owner = owner.clone();
-                let repo = repo.clone();
 
-                // SECURITY: auth_header is never logged inside this task.
-                tokio::spawn(async move {
-                    let mirror_path = match mirrors.path_for(&upstream_arc.name, &owner, &repo) {
-                        Some(p) => p,
-                        None => {
-                            log::warn!(
-                                "post-push sync: no mirror path for {}/{}/{}",
-                                upstream_arc.name,
-                                owner,
-                                repo
-                            );
-                            return;
-                        }
-                    };
-
-                    // Re-resolve the git credential (secret).
-                    let secret = match secrets.get(&upstream_arc.secret_ref).await {
-                        Ok(s) => s,
+                let path = format!("/{owner}/{repo}.git/info/refs");
+                let credential = match credentials.resolve(&upstream_arc, "GET", &path).await {
+                    Ok(credential) => credential,
+                    Err(e) => {
+                        log::warn!(
+                            "post-push sync: credential resolution failed for {}: {e}",
+                            upstream_arc.name
+                        );
+                        return;
+                    }
+                };
+                // Build the auth header — SECURITY: never log this value.
+                let auth_header =
+                    match injection_value(&upstream_arc.injection, credential.secret.expose()) {
+                        Ok(v) => v,
                         Err(e) => {
                             log::warn!(
-                                "post-push sync: secret fetch failed for {}: {e}",
+                                "post-push sync: injection failed for {}: {e}",
                                 upstream_arc.name
                             );
                             return;
                         }
                     };
-                    // Build the auth header — SECURITY: never log this value.
-                    let auth_header =
-                        match injection_value(&upstream_arc.injection, secret.expose()) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                log::warn!(
-                                    "post-push sync: injection failed for {}: {e}",
-                                    upstream_arc.name
-                                );
-                                return;
-                            }
-                        };
 
-                    let key = format!("{}/{}/{}", upstream_arc.name, owner, repo);
-                    if let Err(e) = sync.sync(&key, &mirror_path, &auth_header).await {
-                        // SECURITY: `e` contains key/path only, never auth_header.
-                        log::warn!("post-push sync failed for {key}: {e}");
-                    }
-                });
-            }
+                let key = format!("{}/{}/{}", upstream_arc.name, owner, repo);
+                if let Err(e) = sync.sync(&key, &mirror_path, &auth_header).await {
+                    // SECURITY: `e` contains key/path only, never auth_header.
+                    log::warn!("post-push sync failed for {key}: {e}");
+                }
+            });
         }
         Ok(())
+    }
+
+    fn response_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<Option<Duration>> {
+        let Some(rewrite) = ctx.npm_rewrite.as_mut() else {
+            return Ok(None);
+        };
+        if !rewrite.buffer_body {
+            return Ok(None);
+        }
+        if let Some(chunk) = body.as_mut() {
+            if rewrite.buffer.len() + chunk.len() > MAX_NPM_METADATA_BYTES {
+                return Err(Error::new_str("registry metadata exceeds rewrite limit"));
+            }
+            rewrite.buffer.extend_from_slice(chunk);
+            chunk.clear();
+        }
+        if end_of_stream {
+            let rewritten = rewrite_registry_json(&rewrite.buffer, &rewrite.from, &rewrite.to)
+                .map_err(|_| Error::new_str("invalid registry metadata JSON"))?;
+            *body = Some(Bytes::from(rewritten));
+        }
+        Ok(None)
     }
 
     async fn logging(&self, session: &mut Session, _e: Option<&Error>, ctx: &mut Self::CTX) {
@@ -445,10 +618,13 @@ impl ProxyService {
         let repo = res.repo;
 
         // --- Fetch the git credential (secret).  The JWT is NOT used here. ---
-        let secret = match self.secrets.get(&upstream.secret_ref).await {
-            Ok(s) => s,
+        let credential = match self.credentials.resolve(&upstream, method, path).await {
+            Ok(credential) => credential,
             Err(e) => {
-                log::error!("git-cache secret fetch failed for {}: {e}", upstream.name);
+                log::error!(
+                    "git-cache credential resolution failed for {}: {e}",
+                    upstream.name
+                );
                 session
                     .respond_error_with_body(
                         502,
@@ -459,7 +635,7 @@ impl ProxyService {
             }
         };
         // SECURITY: auth_header is the injected git credential — never logged.
-        let auth_header = match injection_value(&upstream.injection, secret.expose()) {
+        let auth_header = match injection_value(&upstream.injection, credential.secret.expose()) {
             Ok(v) => v,
             Err(e) => {
                 log::error!("git-cache injection failed for {}: {e}", upstream.name);
@@ -819,11 +995,12 @@ impl ProxyService {
 
         // Fetch the secret so the normal proxy path (upstream_request_filter)
         // can inject it.
-        let secret = match self.secrets.get(&upstream.secret_ref).await {
-            Ok(s) => s,
+        let method = session.req_header().method.as_str().to_string();
+        let credential = match self.credentials.resolve(&upstream, &method, path).await {
+            Ok(credential) => credential,
             Err(e) => {
                 log::error!(
-                    "git-cache push: secret fetch failed for {}: {e}",
+                    "git-cache push: credential resolution failed for {}: {e}",
                     upstream.name
                 );
                 session
@@ -838,11 +1015,46 @@ impl ProxyService {
 
         // Record push info for the background post-push sync in response_filter.
         ctx.push_repo = Some((upstream.name.clone(), res.owner, res.repo));
-        ctx.secret = Some(secret);
+        ctx.secret = Some(credential.secret);
+        ctx.credential_cache_key = credential.cache_key;
         ctx.upstream = Some(upstream);
 
         // Return false → normal proxy path continues (upstream_peer +
         // upstream_request_filter strips JWT + injects credential).
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rewrite_registry_json;
+
+    #[test]
+    fn rewrites_only_artifact_registry_urls_in_npm_metadata() {
+        let input = br#"{
+            "versions": {
+                "1.0.0": {
+                    "dist": {
+                        "tarball": "https://europe-north1-npm.pkg.dev/project/repo/pkg/-/pkg.tgz"
+                    },
+                    "repository": "https://github.com/example/pkg"
+                }
+            }
+        }"#;
+        let output = rewrite_registry_json(
+            input,
+            "https://europe-north1-npm.pkg.dev",
+            "http://npm-proxy.pit-workers.svc:6191",
+        )
+        .unwrap();
+        let output: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(
+            output["versions"]["1.0.0"]["dist"]["tarball"],
+            "http://npm-proxy.pit-workers.svc:6191/project/repo/pkg/-/pkg.tgz"
+        );
+        assert_eq!(
+            output["versions"]["1.0.0"]["repository"],
+            "https://github.com/example/pkg"
+        );
     }
 }

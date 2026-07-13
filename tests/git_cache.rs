@@ -35,7 +35,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pingora::prelude::*;
-use trust::config::{GitConfig, Injection, InjectionScheme, Origin, Upstream, UpstreamKind};
+use trust::config::{
+    CredentialSource, GitConfig, Injection, InjectionScheme, Origin, Upstream, UpstreamKind,
+};
 use trust::git::mirror::MirrorStore;
 use trust::git::sync::SyncManager;
 use trust::jwt::{Issuer, Verifier};
@@ -426,7 +428,9 @@ fn build_proxy_upstream(origin_port: u16, storage_path: &Path) -> Arc<Upstream> 
             tls: false,
             sni: String::new(),
         },
-        secret_ref: "ref/git".into(),
+        credential: CredentialSource::StaticSecret {
+            secret_ref: "ref/git".into(),
+        },
         injection: Injection {
             header: "authorization".into(),
             scheme: InjectionScheme::Bearer,
@@ -435,6 +439,7 @@ fn build_proxy_upstream(origin_port: u16, storage_path: &Path) -> Arc<Upstream> 
         git: Some(GitConfig {
             storage_path: storage_path.to_string_lossy().into_owned(),
         }),
+        allowed_methods: Vec::new(),
     })
 }
 
