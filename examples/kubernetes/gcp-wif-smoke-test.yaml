@@ -1,0 +1,105 @@
+# Opt-in live test for GKE Workload Identity through trust. This Job publishes
+# one Pub/Sub message and creates one uniquely named Cloud Storage object.
+# Replace the three placeholder values and grant the `my-service` Workload
+# Identity principal roles/pubsub.publisher on the topic plus
+# roles/storage.objectCreator on the bucket before applying it.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: trust-gcp-wif-smoke-test
+  namespace: workloads
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: trust-gcp-wif-smoke-test
+        trust.example.com/token-client: "true"
+        trust.example.com/proxy-client: "true"
+        trust.example.com/restricted-egress: "true"
+    spec:
+      restartPolicy: Never
+      serviceAccountName: my-service
+      automountServiceAccountToken: false
+      containers:
+        - name: smoke-test
+          image: curlimages/curl:8.16.0
+          env:
+            - name: GCP_PROJECT_ID
+              value: PROJECT_ID
+            - name: PUBSUB_TOPIC_ID
+              value: TOPIC_ID
+            - name: GCS_BUCKET_NAME
+              value: BUCKET_NAME
+            - name: NO_PROXY
+              value: >-
+                metadata.google.internal,
+                169.254.169.254,
+                169.254.169.252,
+                trust.trust-system.svc,
+                .proxy.internal
+          command:
+            - /bin/sh
+            - -ceu
+            - |
+              extract_access_token() {
+                sed -n 's/.*"access_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+              }
+
+              TRUST_TOKEN="$(
+                curl --fail --silent --show-error \
+                  --cert /var/run/trust/client/tls.crt \
+                  --key /var/run/trust/client/tls.key \
+                  --cacert /var/run/trust/server/ca.crt \
+                  https://trust.trust-system.svc:8443/token \
+                  --data-urlencode 'grant_type=client_credentials' \
+                  --data-urlencode 'scope=gcp-pubsub gcp-storage' \
+                | extract_access_token
+              )"
+              test -n "${TRUST_TOKEN}"
+
+              GOOGLE_TOKEN="$(
+                curl --fail --silent --show-error --noproxy '*' \
+                  -H 'Metadata-Flavor: Google' \
+                  http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token \
+                | extract_access_token
+              )"
+              test -n "${GOOGLE_TOKEN}"
+
+              curl --fail --silent --show-error \
+                --proxy https://trust.trust-system.svc:6180 \
+                --proxy-cacert /var/run/trust/server/ca.crt \
+                --proxy-header "Proxy-Authorization: Bearer ${TRUST_TOKEN}" \
+                -H "Authorization: Bearer ${GOOGLE_TOKEN}" \
+                -H 'Content-Type: application/json' \
+                --data '{"messages":[{"data":"dHJ1c3QgV0lGIHByb3h5IHNtb2tlIHRlc3Q="}]}' \
+                "https://pubsub.googleapis.com/v1/projects/${GCP_PROJECT_ID}/topics/${PUBSUB_TOPIC_ID}:publish" \
+                >/dev/null
+
+              OBJECT_NAME="trust-wif-smoke-$(date +%s).txt"
+              curl --fail --silent --show-error \
+                --proxy https://trust.trust-system.svc:6180 \
+                --proxy-cacert /var/run/trust/server/ca.crt \
+                --proxy-header "Proxy-Authorization: Bearer ${TRUST_TOKEN}" \
+                -H "Authorization: Bearer ${GOOGLE_TOKEN}" \
+                -H 'Content-Type: text/plain' \
+                --data 'trust Workload Identity proxy smoke test' \
+                "https://storage.googleapis.com/upload/storage/v1/b/${GCS_BUCKET_NAME}/o?uploadType=media&name=${OBJECT_NAME}" \
+                >/dev/null
+
+              echo "Pub/Sub publish and Cloud Storage upload succeeded (${OBJECT_NAME})"
+          volumeMounts:
+            - name: trust-client
+              mountPath: /var/run/trust/client
+              readOnly: true
+            - name: trust-server-ca
+              mountPath: /var/run/trust/server
+              readOnly: true
+      volumes:
+        - name: trust-client
+          secret:
+            secretName: my-service-trust-client
+        - name: trust-server-ca
+          configMap:
+            name: trust-server-ca

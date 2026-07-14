@@ -50,3 +50,4 @@ rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
 openssl = "0.10"
+serde_yaml_ng = "0.10"

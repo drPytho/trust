@@ -202,7 +202,7 @@ curl --proxy https://trust.trust-system.svc:6180 \
 # Compatibility mode for clients that only support credentials in HTTPS_PROXY.
 # trust accepts Basic username `jwt` with the JWT as its password.
 export HTTPS_PROXY="https://jwt:${TRUST_TOKEN}@trust.trust-system.svc:6180"
-export NO_PROXY="trust.trust-system.svc,.proxy.internal"
+export NO_PROXY="metadata.google.internal,169.254.169.254,169.254.169.252,trust.trust-system.svc,.proxy.internal"
 ```
 
 The server certificate must include `trust.trust-system.svc` as a DNS SAN, and
@@ -213,10 +213,55 @@ used only with compensating network controls.
 
 Apply `sandbox-egress-network-policy.yaml` to select sandbox Pods labeled
 `trust.example.com/restricted-egress: "true"`. It allows egress only to the
-trust token/reverse/CONNECT ports and cluster DNS. The separate ingress policy
-allows only the corresponding labeled clients to enter those ports. Together,
-these make direct egress fail closed for traffic covered by the cluster's
-NetworkPolicy implementation.
+trust token/reverse/CONNECT ports, cluster DNS, and the GKE metadata server.
+The metadata exception in the example is for GKE Dataplane V2
+(`169.254.169.254/32` on TCP ports `80` and `8080`). For older or
+non-Dataplane-V2 clusters, replace it with `169.254.169.252/32` on TCP ports
+`987` and `988`. The separate ingress policy allows only the corresponding
+labeled clients to enter the trust ports. Together, these make direct egress
+fail closed for traffic covered by the cluster's NetworkPolicy implementation.
+
+When the sandbox uses Workload Identity, keep the metadata host and addresses
+out of the proxy path:
+
+```bash
+export NO_PROXY="metadata.google.internal,169.254.169.254,169.254.169.252,trust.trust-system.svc,.proxy.internal"
+```
+
+The sandbox's Google client obtains a short-lived access token from the GKE
+metadata server. It then sends that token inside the TLS stream carried by the
+CONNECT tunnel. The trust JWT authorizes the destination; Google IAM authorizes
+the operation and resource. Grant `roles/pubsub.publisher` on only the required
+topic and `roles/storage.objectCreator` on only the required bucket. Use a more
+permissive Storage role only when overwrite, read, or delete is required.
+
+### Testing Workload Identity egress
+
+`cargo test --all --locked` includes integration tests that verify:
+
+- the CONNECT listener consumes the trust JWT without forwarding it;
+- a separate Google OAuth bearer token is preserved inside the tunnel;
+- all Kubernetes examples parse as YAML and the embedded trust TOML is valid;
+- the example allowlists only the exact Pub/Sub and Storage CONNECT endpoints;
+- the restricted sandbox policy has the Dataplane V2 metadata exception but no
+  direct HTTPS egress; and
+- `NO_PROXY` covers the metadata server without bypassing `*.googleapis.com`.
+
+Only a Pod on a real GKE node can test metadata interception and the deployed
+IAM policies. `gcp-wif-smoke-test.yaml` is an opt-in Job for that final check.
+It publishes one message and creates one uniquely named object, so do not apply
+it against production resources unintentionally. Replace `PROJECT_ID`,
+`TOPIC_ID`, and `BUCKET_NAME`, then run:
+
+```bash
+kubectl apply -f examples/kubernetes/gcp-wif-smoke-test.yaml
+kubectl -n workloads logs -f job/trust-gcp-wif-smoke-test
+```
+
+The Job reuses the `my-service` Kubernetes ServiceAccount, mTLS client Secret,
+server CA ConfigMap, trust scopes, and restricted-egress labels from the other
+examples. A successful run proves metadata token acquisition, proxy
+authentication, Pub/Sub publish, and Cloud Storage upload end to end.
 
 NetworkPolicy enforcement and service-DNAT ordering vary by CNI. Validate the
 policy in your cluster, adapt the DNS Pod selector if it is not `k8s-app:
@@ -242,7 +287,10 @@ The example is split into reusable manifests:
 - [`token-network-policy.yaml`](token-network-policy.yaml) restricts the mTLS
   port and proxy ports to their respective labeled clients.
 - [`sandbox-egress-network-policy.yaml`](sandbox-egress-network-policy.yaml)
-  denies direct egress from selected sandboxes while retaining trust and DNS.
+  denies direct egress from selected sandboxes while retaining trust, DNS, and
+  the GKE metadata server.
+- [`gcp-wif-smoke-test.yaml`](gcp-wif-smoke-test.yaml) optionally verifies a
+  real Workload Identity token through trust against Pub/Sub and Cloud Storage.
 
 Replace the example namespaces, DNS names, SPIFFE trust domain, image, and CA
 certificate before applying the files. The management port is intentionally

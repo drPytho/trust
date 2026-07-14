@@ -59,7 +59,12 @@ spec:
             - name: TRUST_FORWARD_PROXY
               value: https://trust.trust-system.svc:6180
             - name: NO_PROXY
-              value: trust.trust-system.svc,.proxy.internal
+              value: >-
+                metadata.google.internal,
+                169.254.169.254,
+                169.254.169.252,
+                trust.trust-system.svc,
+                .proxy.internal
           volumeMounts:
             - name: trust-client
               mountPath: /var/run/trust/client
