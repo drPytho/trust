@@ -44,7 +44,7 @@ data:
 
     [[issuance.clients]]
     spiffe = "spiffe://example/workloads/*"
-    allowed_scopes = ["anthropic", "public-api"]
+    allowed_scopes = ["anthropic", "public-api", "gcp-pubsub", "gcp-storage"]
 
     [[upstreams]]
     name = "anthropic"
@@ -60,6 +60,25 @@ data:
     mode = "passthrough"
     listen_host = "public.proxy.internal"
     origin = "https://api.example.com"
+    allow_connect = true
+
+    # Workload Identity obtains the Google access token in the sandbox. These
+    # CONNECT upstreams only authorize the destination; Google IAM remains the
+    # bucket/topic-level authorization layer.
+    [[upstreams]]
+    name = "gcp-pubsub"
+    kind = "api"
+    mode = "passthrough"
+    listen_host = "pubsub.proxy.internal"
+    origin = "https://pubsub.googleapis.com"
+    allow_connect = true
+
+    [[upstreams]]
+    name = "gcp-storage"
+    kind = "api"
+    mode = "passthrough"
+    listen_host = "storage.proxy.internal"
+    origin = "https://storage.googleapis.com"
     allow_connect = true
 ---
 apiVersion: apps/v1

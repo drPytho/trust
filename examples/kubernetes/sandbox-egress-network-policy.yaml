@@ -39,3 +39,14 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
+    # Workload Identity Federation for GKE credential lookup. This is the GKE
+    # Dataplane V2 metadata-server address. For older/non-Dataplane-V2 clusters,
+    # use 169.254.169.252/32 with TCP ports 987 and 988 instead.
+    - to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+      ports:
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 8080
