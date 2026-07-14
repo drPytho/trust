@@ -442,6 +442,7 @@ fn build_proxy_upstream(origin_port: u16, storage_path: &Path) -> Arc<Upstream> 
             storage_path: storage_path.to_string_lossy().into_owned(),
         }),
         allowed_methods: Vec::new(),
+        allow_connect: false,
     })
 }
 

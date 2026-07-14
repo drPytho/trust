@@ -17,6 +17,15 @@ data:
     cert_path = "/etc/trust/tls/server.crt"
     key_path = "/etc/trust/tls/server.key"
 
+    [forward_proxy]
+    addr = "0.0.0.0:6180"
+    tls = true
+    connect_timeout = "10s"
+    idle_timeout = "5m"
+    max_tunnel_duration = "1h"
+    max_concurrent_tunnels = 1024
+    allow_private_ips = false
+
     [auth]
     issuer = "https://trust.example.com/"
     audience = "trust-proxy"
@@ -49,7 +58,7 @@ data:
     mode = "passthrough"
     listen_host = "public.proxy.internal"
     origin = "https://api.example.com"
-    allowed_methods = ["GET", "HEAD"]
+    allow_connect = true
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -82,6 +91,8 @@ spec:
               containerPort: 6191
             - name: proxy-tls
               containerPort: 6443
+            - name: forward-proxy
+              containerPort: 6180
             - name: token-mtls
               containerPort: 8443
             - name: jwks
@@ -134,6 +145,9 @@ spec:
     - name: proxy-tls
       port: 6443
       targetPort: proxy-tls
+    - name: forward-proxy
+      port: 6180
+      targetPort: forward-proxy
     - name: token-mtls
       port: 8443
       targetPort: token-mtls

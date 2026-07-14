@@ -24,10 +24,10 @@ Apply the example:
 kubectl apply -f examples/kubernetes/deployment.yaml
 ```
 
-The Service exposes the plain proxy, TLS proxy, mTLS token, and JWKS ports
-inside the cluster. For a private GHCR package, also configure an
-`imagePullSecret`. For production, pin the image to the immutable `sha-...` tag
-published by CI instead of `latest`.
+The Service exposes the plain reverse proxy, TLS reverse proxy, TLS CONNECT
+forward proxy, mTLS token, and JWKS ports inside the cluster. For a private
+GHCR package, also configure an `imagePullSecret`. For production, pin the
+image to the immutable `sha-...` tag published by CI instead of `latest`.
 
 The Deployment probes `/healthz` for liveness and `/readyz` for readiness on
 the management port. Prometheus metrics are available at `/metrics` on the same
@@ -140,6 +140,80 @@ caller's regular `Authorization` header unchanged. Passthrough hosts are still
 explicitly allowlisted, JWT-authenticated, and scope-authorized; unknown hosts
 remain denied.
 
+## Using trust as the sandbox egress proxy
+
+The example enables a TLS HTTP CONNECT listener on port `6180`. A destination
+is available through that listener only when its upstream is configured as
+passthrough and explicitly opts in:
+
+```toml
+[forward_proxy]
+addr = "0.0.0.0:6180"
+tls = true
+connect_timeout = "10s"
+idle_timeout = "5m"
+max_tunnel_duration = "1h"
+max_concurrent_tunnels = 1024
+allow_private_ips = false
+
+[[upstreams]]
+name = "public-api"
+kind = "api"
+mode = "passthrough"
+listen_host = "public.proxy.internal"
+origin = "https://api.example.com"
+allow_connect = true
+```
+
+The CONNECT authority must exactly match `api.example.com:443`, and the JWT
+must contain the `public-api` scope. Unknown hosts and ports fail closed. The
+listener uses the same verifier, scopes, upstream configuration, signing keys,
+rejection logs, and metrics as the reverse proxy. It does not create a second
+trust domain.
+
+CONNECT carries an opaque TLS stream, so it cannot inject credentials or
+enforce HTTP paths or methods. Keep credential-injected endpoints on the
+reverse proxy (`https://anthropic.proxy.internal/...`, for example), and use
+CONNECT for explicitly allowlisted straight-through destinations. Configure
+cluster DNS for each `*.proxy.internal` reverse-proxy name to resolve to the
+`trust` Service, or use equivalent stable internal DNS names in `listen_host`.
+
+An orchestrator can mint a narrowly scoped JWT over mTLS, pass the short-lived
+token and proxy URL into the sandbox, and configure clients in either of these
+ways:
+
+```bash
+# Preferred when the client supports explicit proxy headers.
+curl --proxy https://trust.trust-system.svc:6180 \
+  --proxy-cacert /var/run/trust/server/ca.crt \
+  --proxy-header "Proxy-Authorization: Bearer $TRUST_TOKEN" \
+  https://api.example.com/resource
+
+# Compatibility mode for clients that only support credentials in HTTPS_PROXY.
+# trust accepts Basic username `jwt` with the JWT as its password.
+export HTTPS_PROXY="https://jwt:${TRUST_TOKEN}@trust.trust-system.svc:6180"
+export NO_PROXY="trust.trust-system.svc,.proxy.internal"
+```
+
+The server certificate must include `trust.trust-system.svc` as a DNS SAN, and
+the client must trust its issuing CA. Support for TLS-to-proxy (`https://` in
+`HTTPS_PROXY`) varies by client. A plaintext `http://` listener is more broadly
+compatible but exposes the JWT on the Pod-to-proxy network path and should be
+used only with compensating network controls.
+
+Apply `sandbox-egress-network-policy.yaml` to select sandbox Pods labeled
+`trust.example.com/restricted-egress: "true"`. It allows egress only to the
+trust reverse/CONNECT ports and cluster DNS. The separate ingress policy allows
+only labeled clients to enter those proxy ports. Together, these make direct
+egress fail closed for traffic covered by the cluster's NetworkPolicy
+implementation.
+
+NetworkPolicy enforcement and service-DNAT ordering vary by CNI. Validate the
+policy in your cluster, adapt the DNS Pod selector if it is not `k8s-app:
+kube-dns`, and separately prevent bypass through host networking, privileged
+Pods, node-local proxies, or other CNI-specific paths. The trust Pod itself
+still needs DNS and outbound access to its configured origins.
+
 In production, restrict ingress to the token port with NetworkPolicy, prefer
 short JWT lifetimes, and tightly control who may request certificates or choose
 URI SANs from the client issuer. Deleting a client certificate does not revoke
@@ -154,9 +228,11 @@ The example is split into reusable manifests:
 - [`client-workload.yaml`](client-workload.yaml) shows how to mount the client
   key pair and server CA in an application Pod.
 - [`token-network-policy.yaml`](token-network-policy.yaml) restricts the mTLS
-  port to labeled token clients in the example workload namespace.
+  port and proxy ports to their respective labeled clients.
+- [`sandbox-egress-network-policy.yaml`](sandbox-egress-network-policy.yaml)
+  denies direct egress from selected sandboxes while retaining trust and DNS.
 
 Replace the example namespaces, DNS names, SPIFFE trust domain, image, and CA
-certificate before applying the files. The NetworkPolicy intentionally permits
-only port `8443`; add the ingress rules needed for the proxy and management
-ports before applying it to a shared `trust` Deployment.
+certificate before applying the files. The management port is intentionally
+not exposed by the ingress NetworkPolicy; add a narrowly scoped monitoring
+rule if Prometheus or an operator must reach it.

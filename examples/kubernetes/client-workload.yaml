@@ -33,6 +33,8 @@ spec:
       labels:
         app.kubernetes.io/name: my-service
         trust.example.com/token-client: "true"
+        trust.example.com/proxy-client: "true"
+        trust.example.com/restricted-egress: "true"
     spec:
       serviceAccountName: my-service
       automountServiceAccountToken: false
@@ -50,6 +52,13 @@ spec:
               value: /var/run/trust/client/tls.key
             - name: TRUST_SERVER_CA
               value: /var/run/trust/server/ca.crt
+            # The application obtains a short-lived JWT, then supplies it as
+            # Proxy-Authorization: Bearer <JWT>. For clients limited to proxy URL
+            # credentials, use the fixed Basic username `jwt` and the JWT as password.
+            - name: TRUST_FORWARD_PROXY
+              value: https://trust.trust-system.svc:6180
+            - name: NO_PROXY
+              value: trust.trust-system.svc,.proxy.internal
           volumeMounts:
             - name: trust-client
               mountPath: /var/run/trust/client

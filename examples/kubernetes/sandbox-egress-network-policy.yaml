@@ -1,0 +1,39 @@
+# Apply this in the sandbox namespace after verifying the label conventions used
+# by your CNI. It permits selected Pods to reach trust and cluster DNS, and denies
+# every other direct egress path covered by Kubernetes NetworkPolicy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sandbox-egress-through-trust
+  namespace: workloads
+spec:
+  podSelector:
+    matchLabels:
+      trust.example.com/restricted-egress: "true"
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: trust-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: trust
+      ports:
+        - protocol: TCP
+          port: 6180
+        - protocol: TCP
+          port: 6443
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

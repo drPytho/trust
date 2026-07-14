@@ -409,6 +409,7 @@ mod tests {
             resource: Some(ResourceKind::GithubRepo),
             git: None,
             allowed_methods: vec!["GET".into()],
+            allow_connect: false,
         };
 
         let one = manager

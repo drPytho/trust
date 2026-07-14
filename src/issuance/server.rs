@@ -76,6 +76,21 @@ pub fn build_mtls_server_config(
     Ok(Arc::new(config))
 }
 
+pub fn build_tls_server_config(
+    server_cert_pem: &str,
+    server_key_pem: &str,
+) -> Result<Arc<ServerConfig>, ServerError> {
+    let server_certs = certs_from_pem(server_cert_pem)?;
+    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut server_key_pem.as_bytes())
+        .map_err(|e| ServerError::Tls(e.to_string()))?
+        .ok_or_else(|| ServerError::Tls("no private key in server key PEM".into()))?;
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(server_certs, key)
+        .map_err(|e| ServerError::Tls(e.to_string()))?;
+    Ok(Arc::new(config))
+}
+
 #[derive(Deserialize)]
 struct TokenForm {
     grant_type: String,

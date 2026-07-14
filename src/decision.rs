@@ -66,6 +66,7 @@ mod tests {
             resource,
             git: None,
             allowed_methods: Vec::new(),
+            allow_connect: false,
         })
     }
 

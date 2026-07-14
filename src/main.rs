@@ -7,13 +7,14 @@ use pingora::listeners::tls::TlsSettings;
 use pingora::prelude::*;
 
 use trust::config::{Config, UpstreamKind};
+use trust::connect::{ConnectProxy, serve_connect};
 use trust::credentials::CredentialManager;
 use trust::git::mirror::MirrorStore;
 use trust::git::sync::SyncManager;
 use trust::issuance::policy::ClientPolicy;
 use trust::issuance::server::{
-    IssuanceState, ManagementState, build_mtls_server_config, install_crypto_provider,
-    serve_management, serve_token,
+    IssuanceState, ManagementState, build_mtls_server_config, build_tls_server_config,
+    install_crypto_provider, serve_management, serve_token,
 };
 use trust::jwt::{Issuer, Verifier};
 use trust::keystore::{Keystore, fetch};
@@ -155,6 +156,55 @@ fn main() {
         .unwrap_or_else(|| "/var/cache/trust/mirrors".to_string());
     let mirrors = Arc::new(MirrorStore::new(mirror_root));
     let sync = Arc::new(SyncManager::new());
+
+    if let Some(forward) = config.forward_proxy.clone() {
+        let listener = std::net::TcpListener::bind(&forward.addr).unwrap_or_else(|error| {
+            panic!("failed to bind forward proxy {}: {error}", forward.addr)
+        });
+        listener
+            .set_nonblocking(true)
+            .expect("set forward proxy listener nonblocking");
+        let tls = if forward.tls {
+            let tls_config = config.tls.as_ref().expect("validated TLS configuration");
+            let certificate = std::fs::read_to_string(&tls_config.cert_path)
+                .expect("read forward proxy TLS certificate");
+            let key =
+                std::fs::read_to_string(&tls_config.key_path).expect("read forward proxy TLS key");
+            Some(
+                build_tls_server_config(&certificate, &key)
+                    .expect("build forward proxy TLS configuration"),
+            )
+        } else {
+            log::warn!(
+                "forward proxy is using plaintext HTTP; Proxy-Authorization is not encrypted"
+            );
+            None
+        };
+        let state = Arc::new(ConnectProxy::new(
+            Arc::new(Router::new(&config.upstreams)),
+            Arc::new(Verifier::new(
+                config.auth.issuer.clone(),
+                config.auth.audience.clone(),
+            )),
+            keystore.clone(),
+            metrics.clone(),
+            forward,
+        ));
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("forward proxy runtime");
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener)
+                    .expect("create forward proxy listener");
+                if let Err(error) = serve_connect(listener, tls, state).await {
+                    log::error!("forward proxy server exited: {error}");
+                    std::process::exit(1);
+                }
+            });
+        });
+    }
 
     let service = ProxyService::with_credentials_and_metrics(
         router,

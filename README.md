@@ -59,6 +59,10 @@ key to be loaded. The exported proxy metrics are:
 - `trust_proxy_in_flight_requests`
 - `trust_credential_resolutions_total{upstream,provider,result}`
 - `trust_credential_resolution_duration_seconds{provider}`
+- `trust_connect_attempts_total{upstream,result}`
+- `trust_connect_active_tunnels{upstream}`
+- `trust_connect_duration_seconds{upstream}`
+- `trust_connect_bytes_total{upstream,direction}`
 
 Rejected proxy calls are also logged at `WARN` with bounded reasons (`missing_host`,
 `unknown_host`, `missing_token`, `signing_keys_unavailable`, `invalid_token`, or
@@ -128,6 +132,9 @@ Rules:
 - **Configurable injection** per upstream: header name + scheme (`bearer` / `basic` / `raw`).
 - **Authenticated passthrough** — explicitly allowlisted hosts can proxy without credential
   injection while retaining scoped JWT authorization and preserving the caller's headers.
+- **Authenticated CONNECT forwarding** — an optional forward-proxy listener supports standard
+  `HTTPS_PROXY` clients. Only explicitly enabled `host:port` destinations are reachable, and every
+  tunnel requires a scoped JWT.
 - **Repo-scoped authz** for `github-repo` upstreams — the request path is parsed for
   `owner/repo`; the JWT scope must cover it.
 - **git-cache upstream** — serves `git clone`/`fetch` from a local bare mirror (fresh refs,
@@ -153,6 +160,17 @@ tcp = "0.0.0.0:6191"
 addr = "0.0.0.0:6443"
 cert_path = "/etc/trust/server.crt"
 key_path  = "/etc/trust/server.key"
+
+# Optional HTTP CONNECT forward proxy. TLS protects the JWT on the client-to-proxy hop.
+# The [tls] certificate/key above are reused and must cover this listener's DNS name.
+[forward_proxy]
+addr = "0.0.0.0:6180"
+tls = true
+connect_timeout = "10s"
+idle_timeout = "5m"
+max_tunnel_duration = "1h"
+max_concurrent_tunnels = 1024
+allow_private_ips = false
 
 # JWT auth: issuer/audience embedded in minted tokens and verified on every request.
 [auth]
@@ -229,13 +247,14 @@ allowed_methods = ["GET", "HEAD"]
 
 # Explicitly allowlisted passthrough. No secret is fetched or injected. Clients must put their
 # trust JWT in Proxy-Authorization; their normal Authorization header is forwarded unchanged.
+# allow_connect additionally permits an opaque tunnel to exactly api.example.com:443.
 [[upstreams]]
-name            = "public-api"
-kind            = "api"
-mode            = "passthrough"
-listen_host     = "public.proxy.internal"
-origin          = "https://api.example.com"
-allowed_methods = ["GET", "HEAD"]
+name          = "public-api"
+kind          = "api"
+mode          = "passthrough"
+listen_host   = "public.proxy.internal"
+origin        = "https://api.example.com"
+allow_connect = true
 
 # git-cache upstream: bare mirror + pass-through push.
 # Requires `git` in PATH where trust runs.
@@ -283,6 +302,42 @@ through the proxy. Existing lockfiles should still be regenerated against the pr
 with `replace-registry-host=always`, so previously stored direct `*.pkg.dev` URLs cannot bypass it.
 Publishing should use a separate upstream, workload identity, and method policy with Artifact
 Registry Writer access.
+
+### Using the CONNECT forward proxy
+
+CONNECT is for clients that expect a conventional forward proxy, especially HTTPS clients. The
+request target must exactly match the configured upstream origin's `host:port`, the upstream must
+use `mode = "passthrough"` and `allow_connect = true`, and the JWT must include that upstream's
+scope. Unknown destinations are denied. Because the tunneled TLS is opaque to `trust`, CONNECT
+cannot inject credentials or enforce HTTP paths or methods; use the reverse-proxy host for those
+policies.
+
+Clients that can set proxy headers directly should use Bearer authentication:
+
+```bash
+curl --proxy https://trust.pit.internal:6180 \
+  --proxy-cacert server-ca.pem \
+  --proxy-header "Proxy-Authorization: Bearer $JWT" \
+  https://api.example.com/resource
+```
+
+For tools that only understand proxy URL credentials, `trust` also accepts HTTP Basic with the
+fixed username `jwt` and the JWT as its password:
+
+```bash
+export HTTPS_PROXY="https://jwt:${JWT}@trust.pit.internal:6180"
+export NO_PROXY="trust.pit.internal,.proxy.internal"
+```
+
+The `https://` proxy scheme means TLS is used between the client and `trust`; client support varies.
+Setting `tls = false` and using `http://` is more widely compatible, but exposes the JWT to anyone
+who can observe that network hop. Keep the listener private if plaintext is unavoidable. Avoid
+putting long-lived secrets in proxy URLs; these JWTs should be short-lived and scoped.
+
+The proxy resolves DNS server-side and rejects loopback, link-local, private, unique-local,
+multicast, documentation, and carrier-grade NAT addresses by default. Set `allow_private_ips =
+true` only when explicitly configured internal upstreams are required. Tunnels end at JWT expiry,
+the idle timeout, or `max_tunnel_duration`, whichever comes first.
 
 ## Running
 
@@ -361,6 +416,9 @@ git -c http.extraHeader="Authorization: Bearer $JWT" \
 - No request reaches an upstream without a valid, authorized JWT (verified ES256, `iss`, `aud`,
   `exp`, and scope).
 - Unknown hosts are denied, and passthrough must be enabled explicitly per configured upstream.
+- CONNECT destinations are denied unless their exact origin `host:port` has `allow_connect = true`.
+  CONNECT reuses the same JWT verifier, scope names, upstream allowlist, logs, and metrics as the
+  reverse proxy, but cannot inspect or inject into the encrypted tunnel.
 - The issuance server is mTLS-only — unauthenticated clients cannot reach the `/token` endpoint.
 - Scopes are capped at issuance to the per-identity policy; clients cannot self-escalate.
 - The config file contains no plaintext secrets — only secret-manager references. Keep your
@@ -369,7 +427,7 @@ git -c http.extraHeader="Authorization: Bearer $JWT" \
 ## Testing
 
 ```bash
-cargo test                                 # 102 unit + 3 end-to-end integration tests (105 total)
+cargo test                                 # 121 unit + 5 integration tests (126 total)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```

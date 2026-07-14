@@ -50,6 +50,16 @@ pub enum ConfigError {
     GithubAppNeedsResource(String),
     #[error("gcp-adc upstream '{0}' requires Authorization bearer injection")]
     GcpAdcNeedsBearer(String),
+    #[error("CONNECT upstream '{0}' must use api kind and passthrough mode")]
+    ConnectRequiresPassthrough(String),
+    #[error("CONNECT upstream '{0}' cannot configure resource or allowed_methods policies")]
+    ConnectPolicyUnsupported(String),
+    #[error("CONNECT upstream '{0}' requires a [forward_proxy] listener")]
+    ConnectWithoutListener(String),
+    #[error("duplicate CONNECT destination authority: {0}")]
+    DuplicateConnectAuthority(String),
+    #[error("invalid forward proxy configuration: {0}")]
+    BadForwardProxy(String),
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -166,6 +176,7 @@ pub struct Upstream {
     pub resource: Option<ResourceKind>,
     pub git: Option<GitConfig>,
     pub allowed_methods: Vec<String>,
+    pub allow_connect: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -178,6 +189,54 @@ pub struct TlsConfig {
     pub addr: String,
     pub cert_path: String,
     pub key_path: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ForwardProxyConfig {
+    pub addr: String,
+    pub tls: bool,
+    pub connect_timeout: std::time::Duration,
+    pub idle_timeout: std::time::Duration,
+    pub max_tunnel_duration: std::time::Duration,
+    pub max_concurrent_tunnels: usize,
+    pub allow_private_ips: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_connect_timeout() -> String {
+    "10s".to_string()
+}
+
+fn default_idle_timeout() -> String {
+    "5m".to_string()
+}
+
+fn default_max_tunnel_duration() -> String {
+    "1h".to_string()
+}
+
+fn default_max_concurrent_tunnels() -> usize {
+    1024
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawForwardProxyConfig {
+    addr: String,
+    #[serde(default = "default_true")]
+    tls: bool,
+    #[serde(default = "default_connect_timeout")]
+    connect_timeout: String,
+    #[serde(default = "default_idle_timeout")]
+    idle_timeout: String,
+    #[serde(default = "default_max_tunnel_duration")]
+    max_tunnel_duration: String,
+    #[serde(default = "default_max_concurrent_tunnels")]
+    max_concurrent_tunnels: usize,
+    #[serde(default)]
+    allow_private_ips: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -253,6 +312,8 @@ struct RawUpstream {
     git: Option<GitConfig>,
     #[serde(default)]
     allowed_methods: Vec<String>,
+    #[serde(default)]
+    allow_connect: bool,
 }
 
 #[derive(Deserialize)]
@@ -262,6 +323,8 @@ struct RawConfig {
     tls: Option<TlsConfig>,
     auth: RawAuth,
     issuance: IssuanceConfig,
+    #[serde(default)]
+    forward_proxy: Option<RawForwardProxyConfig>,
     #[serde(default)]
     github_app: Option<GithubAppConfig>,
     upstreams: Vec<RawUpstream>,
@@ -273,6 +336,7 @@ pub struct Config {
     pub tls: Option<TlsConfig>,
     pub auth: AuthConfig,
     pub issuance: IssuanceConfig,
+    pub forward_proxy: Option<ForwardProxyConfig>,
     pub github_app: Option<GithubAppConfig>,
     pub upstreams: Vec<Arc<Upstream>>,
 }
@@ -321,6 +385,7 @@ impl Config {
 
         let mut names = HashSet::new();
         let mut hosts = HashSet::new();
+        let mut connect_authorities = HashSet::new();
         let mut upstreams = Vec::with_capacity(raw.upstreams.len());
         if let Some(github_app) = &raw.github_app {
             if github_app.app_id == 0 || github_app.private_key_secret_ref.is_empty() {
@@ -451,6 +516,22 @@ impl Config {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
 
+            if ru.allow_connect {
+                if ru.kind != UpstreamKind::Api || ru.mode != UpstreamMode::Passthrough {
+                    return Err(ConfigError::ConnectRequiresPassthrough(ru.name));
+                }
+                if ru.resource.is_some() || !allowed_methods.is_empty() {
+                    return Err(ConfigError::ConnectPolicyUnsupported(ru.name));
+                }
+                if raw.forward_proxy.is_none() {
+                    return Err(ConfigError::ConnectWithoutListener(ru.name));
+                }
+                let authority = format!("{}:{}", origin.host.to_ascii_lowercase(), origin.port);
+                if !connect_authorities.insert(authority.clone()) {
+                    return Err(ConfigError::DuplicateConnectAuthority(authority));
+                }
+            }
+
             // Validate git-cache-specific rules.
             match ru.kind {
                 UpstreamKind::GitCache => {
@@ -487,8 +568,38 @@ impl Config {
                 resource: ru.resource.map(|r| r.kind),
                 git: ru.git,
                 allowed_methods,
+                allow_connect: ru.allow_connect,
             }));
         }
+
+        let forward_proxy = raw
+            .forward_proxy
+            .map(|forward| {
+                let parse_duration = |value: &str| {
+                    humantime::parse_duration(value)
+                        .ok()
+                        .filter(|duration| !duration.is_zero())
+                        .ok_or_else(|| ConfigError::BadDuration {
+                            value: value.to_string(),
+                        })
+                };
+                Ok::<_, ConfigError>(ForwardProxyConfig {
+                    addr: forward.addr,
+                    tls: forward.tls,
+                    connect_timeout: parse_duration(&forward.connect_timeout)?,
+                    idle_timeout: parse_duration(&forward.idle_timeout)?,
+                    max_tunnel_duration: parse_duration(&forward.max_tunnel_duration)?,
+                    max_concurrent_tunnels: if forward.max_concurrent_tunnels == 0 {
+                        return Err(ConfigError::BadForwardProxy(
+                            "max_concurrent_tunnels must be greater than zero".to_string(),
+                        ));
+                    } else {
+                        forward.max_concurrent_tunnels
+                    },
+                    allow_private_ips: forward.allow_private_ips,
+                })
+            })
+            .transpose()?;
 
         // Parse token TTL.
         let token_ttl = humantime::parse_duration(&raw.auth.signing.token_ttl).map_err(|_| {
@@ -526,6 +637,7 @@ impl Config {
             tls: raw.tls,
             auth,
             issuance: raw.issuance,
+            forward_proxy,
             github_app: raw.github_app,
             upstreams,
         })
@@ -830,6 +942,109 @@ allowed_methods = ["GET", "HEAD"]
         assert_eq!(upstream.mode, UpstreamMode::Passthrough);
         assert!(upstream.credential.is_none());
         assert!(upstream.injection.is_none());
+    }
+
+    #[test]
+    fn parses_connect_listener_and_explicit_destination() {
+        let connect = r#"
+[forward_proxy]
+addr = "0.0.0.0:6180"
+tls = false
+connect_timeout = "3s"
+idle_timeout = "2m"
+max_tunnel_duration = "30m"
+allow_private_ips = true
+
+[[upstreams]]
+name = "public-docs"
+kind = "api"
+mode = "passthrough"
+listen_host = "docs.proxy.internal"
+origin = "https://docs.example.com"
+allow_connect = true
+"#;
+        let cfg = Config::from_str(&(GOOD.to_string() + connect)).unwrap();
+        let forward = cfg.forward_proxy.unwrap();
+        assert_eq!(forward.addr, "0.0.0.0:6180");
+        assert!(!forward.tls);
+        assert_eq!(forward.connect_timeout, std::time::Duration::from_secs(3));
+        assert_eq!(forward.idle_timeout, std::time::Duration::from_secs(120));
+        assert_eq!(
+            forward.max_tunnel_duration,
+            std::time::Duration::from_secs(1800)
+        );
+        assert_eq!(forward.max_concurrent_tunnels, 1024);
+        assert!(forward.allow_private_ips);
+        assert!(
+            cfg.upstreams
+                .iter()
+                .find(|upstream| upstream.name == "public-docs")
+                .unwrap()
+                .allow_connect
+        );
+    }
+
+    #[test]
+    fn rejects_unsafe_or_ambiguous_connect_configuration() {
+        let no_listener = r#"
+[[upstreams]]
+name = "docs-connect"
+kind = "api"
+mode = "passthrough"
+listen_host = "docs-connect.proxy.internal"
+origin = "https://docs.example.com"
+allow_connect = true
+"#;
+        assert!(matches!(
+            Config::from_str(&(GOOD.to_string() + no_listener)),
+            Err(ConfigError::ConnectWithoutListener(_))
+        ));
+
+        let inject = r#"
+[forward_proxy]
+addr = "0.0.0.0:6180"
+
+[[upstreams]]
+name = "bad-connect"
+kind = "api"
+listen_host = "bad-connect.proxy.internal"
+origin = "https://api.example.com"
+secret_ref = "projects/p/secrets/bad/versions/latest"
+injection = { header = "authorization", scheme = "bearer" }
+allow_connect = true
+"#;
+        assert!(matches!(
+            Config::from_str(&(GOOD.to_string() + inject)),
+            Err(ConfigError::ConnectRequiresPassthrough(_))
+        ));
+
+        let path_policy = r#"
+[forward_proxy]
+addr = "0.0.0.0:6180"
+
+[[upstreams]]
+name = "path-connect"
+kind = "api"
+mode = "passthrough"
+listen_host = "path-connect.proxy.internal"
+origin = "https://api.example.com"
+resource = { kind = "github-repo" }
+allow_connect = true
+"#;
+        assert!(matches!(
+            Config::from_str(&(GOOD.to_string() + path_policy)),
+            Err(ConfigError::ConnectPolicyUnsupported(_))
+        ));
+
+        let zero_capacity = r#"
+[forward_proxy]
+addr = "0.0.0.0:6180"
+max_concurrent_tunnels = 0
+"#;
+        assert!(matches!(
+            Config::from_str(&(GOOD.to_string() + zero_capacity)),
+            Err(ConfigError::BadForwardProxy(_))
+        ));
     }
 
     #[test]
