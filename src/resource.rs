@@ -7,6 +7,7 @@ use crate::scope::Resource;
 pub enum ResourceKind {
     GithubRepo,
     GitRepo,
+    ArtifactRegistryRepo,
 }
 
 /// Returns `true` if `s` is a safe path component: non-empty, not `.` or `..`,
@@ -28,19 +29,15 @@ const GIT_SUFFIXES: &[&str] = &["/info/refs", "/git-upload-pack", "/git-receive-
 pub fn extract(kind: ResourceKind, path: &str) -> Option<Resource> {
     match kind {
         ResourceKind::GithubRepo => {
-            // .../repos/{owner}/{repo}/...
+            // /repos/{owner}/{repo}/...
             let mut segs = path.split('/').filter(|s| !s.is_empty());
-            loop {
-                match segs.next() {
-                    Some("repos") => break,
-                    Some(_) => continue,
-                    None => return None,
-                }
+            if segs.next()? != "repos" {
+                return None;
             }
             let owner = segs.next()?;
             let repo = segs.next()?;
             let repo = repo.strip_suffix(".git").unwrap_or(repo);
-            if owner.is_empty() || repo.is_empty() {
+            if !safe_component(owner) || !safe_component(repo) {
                 return None;
             }
             Some(Resource {
@@ -76,6 +73,20 @@ pub fn extract(kind: ResourceKind, path: &str) -> Option<Resource> {
                 repo: repo.to_string(),
             })
         }
+
+        ResourceKind::ArtifactRegistryRepo => {
+            // Artifact Registry npm endpoints are rooted at /PROJECT/REPOSITORY/.
+            let mut segs = path.split('/').filter(|s| !s.is_empty());
+            let project = segs.next()?;
+            let repository = segs.next()?;
+            if !safe_component(project) || !safe_component(repository) {
+                return None;
+            }
+            Some(Resource {
+                owner: project.to_string(),
+                repo: repository.to_string(),
+            })
+        }
     }
 }
 
@@ -96,6 +107,17 @@ mod tests {
     fn github_repo_trims_dot_git() {
         let r = extract(ResourceKind::GithubRepo, "/repos/pitorg/pit-ts.git").unwrap();
         assert_eq!(r.repo, "pit-ts");
+    }
+
+    #[test]
+    fn artifact_registry_repo_from_path() {
+        let r = extract(
+            ResourceKind::ArtifactRegistryRepo,
+            "/my-project/npm-private/@scope%2fpkg",
+        )
+        .unwrap();
+        assert_eq!(r.owner, "my-project");
+        assert_eq!(r.repo, "npm-private");
     }
 
     #[test]

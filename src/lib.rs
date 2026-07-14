@@ -1,4 +1,6 @@
 pub mod config;
+pub mod connect;
+pub mod credentials;
 pub mod decision;
 pub mod git;
 pub mod inject;

@@ -5,27 +5,52 @@ use crate::config::Upstream;
 
 pub struct Router {
     by_host: HashMap<String, Arc<Upstream>>,
+    by_connect_authority: HashMap<(String, u16), Arc<Upstream>>,
 }
 
 impl Router {
     pub fn new(upstreams: &[Arc<Upstream>]) -> Router {
         let by_host = upstreams
             .iter()
-            .map(|u| (u.listen_host.clone(), u.clone()))
+            .map(|u| (u.listen_host.to_ascii_lowercase(), u.clone()))
             .collect();
-        Router { by_host }
+        let by_connect_authority = upstreams
+            .iter()
+            .filter(|upstream| upstream.allow_connect)
+            .map(|upstream| {
+                (
+                    (
+                        upstream.origin.host.to_ascii_lowercase(),
+                        upstream.origin.port,
+                    ),
+                    upstream.clone(),
+                )
+            })
+            .collect();
+        Router {
+            by_host,
+            by_connect_authority,
+        }
     }
 
     pub fn resolve(&self, host: &str) -> Option<Arc<Upstream>> {
         let bare = host.split(':').next().unwrap_or(host);
-        self.by_host.get(bare).cloned()
+        self.by_host.get(&bare.to_ascii_lowercase()).cloned()
+    }
+
+    pub fn resolve_connect(&self, host: &str, port: u16) -> Option<Arc<Upstream>> {
+        self.by_connect_authority
+            .get(&(host.to_ascii_lowercase(), port))
+            .cloned()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Injection, InjectionScheme, Origin, Upstream, UpstreamKind};
+    use crate::config::{
+        CredentialSource, Injection, InjectionScheme, Origin, Upstream, UpstreamKind, UpstreamMode,
+    };
     use std::sync::Arc;
 
     fn up(name: &str, host: &str) -> Arc<Upstream> {
@@ -39,13 +64,18 @@ mod tests {
                 tls: true,
                 sni: "example.com".into(),
             },
-            secret_ref: "ref".into(),
-            injection: Injection {
+            mode: UpstreamMode::Inject,
+            credential: Some(CredentialSource::StaticSecret {
+                secret_ref: "ref".into(),
+            }),
+            injection: Some(Injection {
                 header: "x-api-key".into(),
                 scheme: InjectionScheme::Raw,
-            },
+            }),
             resource: None,
             git: None,
+            allowed_methods: Vec::new(),
+            allow_connect: false,
         })
     }
 
@@ -61,5 +91,25 @@ mod tests {
             "anthropic"
         );
         assert!(r.resolve("unknown.host").is_none());
+    }
+
+    #[test]
+    fn resolves_only_explicit_connect_destinations() {
+        let mut connect = (*up("docs", "docs.proxy.internal")).clone();
+        connect.origin.host = "docs.example.com".into();
+        connect.mode = UpstreamMode::Passthrough;
+        connect.credential = None;
+        connect.injection = None;
+        connect.allow_connect = true;
+        let router = Router::new(&[Arc::new(connect), up("other", "other.proxy.internal")]);
+        assert_eq!(
+            router
+                .resolve_connect("DOCS.EXAMPLE.COM", 443)
+                .unwrap()
+                .name,
+            "docs"
+        );
+        assert!(router.resolve_connect("docs.example.com", 8443).is_none());
+        assert!(router.resolve_connect("example.com", 443).is_none());
     }
 }

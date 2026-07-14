@@ -74,12 +74,19 @@ pub struct Verifier {
     audience: String,
 }
 
+#[derive(Debug)]
+pub struct VerifiedToken {
+    pub subject: String,
+    pub scopes: ScopeSet,
+    pub expires_at: u64,
+}
+
 impl Verifier {
     pub fn new(issuer: String, audience: String) -> Verifier {
         Verifier { issuer, audience }
     }
 
-    pub fn verify(&self, km: &KeyMaterial, token: &str) -> Result<ScopeSet, JwtError> {
+    pub fn verify_token(&self, km: &KeyMaterial, token: &str) -> Result<VerifiedToken, JwtError> {
         let header = decode_header(token).map_err(|e| JwtError::Invalid(e.to_string()))?;
         let kid = header.kid.ok_or(JwtError::UnknownKid)?;
         let key = km.decoding.get(&kid).ok_or(JwtError::UnknownKid)?;
@@ -94,7 +101,17 @@ impl Verifier {
             _ => JwtError::Invalid(e.to_string()),
         })?;
 
-        ScopeSet::parse(&data.claims.scope).map_err(|e| JwtError::BadScope(e.to_string()))
+        let scopes =
+            ScopeSet::parse(&data.claims.scope).map_err(|e| JwtError::BadScope(e.to_string()))?;
+        Ok(VerifiedToken {
+            subject: data.claims.sub,
+            scopes,
+            expires_at: data.claims.exp,
+        })
+    }
+
+    pub fn verify(&self, km: &KeyMaterial, token: &str) -> Result<ScopeSet, JwtError> {
+        self.verify_token(km, token).map(|token| token.scopes)
     }
 }
 
@@ -126,6 +143,9 @@ mod tests {
         let token = issuer.mint(&km, "user:filip", &scopes, now()).unwrap();
         let got = verifier.verify(&km, &token).unwrap();
         assert_eq!(got.to_scope_string(), "anthropic github:pitorg/pit-ts");
+        let verified = verifier.verify_token(&km, &token).unwrap();
+        assert_eq!(verified.subject, "user:filip");
+        assert!(verified.expires_at > now());
     }
 
     #[test]

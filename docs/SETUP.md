@@ -1,33 +1,38 @@
 # trust — Setup & Operations Guide
 
-How to build, configure, run, and use `trust` (the credential-injection egress
-proxy). Covers a local-dev quickstart and production notes, including mTLS setup
-and minting JWTs.
+How to build, configure, run, and use `trust`, the policy-enforcing egress
+proxy. Covers a local-dev quickstart and production notes, including mTLS token
+issuance, credential injection, authenticated passthrough, and HTTP CONNECT.
 
 ## What you're running
 
-trust exposes up to four listeners:
+trust exposes up to five listeners:
 
 | Port (default) | Listener | Purpose |
 |---|---|---|
-| `6191` | proxy (plain TCP) | the egress proxy (clients send `Authorization: Bearer <jwt>`) |
-| `6443` | proxy (TLS) | same, TLS-terminated |
+| `6191` | reverse proxy (plain HTTP) | optional development listener; avoid for JWT-bearing production traffic |
+| `6443` | reverse proxy (TLS) | credential injection and authenticated passthrough |
+| `6180` | CONNECT proxy (TLS by default) | authenticated tunnels to exact allowlisted `host:port` origins |
 | `8443` | issuance (**mTLS**) | `POST /token` — OAuth2 `client_credentials`, mints scoped JWTs |
-| `8080` | JWKS (plain HTTP) | `GET /.well-known/jwks.json` — public keys for verification |
+| `8080` | management (plain HTTP) | JWKS, `/healthz`, `/readyz`, and `/metrics` |
 
 A client authenticates to the **issuance** endpoint with an mTLS client cert
 (its SPIFFE identity), receives a short-lived scoped JWT, then uses that JWT on
-the **proxy** endpoint. trust verifies the JWT, authorizes by scope, injects the
-real upstream credential (from GCP Secret Manager), and forwards.
+the proxy. trust verifies the JWT and authorizes by scope. A reverse-proxy
+upstream can inject a server-side credential or pass the caller's credential
+through; a CONNECT upstream opens an opaque tunnel only to an exact configured
+destination.
 
 ## Prerequisites
 
 - Docker (to build/run the image).
 - `openssl`, `curl`, `jq` (for the helper scripts).
 - A GCP project + `gcloud`, with a service account that has
-  `roles/secretmanager.secretAccessor`. trust loads its ES256 **signing key**
-  and every upstream **credential** from GCP Secret Manager — there is no
-  offline secret backend today, so even local dev points at a (dev) GCP project.
+  `roles/secretmanager.secretAccessor` for the ES256 signing key and static
+  secrets. Dynamic GitHub App credentials additionally require the App private
+  key; Artifact Registry uses ADC/Workload Identity rather than a stored access
+  token. There is no offline signing-key backend today, so local dev still
+  points at a development GCP project.
 
 ## 1. Build the image
 
@@ -35,13 +40,9 @@ real upstream credential (from GCP Secret Manager), and forwards.
 docker build -t trust:dev .
 ```
 
-Multi-stage: compiles with the Rust toolchain (cmake/clang/libssl-dev for
-aws-lc-rs + pingora's OpenSSL), runs on `distroless/cc` with `libssl3` copied in.
-
-> **git-cache (Phase 3):** distroless has no `git` binary. When the git-cache
-> upstream ships, switch the runtime stage to `debian:bookworm-slim` +
-> `apt-get install -y git` (or copy the `git` binary in). Not needed for the
-> API-egress (Phase 1/2) system this image targets.
+The multi-stage image compiles with the Rust toolchain and runs on
+`debian:bookworm-slim` with CA certificates, OpenSSL, and `git`. The runtime
+`git` binary is required by the implemented git smart-HTTP cache.
 
 ## 2. Secrets in GCP Secret Manager
 
@@ -89,6 +90,15 @@ addr = "0.0.0.0:6443"
 cert_path = "/etc/trust/certs/server.crt"
 key_path  = "/etc/trust/certs/server.key"
 
+[forward_proxy]                         # optional CONNECT-only listener
+addr = "0.0.0.0:6180"
+tls = true                              # reuses the [tls] certificate/key
+connect_timeout = "10s"
+idle_timeout = "5m"
+max_tunnel_duration = "1h"
+max_concurrent_tunnels = 1024
+allow_private_ips = false
+
 [auth]
 issuer   = "https://trust.local/"
 audience = "trust-proxy"
@@ -107,7 +117,7 @@ jwks_addr      = "0.0.0.0:8080"
 # Which SPIFFE identity may mint which scopes (exact, or trailing '*' prefix).
 [[issuance.clients]]
 spiffe = "spiffe://pit/dev/local"
-allowed_scopes = ["anthropic", "github:pitorg/*"]
+allowed_scopes = ["anthropic", "github:pitorg/*", "public-api"]
 
 [[upstreams]]
 name = "anthropic"
@@ -116,6 +126,16 @@ listen_host = "anthropic.proxy.internal"     # Host header routes here
 origin = "https://api.anthropic.com"
 secret_ref = "projects/PROJECT/secrets/anthropic-key/versions/latest"
 injection = { header = "x-api-key", scheme = "raw" }
+
+# Straight-through reverse proxy and CONNECT destination. CONNECT is opaque,
+# so it cannot use injection, resource extraction, or allowed_methods.
+[[upstreams]]
+name = "public-api"
+kind = "api"
+mode = "passthrough"
+listen_host = "public.proxy.internal"
+origin = "https://api.example.com"
+allow_connect = true
 ```
 
 Scope grammar: `anthropic` (whole upstream); `github:owner/repo` (exact repo);
@@ -126,7 +146,7 @@ schemes: `raw` (verbatim), `bearer` (`Bearer <s>`), `basic` (`Basic base64(s)`).
 
 ```bash
 docker run --rm \
-  -p 6191:6191 -p 6443:6443 -p 8443:8443 -p 8080:8080 \
+  -p 6191:6191 -p 6443:6443 -p 6180:6180 -p 8443:8443 -p 8080:8080 \
   -v "$PWD/config.toml:/etc/trust/config.toml:ro" \
   -v "$PWD/certs:/etc/trust/certs:ro" \
   -v "$HOME/.config/gcloud/application_default_credentials.json:/gcp/adc.json:ro" \
@@ -178,9 +198,25 @@ trust validates the JWT, authorizes `anthropic`, strips your `Authorization`,
 injects the real `x-api-key`, and forwards. Your JWT never reaches the upstream;
 the real key never reaches you.
 
-**git (Phase 3, git-cache — coming soon):**
+**CONNECT forward proxy** (the JWT needs the `public-api` scope):
 
 ```bash
+JWT=$(./scripts/mint-jwt.sh "public-api")
+curl --proxy https://localhost:6180 \
+  --proxy-cacert certs/server.crt \
+  --proxy-header "Proxy-Authorization: Bearer $JWT" \
+  https://api.example.com/resource
+```
+
+For clients limited to proxy URL authentication, use Basic username `jwt` and
+the JWT as password: `HTTPS_PROXY=https://jwt:${JWT}@localhost:6180`. The
+listener accepts CONNECT only, so plain HTTP sent through `HTTP_PROXY` receives
+`405 Method Not Allowed`. Unknown destinations or ports receive `403`.
+
+**git smart-HTTP cache:**
+
+```bash
+JWT=$(./scripts/mint-jwt.sh "github:pitorg/pit-ts")
 git -c http.extraHeader="Authorization: Bearer $JWT" \
   clone https://github-git.proxy.internal/pitorg/pit-ts.git
 ```
@@ -194,7 +230,7 @@ docker build -t trust:dev .
 gcloud secrets create trust-signing-key --data-file=signing-key.pem --project=$PROJECT
 printf '%s' "sk-ant-…" | gcloud secrets create anthropic-key --data-file=- --project=$PROJECT
 # write config.toml (section 4), then:
-docker run --rm -p 6443:6443 -p 8443:8443 -p 8080:8080 \
+docker run --rm -p 6443:6443 -p 6180:6180 -p 8443:8443 -p 8080:8080 \
   -v "$PWD/config.toml:/etc/trust/config.toml:ro" -v "$PWD/certs:/etc/trust/certs:ro" \
   -v "$HOME/.config/gcloud/application_default_credentials.json:/gcp/adc.json:ro" \
   -e GOOGLE_APPLICATION_CREDENTIALS=/gcp/adc.json trust:dev &
@@ -212,11 +248,18 @@ curl -sS https://anthropic.proxy.internal:6443/v1/models \
 - **mTLS identities:** issue client SVIDs via SPIRE / your mesh; map each
   `spiffe://…` (exact or `…/*` prefix) to the minimal scopes in
   `[[issuance.clients]]`. End prefix scopes with `/*` at a path boundary.
-- **TLS:** terminate the proxy at `[tls]` with real certs (or front it with a TLS
-  LB and use `[listen].tcp`). JWKS (`8080`) is public and safe to expose to
-  verifiers; the issuance endpoint (`8443`) must stay mTLS-only.
-- **Token TTL:** `token_ttl` (default 7d) trades revocation latency for fewer
-  mints. Shorten if you need tighter revocation.
+- **TLS:** terminate the reverse proxy at `[tls]` with real certs. The CONNECT
+  listener reuses that certificate when `forward_proxy.tls = true`; include both
+  proxy DNS names in its SANs. JWKS (`8080`) is safe to expose to verifiers, but
+  `/metrics` may reveal operational metadata. The issuance endpoint (`8443`)
+  must stay mTLS-only.
+- **CONNECT:** only passthrough API upstreams with `allow_connect = true` are
+  reachable, matched by exact origin `host:port`. Private, loopback, link-local,
+  and other non-public targets are rejected unless explicitly enabled. Tunnels
+  end at JWT expiry, idle timeout, maximum duration, or process shutdown.
+- **Token TTL:** `token_ttl` (configured as 7d in this local example) trades
+  revocation latency for fewer mints. Shorten it in production if you need
+  tighter revocation.
 
 ## 10. Troubleshooting
 
@@ -230,3 +273,8 @@ curl -sS https://anthropic.proxy.internal:6443/v1/models \
 | proxy → 403 | JWT scope doesn't cover this upstream/repo |
 | proxy → 404 | `Host` header matches no upstream `listen_host` |
 | proxy → 502 | upstream secret fetch failed (GCP) or upstream unreachable |
+| CONNECT → 407 | missing, expired, or invalid `Proxy-Authorization` JWT |
+| CONNECT → 403 | destination is not allowlisted or JWT scope does not cover it |
+| CONNECT → 405 | client sent a non-CONNECT method (commonly plain `HTTP_PROXY` traffic) |
+| CONNECT → 502 | DNS resolution, private-address policy, or target connection failed |
+| CONNECT → 503 | signing keys unavailable or concurrent tunnel capacity exhausted |

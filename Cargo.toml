@@ -37,8 +37,16 @@ rustls-pemfile = "2"
 x509-parser = "0.18"
 serde_json = "1.0.150"
 prometheus = "0.13"
+google-cloud-auth = "1.13"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+time = { version = "0.3", features = ["parsing"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+tokio-rustls = "0.26"
 
 [dev-dependencies]
 rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
+openssl = "0.10"

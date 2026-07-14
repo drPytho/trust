@@ -47,7 +47,7 @@ COPY --from=builder /app/target/release/trust /usr/local/bin/trust
 ENV TRUST_CONFIG=/etc/trust/config.toml
 ENV RUST_LOG=info
 
-# proxy TCP / proxy TLS / mTLS token endpoint / JWKS
-EXPOSE 6191 6443 8443 8080
+# reverse proxy TCP / reverse proxy TLS / CONNECT TLS / mTLS token / management
+EXPOSE 6191 6443 6180 8443 8080
 
 ENTRYPOINT ["/usr/local/bin/trust"]

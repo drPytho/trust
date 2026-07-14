@@ -1,14 +1,19 @@
 # trust
 
-A credential-injection egress proxy built on [Pingora](https://github.com/cloudflare/pingora).
+A policy-enforcing egress proxy built on [Pingora](https://github.com/cloudflare/pingora) and
+Hyper.
 
 Clients authenticate to `trust` with a **short-lived JWT** they mint against their own mTLS identity.
 `trust` validates the JWT, checks the client is authorized for the requested upstream, fetches the
-**real** upstream secret from a secret manager, injects it, and forwards the request. The upstream
-credential is never handed to clients, and the client's JWT is never forwarded upstream.
+**real** upstream secret from a secret manager, injects it, and forwards the request. Explicit
+destinations can instead pass caller credentials through or accept authenticated HTTP CONNECT
+tunnels. The upstream credential is never handed to clients, and the client's JWT is never
+forwarded upstream.
 
-> **Status:** Phase 3 (git smart-HTTP caching) is complete. All three upstream kinds — `api`,
-> `github-api` (repo-scoped), and `git-cache` — are production-ready.
+> **Status:** credential-injected API proxying, authenticated passthrough, HTTP CONNECT forwarding,
+> and git smart-HTTP caching are implemented. API credentials may be static Secret Manager values,
+> repository-scoped GitHub App installation tokens, or Google ADC access tokens for services such
+> as Artifact Registry.
 
 ## Why
 
@@ -56,11 +61,17 @@ key to be loaded. The exported proxy metrics are:
 - `trust_proxy_rejections_total{upstream,reason,status}`
 - `trust_proxy_request_duration_seconds{upstream}`
 - `trust_proxy_in_flight_requests`
+- `trust_credential_resolutions_total{upstream,provider,result}`
+- `trust_credential_resolution_duration_seconds{provider}`
+- `trust_connect_attempts_total{upstream,result}`
+- `trust_connect_active_tunnels{upstream}`
+- `trust_connect_duration_seconds{upstream}`
+- `trust_connect_bytes_total{upstream,direction}`
 
-Rejected proxy calls are also logged at `WARN` with bounded reasons (`missing_host`,
-`unknown_host`, `missing_token`, `signing_keys_unavailable`, `invalid_token`, or
-`forbidden_scope`) and safe request metadata. Credentials and authorization headers are never
-logged.
+Rejected reverse-proxy and CONNECT calls are also logged at `WARN` with bounded reason labels and
+safe request metadata. CONNECT distinguishes invalid authorities, unknown destinations, missing or
+invalid tokens, forbidden scopes, private destinations, connection failures, and tunnel-capacity
+exhaustion. Credentials and authorization headers are never logged.
 
 ### Proxying a request
 
@@ -81,8 +92,8 @@ Each upstream owns a proxy **hostname**; the incoming `Host` header selects it.
                          └──────────────────────────────────────────────────────────┘     api.anthropic.com
 ```
 
-Reject responses (404/401/403/502) short-circuit inside the proxy; only authorized,
-credential-injected requests ever reach an upstream.
+Reject responses (404/401/403/502) short-circuit inside the proxy; only authorized requests ever
+reach an upstream.
 
 ## Scope grammar
 
@@ -104,19 +115,31 @@ Rules:
 
 ## Features
 
-- **JWT client auth** — clients send `Authorization: Bearer <jwt>`; `trust` verifies ES256,
-  `iss`, `aud`, and `exp`.
+- **JWT client auth** — clients send `Authorization: Bearer <jwt>` for injected upstreams or
+  `Proxy-Authorization: Bearer <jwt>` when their own `Authorization` must pass through; `trust`
+  verifies ES256, `iss`, `aud`, and `exp`.
 - **mTLS token issuance** — OAuth2 `client_credentials` on a dedicated mTLS listener; client
   identity = SPIFFE URI SAN.
 - **Scope-capped issuance** — requested scopes are intersected against the per-identity policy;
   uncovered scopes → 403.
 - **Key rotation** — current + previous ES256 keys loaded from GCP Secret Manager, refreshed
   in the background every 10 minutes; JWKS served for external verification.
-- **Single Pingora `ProxyHttp` service** — TLS termination, connection pooling, graceful restart.
+- **Pingora reverse proxy plus optional Hyper CONNECT listener** — both reuse the same upstream
+  configuration, JWT verifier, signing keys, scopes, metrics registry, and process lifecycle.
 - **Per-upstream host routing** via the `Host` header.
 - **GCP Secret Manager** backend behind a swappable `SecretProvider` trait, with an
   in-memory TTL cache (default 5 min).
+- **Dynamic GitHub App credentials** — selects an installation by repository owner, mints a token
+  restricted to the exact repository and configured permissions, and caches it until five minutes
+  before expiry.
+- **Artifact Registry credentials via ADC** — obtains Google access tokens through Application
+  Default Credentials/Workload Identity, without placing Google tokens in worker `.npmrc` files.
 - **Configurable injection** per upstream: header name + scheme (`bearer` / `basic` / `raw`).
+- **Authenticated passthrough** — explicitly allowlisted hosts can proxy without credential
+  injection while retaining scoped JWT authorization and preserving the caller's headers.
+- **Authenticated CONNECT forwarding** — an optional forward-proxy listener supports standard
+  `HTTPS_PROXY` clients. Only explicitly enabled `host:port` destinations are reachable, and every
+  tunnel requires a scoped JWT.
 - **Repo-scoped authz** for `github-repo` upstreams — the request path is parsed for
   `owner/repo`; the JWT scope must cover it.
 - **git-cache upstream** — serves `git clone`/`fetch` from a local bare mirror (fresh refs,
@@ -142,6 +165,17 @@ tcp = "0.0.0.0:6191"
 addr = "0.0.0.0:6443"
 cert_path = "/etc/trust/server.crt"
 key_path  = "/etc/trust/server.key"
+
+# Optional HTTP CONNECT forward proxy. TLS protects the JWT on the client-to-proxy hop.
+# The [tls] certificate/key above are reused and must cover this listener's DNS name.
+[forward_proxy]
+addr = "0.0.0.0:6180"
+tls = true
+connect_timeout = "10s"
+idle_timeout = "5m"
+max_tunnel_duration = "1h"
+max_concurrent_tunnels = 1024
+allow_private_ips = false
 
 # JWT auth: issuer/audience embedded in minted tokens and verified on every request.
 [auth]
@@ -169,9 +203,24 @@ allowed_scopes = ["github:pitorg/pit-ts"]
 
 [[issuance.clients]]
 spiffe         = "spiffe://pit/team/platform/*"
-allowed_scopes = ["anthropic", "github:pitorg/*"]
+allowed_scopes = ["anthropic", "github:pitorg/*", "npm-artifacts:my-proj/npm-private"]
+
+# One GitHub App can have a different installation in each organization. Owner matching is
+# case-insensitive and requests for an unmapped owner fail closed.
+[github_app]
+app_id = 123456
+private_key_secret_ref = "projects/my-proj/secrets/github-app-key/versions/latest"
+
+[[github_app.installations]]
+owner = "pitorg"
+installation_id = 111111
+
+[[github_app.installations]]
+owner = "pit-customer"
+installation_id = 222222
 
 # Upstreams. Each owns a listen_host; the Host header routes to it.
+# Unknown hosts are denied. The default mode is "inject" for backward compatibility.
 [[upstreams]]
 name        = "anthropic"
 kind        = "api"
@@ -181,13 +230,36 @@ secret_ref  = "projects/my-proj/secrets/anthropic-key/versions/latest"
 injection   = { header = "x-api-key", scheme = "raw" }
 
 [[upstreams]]
-name        = "github-api"
+name        = "github"
 kind        = "api"
 listen_host = "github.proxy.internal"
 origin      = "https://api.github.com"
-secret_ref  = "projects/my-proj/secrets/github-token/versions/latest"
+credential  = { kind = "github-app", permissions = { contents = "read", pull_requests = "read" } }
 injection   = { header = "authorization", scheme = "bearer" }
 resource    = { kind = "github-repo" }   # enables per-repo scope authz
+
+# Read-only npm access through GCP Artifact Registry. The proxy obtains the upstream token via
+# ADC; grant its workload identity Artifact Registry Reader on only this repository.
+[[upstreams]]
+name            = "npm-artifacts"
+kind            = "api"
+listen_host     = "npm.proxy.internal"
+origin          = "https://europe-north1-npm.pkg.dev"
+credential      = { kind = "gcp-adc", rewrite_registry_to = "https://npm.proxy.internal" }
+injection       = { header = "authorization", scheme = "bearer" }
+resource        = { kind = "artifact-registry-repo" }
+allowed_methods = ["GET", "HEAD"]
+
+# Explicitly allowlisted passthrough. No secret is fetched or injected. Clients must put their
+# trust JWT in Proxy-Authorization; their normal Authorization header is forwarded unchanged.
+# allow_connect additionally permits an opaque tunnel to exactly api.example.com:443.
+[[upstreams]]
+name          = "public-api"
+kind          = "api"
+mode          = "passthrough"
+listen_host   = "public.proxy.internal"
+origin        = "https://api.example.com"
+allow_connect = true
 
 # git-cache upstream: bare mirror + pass-through push.
 # Requires `git` in PATH where trust runs.
@@ -196,10 +268,8 @@ name        = "git-mirror"
 kind        = "git-cache"
 listen_host = "git.proxy.internal"
 origin      = "https://github.com"
-secret_ref  = "projects/my-proj/secrets/github-pat/versions/latest"
-# Store the PAT as `x-access-token:<pat>` in the secret; trust injects it as
-# `Authorization: Basic base64(x-access-token:<pat>)`, which GitHub accepts.
-# Alternatively use scheme = "bearer" if your token is a plain Bearer PAT.
+credential  = { kind = "github-app", permissions = { contents = "read" }, basic_username = "x-access-token" }
+# GitHub receives `Authorization: Basic base64(x-access-token:<installation-token>)`.
 injection   = { header = "authorization", scheme = "basic" }
 resource    = { kind = "git-repo" }
 git         = { storage_path = "/var/lib/trust/mirrors" }
@@ -216,8 +286,69 @@ is now JWT-based via the issuance endpoint.
 | `bearer` | `Bearer <secret>`                  | OAuth/PAT bearer auth                      |
 | `basic`  | `Basic base64(<secret>)`           | HTTP Basic (secret is the `user:pass` string) |
 
-Config is validated at startup: duplicate upstream names/listen hosts and malformed origins
-are rejected before the server binds.
+Config is validated at startup: duplicate upstream names/listen hosts, malformed origins, ambiguous
+CONNECT authorities, zero tunnel capacity, and CONNECT on injection/resource/method-restricted
+upstreams are rejected before the server binds. `secret_ref = "..."` remains supported as
+shorthand for `credential = { kind = "static-secret", secret_ref = "..." }`.
+
+### npm client configuration
+
+Workers need only non-secret routing configuration and their short-lived `trust` JWT. The npm CLI
+expands the environment variable at runtime:
+
+```ini
+@company:registry=https://npm.proxy.internal/my-proj/npm-private/
+//npm.proxy.internal/my-proj/npm-private/:_authToken=${TRUST_TOKEN}
+always-auth=true
+```
+
+No `gcloud` CLI or `google-artifactregistry-auth` invocation is required in the worker. The
+`rewrite_registry_to` setting rewrites absolute Artifact Registry tarball URLs and redirects back
+through the proxy. Existing lockfiles should still be regenerated against the proxy, or tested
+with `replace-registry-host=always`, so previously stored direct `*.pkg.dev` URLs cannot bypass it.
+Publishing should use a separate upstream, workload identity, and method policy with Artifact
+Registry Writer access.
+
+### Using the CONNECT forward proxy
+
+CONNECT is for clients that expect a conventional forward proxy, especially HTTPS clients. The
+request target must exactly match the configured upstream origin's `host:port`, the upstream must
+use `mode = "passthrough"` and `allow_connect = true`, and the JWT must include that upstream's
+scope. Unknown destinations are denied. Because the tunneled TLS is opaque to `trust`, CONNECT
+cannot inject credentials or enforce HTTP paths or methods; use the reverse-proxy host for those
+policies.
+
+Clients that can set proxy headers directly should use Bearer authentication:
+
+```bash
+curl --proxy https://trust.pit.internal:6180 \
+  --proxy-cacert server-ca.pem \
+  --proxy-header "Proxy-Authorization: Bearer $JWT" \
+  https://api.example.com/resource
+```
+
+For tools that only understand proxy URL credentials, `trust` also accepts HTTP Basic with the
+fixed username `jwt` and the JWT as its password:
+
+```bash
+export HTTPS_PROXY="https://jwt:${JWT}@trust.pit.internal:6180"
+export NO_PROXY="trust.pit.internal,.proxy.internal"
+```
+
+The `https://` proxy scheme means TLS is used between the client and `trust`; client support varies.
+Setting `tls = false` and using `http://` is more widely compatible, but exposes the JWT to anyone
+who can observe that network hop. Keep the listener private if plaintext is unavoidable. Avoid
+putting long-lived secrets in proxy URLs; these JWTs should be short-lived and scoped.
+
+The forward listener accepts CONNECT only. It works for `HTTPS_PROXY` clients that tunnel HTTPS,
+but it is not a general absolute-form HTTP proxy: a client using `HTTP_PROXY` for plain HTTP will
+receive `405 Method Not Allowed`. Route plain HTTP through an explicit reverse-proxy upstream or add
+absolute-form forwarding as a separate, policy-aware feature.
+
+The proxy resolves DNS server-side and rejects loopback, link-local, private, unique-local,
+multicast, documentation, and carrier-grade NAT addresses by default. Set `allow_private_ips =
+true` only when explicitly configured internal upstreams are required. Tunnels end at JWT expiry,
+the idle timeout, or `max_tunnel_duration`, whichever comes first.
 
 ## Running
 
@@ -257,6 +388,13 @@ curl -H "Authorization: Bearer $JWT" \
   -H "Host: anthropic.proxy.internal" \
   https://trust.pit.internal:6443/v1/messages
 
+# Authenticated passthrough. The trust JWT is consumed by the proxy while the caller's
+# upstream credential is forwarded in Authorization without modification:
+curl -H "Proxy-Authorization: Bearer $JWT" \
+  -H "Authorization: Bearer $CALLER_UPSTREAM_TOKEN" \
+  -H "Host: public.proxy.internal" \
+  https://trust.pit.internal:6443/resource
+
 # git clone via the git-cache upstream (cached mirror, fresh refs):
 git -c http.extraHeader="Authorization: Bearer $JWT" \
   clone https://git.proxy.internal/pitorg/pit-ts.git
@@ -280,12 +418,18 @@ git -c http.extraHeader="Authorization: Bearer $JWT" \
 
 ## Security model
 
-- The client's `Authorization` header is **removed before** the upstream secret is injected —
-  so even when injecting into `authorization`, the client JWT cannot leak upstream.
+- `Proxy-Authorization` is always removed before forwarding. In inject mode, the client's
+  `Authorization` is also removed before the upstream secret is injected. In passthrough mode,
+  the caller's `Authorization` is preserved and the trust JWT is accepted only from
+  `Proxy-Authorization`.
 - Upstream secrets are fetched server-side, held only in memory with a TTL, and **never logged**
   (`Secret` has a redacted `Debug` and no `Display`).
 - No request reaches an upstream without a valid, authorized JWT (verified ES256, `iss`, `aud`,
   `exp`, and scope).
+- Unknown hosts are denied, and passthrough must be enabled explicitly per configured upstream.
+- CONNECT destinations are denied unless their exact origin `host:port` has `allow_connect = true`.
+  CONNECT reuses the same JWT verifier, scope names, upstream allowlist, logs, and metrics as the
+  reverse proxy, but cannot inspect or inject into the encrypted tunnel.
 - The issuance server is mTLS-only — unauthenticated clients cannot reach the `/token` endpoint.
 - Scopes are capped at issuance to the per-identity policy; clients cannot self-escalate.
 - The config file contains no plaintext secrets — only secret-manager references. Keep your
@@ -294,7 +438,7 @@ git -c http.extraHeader="Authorization: Bearer $JWT" \
 ## Testing
 
 ```bash
-cargo test                                 # 102 unit + 3 end-to-end integration tests (105 total)
+cargo test                                 # 121 unit + 5 integration tests (126 total)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```

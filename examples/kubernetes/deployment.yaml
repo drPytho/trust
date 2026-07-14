@@ -2,20 +2,31 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: trust
+  namespace: trust-system
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: trust-config
+  namespace: trust-system
 data:
   config.toml: |
+    # Plain reverse proxy intentionally disabled in this production-oriented example.
     [listen]
-    tcp = "0.0.0.0:6191"
 
     [tls]
     addr = "0.0.0.0:6443"
     cert_path = "/etc/trust/tls/server.crt"
     key_path = "/etc/trust/tls/server.key"
+
+    [forward_proxy]
+    addr = "0.0.0.0:6180"
+    tls = true
+    connect_timeout = "10s"
+    idle_timeout = "5m"
+    max_tunnel_duration = "1h"
+    max_concurrent_tunnels = 1024
+    allow_private_ips = false
 
     [auth]
     issuer = "https://trust.example.com/"
@@ -33,7 +44,7 @@ data:
 
     [[issuance.clients]]
     spiffe = "spiffe://example/workloads/*"
-    allowed_scopes = ["anthropic"]
+    allowed_scopes = ["anthropic", "public-api"]
 
     [[upstreams]]
     name = "anthropic"
@@ -42,11 +53,20 @@ data:
     origin = "https://api.anthropic.com"
     secret_ref = "projects/PROJECT_ID/secrets/anthropic-key/versions/latest"
     injection = { header = "x-api-key", scheme = "raw" }
+
+    [[upstreams]]
+    name = "public-api"
+    kind = "api"
+    mode = "passthrough"
+    listen_host = "public.proxy.internal"
+    origin = "https://api.example.com"
+    allow_connect = true
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: trust
+  namespace: trust-system
   labels:
     app.kubernetes.io/name: trust
 spec:
@@ -70,24 +90,24 @@ spec:
             - name: RUST_LOG
               value: info
           ports:
-            - name: proxy-http
-              containerPort: 6191
             - name: proxy-tls
               containerPort: 6443
+            - name: forward-proxy
+              containerPort: 6180
             - name: token-mtls
               containerPort: 8443
-            - name: jwks
+            - name: management
               containerPort: 8080
           readinessProbe:
             httpGet:
               path: /readyz
-              port: jwks
+              port: management
             initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
             httpGet:
               path: /healthz
-              port: jwks
+              port: management
             initialDelaySeconds: 15
             periodSeconds: 20
           resources:
@@ -116,19 +136,20 @@ apiVersion: v1
 kind: Service
 metadata:
   name: trust
+  namespace: trust-system
 spec:
   selector:
     app.kubernetes.io/name: trust
   ports:
-    - name: proxy-http
-      port: 6191
-      targetPort: proxy-http
     - name: proxy-tls
       port: 6443
       targetPort: proxy-tls
+    - name: forward-proxy
+      port: 6180
+      targetPort: forward-proxy
     - name: token-mtls
       port: 8443
       targetPort: token-mtls
-    - name: jwks
+    - name: management
       port: 8080
-      targetPort: jwks
+      targetPort: management

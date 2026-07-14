@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Generate local-dev TLS material for trust:
-#   - server.crt/key      : the [tls] server cert (proxy TLS + issuance mTLS listener)
+#   - server.crt/key      : the [tls] server cert (reverse proxy, CONNECT, and issuance)
 #   - client-ca.crt/key   : the CA that signs client certs ([issuance].client_ca_path)
 #   - client.crt/key      : a client cert with a SPIFFE URI SAN (the caller identity)
 #
