@@ -25,6 +25,8 @@ spec:
           port: 6180
         - protocol: TCP
           port: 6443
+        - protocol: TCP
+          port: 8443
     - to:
         - namespaceSelector:
             matchLabels:

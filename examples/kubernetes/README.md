@@ -12,7 +12,8 @@ workload identity integration.
 Create the TLS Secret from your server certificate, server key, and client CA:
 
 ```bash
-kubectl create secret generic trust-tls \
+kubectl apply -f examples/kubernetes/namespaces.yaml
+kubectl -n trust-system create secret generic trust-tls \
   --from-file=server.crt=/path/to/server.crt \
   --from-file=server.key=/path/to/server.key \
   --from-file=client-ca.pem=/path/to/client-ca.pem
@@ -24,10 +25,19 @@ Apply the example:
 kubectl apply -f examples/kubernetes/deployment.yaml
 ```
 
-The Service exposes the plain reverse proxy, TLS reverse proxy, TLS CONNECT
-forward proxy, mTLS token, and JWKS ports inside the cluster. For a private
-GHCR package, also configure an `imagePullSecret`. For production, pin the
-image to the immutable `sha-...` tag published by CI instead of `latest`.
+The Service exposes these listeners inside the cluster:
+
+| Service port | Listener | Client authentication |
+|---|---|---|
+| `6443` | TLS reverse proxy | Bearer JWT; passthrough uses `Proxy-Authorization` |
+| `6180` | TLS CONNECT proxy | `Proxy-Authorization` Bearer or Basic `jwt:<JWT>` |
+| `8443` | mTLS token endpoint | client certificate with authorized SPIFFE URI |
+| `8080` | management | restricted by NetworkPolicy in this example |
+
+The example leaves the plain reverse listener disabled so JWTs are not sent
+over an unencrypted hop. For a private GHCR package, also configure an
+`imagePullSecret`. For production, pin the image to the immutable `sha-...`
+tag published by CI instead of `latest`.
 
 The Deployment probes `/healthz` for liveness and `/readyz` for readiness on
 the management port. Prometheus metrics are available at `/metrics` on the same
@@ -203,10 +213,10 @@ used only with compensating network controls.
 
 Apply `sandbox-egress-network-policy.yaml` to select sandbox Pods labeled
 `trust.example.com/restricted-egress: "true"`. It allows egress only to the
-trust reverse/CONNECT ports and cluster DNS. The separate ingress policy allows
-only labeled clients to enter those proxy ports. Together, these make direct
-egress fail closed for traffic covered by the cluster's NetworkPolicy
-implementation.
+trust token/reverse/CONNECT ports and cluster DNS. The separate ingress policy
+allows only the corresponding labeled clients to enter those ports. Together,
+these make direct egress fail closed for traffic covered by the cluster's
+NetworkPolicy implementation.
 
 NetworkPolicy enforcement and service-DNAT ordering vary by CNI. Validate the
 policy in your cluster, adapt the DNS Pod selector if it is not `k8s-app:
@@ -221,6 +231,8 @@ JWTs already minted from it; those remain valid until their configured expiry.
 
 The example is split into reusable manifests:
 
+- [`namespaces.yaml`](namespaces.yaml) creates the `trust-system` and
+  `workloads` namespaces used by the other examples.
 - [`client-ca-issuer.yaml`](client-ca-issuer.yaml) configures cert-manager to
   issue client certificates from a CA Secret.
 - [`client-certificate.yaml`](client-certificate.yaml) requests one rotating
@@ -236,3 +248,19 @@ Replace the example namespaces, DNS names, SPIFFE trust domain, image, and CA
 certificate before applying the files. The management port is intentionally
 not exposed by the ingress NetworkPolicy; add a narrowly scoped monitoring
 rule if Prometheus or an operator must reach it.
+
+A representative application order is:
+
+```bash
+kubectl apply -f examples/kubernetes/namespaces.yaml
+kubectl apply -f examples/kubernetes/deployment.yaml
+kubectl apply -f examples/kubernetes/client-ca-issuer.yaml
+kubectl apply -f examples/kubernetes/client-certificate.yaml
+kubectl apply -f examples/kubernetes/client-workload.yaml
+kubectl apply -f examples/kubernetes/token-network-policy.yaml
+kubectl apply -f examples/kubernetes/sandbox-egress-network-policy.yaml
+```
+
+Create the `trust-tls`, client-CA, and server-CA material before applying the
+resources that reference it. Apply NetworkPolicies last, after confirming DNS,
+token issuance, reverse proxying, CONNECT, and your CNI's policy behavior.

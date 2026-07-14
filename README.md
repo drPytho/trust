@@ -1,15 +1,19 @@
 # trust
 
-A credential-injection egress proxy built on [Pingora](https://github.com/cloudflare/pingora).
+A policy-enforcing egress proxy built on [Pingora](https://github.com/cloudflare/pingora) and
+Hyper.
 
 Clients authenticate to `trust` with a **short-lived JWT** they mint against their own mTLS identity.
 `trust` validates the JWT, checks the client is authorized for the requested upstream, fetches the
-**real** upstream secret from a secret manager, injects it, and forwards the request. The upstream
-credential is never handed to clients, and the client's JWT is never forwarded upstream.
+**real** upstream secret from a secret manager, injects it, and forwards the request. Explicit
+destinations can instead pass caller credentials through or accept authenticated HTTP CONNECT
+tunnels. The upstream credential is never handed to clients, and the client's JWT is never
+forwarded upstream.
 
-> **Status:** API proxying and git smart-HTTP caching are implemented. API credentials may be
-> static Secret Manager values, repository-scoped GitHub App installation tokens, or Google ADC
-> access tokens for services such as Artifact Registry.
+> **Status:** credential-injected API proxying, authenticated passthrough, HTTP CONNECT forwarding,
+> and git smart-HTTP caching are implemented. API credentials may be static Secret Manager values,
+> repository-scoped GitHub App installation tokens, or Google ADC access tokens for services such
+> as Artifact Registry.
 
 ## Why
 
@@ -64,10 +68,10 @@ key to be loaded. The exported proxy metrics are:
 - `trust_connect_duration_seconds{upstream}`
 - `trust_connect_bytes_total{upstream,direction}`
 
-Rejected proxy calls are also logged at `WARN` with bounded reasons (`missing_host`,
-`unknown_host`, `missing_token`, `signing_keys_unavailable`, `invalid_token`, or
-`forbidden_scope`) and safe request metadata. Credentials and authorization headers are never
-logged.
+Rejected reverse-proxy and CONNECT calls are also logged at `WARN` with bounded reason labels and
+safe request metadata. CONNECT distinguishes invalid authorities, unknown destinations, missing or
+invalid tokens, forbidden scopes, private destinations, connection failures, and tunnel-capacity
+exhaustion. Credentials and authorization headers are never logged.
 
 ### Proxying a request
 
@@ -88,8 +92,8 @@ Each upstream owns a proxy **hostname**; the incoming `Host` header selects it.
                          └──────────────────────────────────────────────────────────┘     api.anthropic.com
 ```
 
-Reject responses (404/401/403/502) short-circuit inside the proxy; only authorized,
-credential-injected requests ever reach an upstream.
+Reject responses (404/401/403/502) short-circuit inside the proxy; only authorized requests ever
+reach an upstream.
 
 ## Scope grammar
 
@@ -120,7 +124,8 @@ Rules:
   uncovered scopes → 403.
 - **Key rotation** — current + previous ES256 keys loaded from GCP Secret Manager, refreshed
   in the background every 10 minutes; JWKS served for external verification.
-- **Single Pingora `ProxyHttp` service** — TLS termination, connection pooling, graceful restart.
+- **Pingora reverse proxy plus optional Hyper CONNECT listener** — both reuse the same upstream
+  configuration, JWT verifier, signing keys, scopes, metrics registry, and process lifecycle.
 - **Per-upstream host routing** via the `Host` header.
 - **GCP Secret Manager** backend behind a swappable `SecretProvider` trait, with an
   in-memory TTL cache (default 5 min).
@@ -281,9 +286,10 @@ is now JWT-based via the issuance endpoint.
 | `bearer` | `Bearer <secret>`                  | OAuth/PAT bearer auth                      |
 | `basic`  | `Basic base64(<secret>)`           | HTTP Basic (secret is the `user:pass` string) |
 
-Config is validated at startup: duplicate upstream names/listen hosts and malformed origins
-are rejected before the server binds. `secret_ref = "..."` remains supported as shorthand for
-`credential = { kind = "static-secret", secret_ref = "..." }`.
+Config is validated at startup: duplicate upstream names/listen hosts, malformed origins, ambiguous
+CONNECT authorities, zero tunnel capacity, and CONNECT on injection/resource/method-restricted
+upstreams are rejected before the server binds. `secret_ref = "..."` remains supported as
+shorthand for `credential = { kind = "static-secret", secret_ref = "..." }`.
 
 ### npm client configuration
 
@@ -333,6 +339,11 @@ The `https://` proxy scheme means TLS is used between the client and `trust`; cl
 Setting `tls = false` and using `http://` is more widely compatible, but exposes the JWT to anyone
 who can observe that network hop. Keep the listener private if plaintext is unavoidable. Avoid
 putting long-lived secrets in proxy URLs; these JWTs should be short-lived and scoped.
+
+The forward listener accepts CONNECT only. It works for `HTTPS_PROXY` clients that tunnel HTTPS,
+but it is not a general absolute-form HTTP proxy: a client using `HTTP_PROXY` for plain HTTP will
+receive `405 Method Not Allowed`. Route plain HTTP through an explicit reverse-proxy upstream or add
+absolute-form forwarding as a separate, policy-aware feature.
 
 The proxy resolves DNS server-side and rejects loopback, link-local, private, unique-local,
 multicast, documentation, and carrier-grade NAT addresses by default. Set `allow_private_ips =

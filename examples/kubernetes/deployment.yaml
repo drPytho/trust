@@ -2,15 +2,17 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: trust
+  namespace: trust-system
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: trust-config
+  namespace: trust-system
 data:
   config.toml: |
+    # Plain reverse proxy intentionally disabled in this production-oriented example.
     [listen]
-    tcp = "0.0.0.0:6191"
 
     [tls]
     addr = "0.0.0.0:6443"
@@ -64,6 +66,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: trust
+  namespace: trust-system
   labels:
     app.kubernetes.io/name: trust
 spec:
@@ -87,26 +90,24 @@ spec:
             - name: RUST_LOG
               value: info
           ports:
-            - name: proxy-http
-              containerPort: 6191
             - name: proxy-tls
               containerPort: 6443
             - name: forward-proxy
               containerPort: 6180
             - name: token-mtls
               containerPort: 8443
-            - name: jwks
+            - name: management
               containerPort: 8080
           readinessProbe:
             httpGet:
               path: /readyz
-              port: jwks
+              port: management
             initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
             httpGet:
               path: /healthz
-              port: jwks
+              port: management
             initialDelaySeconds: 15
             periodSeconds: 20
           resources:
@@ -135,13 +136,11 @@ apiVersion: v1
 kind: Service
 metadata:
   name: trust
+  namespace: trust-system
 spec:
   selector:
     app.kubernetes.io/name: trust
   ports:
-    - name: proxy-http
-      port: 6191
-      targetPort: proxy-http
     - name: proxy-tls
       port: 6443
       targetPort: proxy-tls
@@ -151,6 +150,6 @@ spec:
     - name: token-mtls
       port: 8443
       targetPort: token-mtls
-    - name: jwks
+    - name: management
       port: 8080
-      targetPort: jwks
+      targetPort: management
