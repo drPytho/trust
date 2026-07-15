@@ -97,6 +97,7 @@ async fn connect_consumes_trust_jwt_and_preserves_google_oauth_token() {
             max_tunnel_duration: Duration::from_secs(30),
             max_concurrent_tunnels: 10,
             allow_private_ips: true,
+            audit_unmatched: None,
         },
     ));
     let proxy_task = tokio::spawn(serve_connect(proxy_listener, None, proxy));

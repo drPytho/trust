@@ -6,6 +6,8 @@ use url::Url;
 
 use crate::resource::ResourceKind;
 
+pub const AUDIT_UNMATCHED_METRICS_NAME: &str = "audit-unmatched";
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("failed to read config file: {0}")]
@@ -204,6 +206,12 @@ pub struct ForwardProxyConfig {
     pub max_tunnel_duration: std::time::Duration,
     pub max_concurrent_tunnels: usize,
     pub allow_private_ips: bool,
+    pub audit_unmatched: Option<AuditUnmatchedConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct AuditUnmatchedConfig {
+    pub scope: String,
 }
 
 fn default_true() -> bool {
@@ -241,6 +249,8 @@ struct RawForwardProxyConfig {
     max_concurrent_tunnels: usize,
     #[serde(default)]
     allow_private_ips: bool,
+    #[serde(default)]
+    audit_unmatched: Option<AuditUnmatchedConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -613,6 +623,30 @@ impl Config {
                             value: value.to_string(),
                         })
                 };
+                if let Some(audit) = &forward.audit_unmatched {
+                    if audit.scope.is_empty()
+                        || !audit.scope.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                        })
+                    {
+                        return Err(ConfigError::BadForwardProxy(
+                            "audit_unmatched.scope must be a bare scope name containing only letters, numbers, '.', '-', or '_'"
+                                .to_string(),
+                        ));
+                    }
+                    if names.contains(&audit.scope) {
+                        return Err(ConfigError::BadForwardProxy(format!(
+                            "audit_unmatched.scope '{}' must not reuse a configured upstream name",
+                            audit.scope
+                        )));
+                    }
+                    if names.contains(AUDIT_UNMATCHED_METRICS_NAME) {
+                        return Err(ConfigError::BadForwardProxy(
+                            "upstream name 'audit-unmatched' is reserved while audit_unmatched is enabled"
+                                .to_string(),
+                        ));
+                    }
+                }
                 Ok::<_, ConfigError>(ForwardProxyConfig {
                     addr: forward.addr,
                     tls: forward.tls,
@@ -627,6 +661,7 @@ impl Config {
                         forward.max_concurrent_tunnels
                     },
                     allow_private_ips: forward.allow_private_ips,
+                    audit_unmatched: forward.audit_unmatched,
                 })
             })
             .transpose()?;
@@ -1031,6 +1066,7 @@ connect_timeout = "3s"
 idle_timeout = "2m"
 max_tunnel_duration = "30m"
 allow_private_ips = true
+audit_unmatched = { scope = "outbound-audit" }
 
 [[upstreams]]
 name = "public-docs"
@@ -1052,6 +1088,12 @@ allow_connect = true
         );
         assert_eq!(forward.max_concurrent_tunnels, 1024);
         assert!(forward.allow_private_ips);
+        assert_eq!(
+            forward.audit_unmatched,
+            Some(AuditUnmatchedConfig {
+                scope: "outbound-audit".into()
+            })
+        );
         assert!(
             cfg.upstreams
                 .iter()
@@ -1120,6 +1162,43 @@ max_concurrent_tunnels = 0
 "#;
         assert!(matches!(
             Config::from_str(&(GOOD.to_string() + zero_capacity)),
+            Err(ConfigError::BadForwardProxy(_))
+        ));
+
+        let resource_scope = r#"
+[forward_proxy]
+addr = "0.0.0.0:6180"
+audit_unmatched = { scope = "github:org/repo" }
+"#;
+        assert!(matches!(
+            Config::from_str(&(GOOD.to_string() + resource_scope)),
+            Err(ConfigError::BadForwardProxy(_))
+        ));
+
+        let reused_scope = r#"
+[forward_proxy]
+addr = "0.0.0.0:6180"
+audit_unmatched = { scope = "github" }
+"#;
+        assert!(matches!(
+            Config::from_str(&(GOOD.to_string() + reused_scope)),
+            Err(ConfigError::BadForwardProxy(_))
+        ));
+
+        let reserved_metrics_name = r#"
+[forward_proxy]
+addr = "0.0.0.0:6180"
+audit_unmatched = { scope = "outbound-audit" }
+
+[[upstreams]]
+name = "audit-unmatched"
+kind = "api"
+mode = "passthrough"
+listen_host = "audit-unmatched.proxy.internal"
+origin = "https://example.com"
+"#;
+        assert!(matches!(
+            Config::from_str(&(GOOD.to_string() + reserved_metrics_name)),
             Err(ConfigError::BadForwardProxy(_))
         ));
     }

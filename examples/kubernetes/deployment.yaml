@@ -27,6 +27,9 @@ data:
     max_tunnel_duration = "1h"
     max_concurrent_tunnels = 1024
     allow_private_ips = false
+    # Temporary rollout inventory mode. If enabled, also grant only selected
+    # sandbox identities the dedicated scope in issuance.clients.
+    # audit_unmatched = { scope = "outbound-audit" }
 
     [auth]
     issuer = "https://trust.example.com/"

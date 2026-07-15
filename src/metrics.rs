@@ -68,7 +68,7 @@ impl ProxyMetrics {
         let connect_attempts = IntCounterVec::new(
             Opts::new(
                 "trust_connect_attempts_total",
-                "CONNECT attempts by configured upstream and bounded result.",
+                "CONNECT attempts by configured upstream or audit fallback and bounded result.",
             ),
             &["upstream", "result"],
         )
