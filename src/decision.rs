@@ -107,9 +107,19 @@ mod tests {
     #[test]
     fn authorize_resource_scoped() {
         let up = upstream("github", Some(ResourceKind::GithubRepo));
-        let s = ScopeSet::parse("github:pitorg/pit-ts").unwrap();
-        assert!(authorize(&s, &up, "GET", "/repos/pitorg/pit-ts/issues"));
-        assert!(!authorize(&s, &up, "GET", "/repos/pitorg/other/issues"));
+        let s = ScopeSet::parse("github:example-org/example-repo").unwrap();
+        assert!(authorize(
+            &s,
+            &up,
+            "GET",
+            "/repos/example-org/example-repo/issues"
+        ));
+        assert!(!authorize(
+            &s,
+            &up,
+            "GET",
+            "/repos/example-org/other/issues"
+        ));
         // Non-repo path on a scoped upstream: only a bare token authorizes.
         assert!(!authorize(&s, &up, "GET", "/user"));
         assert!(authorize(
@@ -134,13 +144,13 @@ mod tests {
             &bare,
             &github,
             "POST",
-            "/repos/pitorg/pit-ts/issues"
+            "/repos/example-org/example-repo/issues"
         ));
         assert!(authorize(
             &bare,
             &github,
             "GET",
-            "/repos/pitorg/pit-ts/issues"
+            "/repos/example-org/example-repo/issues"
         ));
     }
 }

@@ -229,16 +229,16 @@ fn jwt_scoped_egress_end_to_end() {
     keystore.store(build_key_material(&signing_key_pem(), None).unwrap());
     let km = keystore.load().unwrap();
 
-    // Mint a token scoped to github:pitorg/pit-ts.
+    // Mint a token scoped to github:example-org/example-repo.
     let issuer = Issuer::new(
         "trust".into(),
         "trust-proxy".into(),
         Duration::from_secs(3600),
     );
     let now = jsonwebtoken::get_current_timestamp();
-    let scopes = ScopeSet::parse("github:pitorg/pit-ts").unwrap();
+    let scopes = ScopeSet::parse("github:example-org/example-repo").unwrap();
     let token = issuer
-        .mint(&km, "spiffe://pit/ci/pit-ts", &scopes, now)
+        .mint(&km, "spiffe://example/ci/example-repo", &scopes, now)
         .unwrap();
     let expired = issuer.mint(&km, "s", &scopes, now - 100_000).unwrap();
 
@@ -282,7 +282,13 @@ fn jwt_scoped_egress_end_to_end() {
     assert_eq!(raw_request(proxy_port, "unknown.test", "/", None).0, 404);
     // Missing token → 401.
     assert_eq!(
-        raw_request(proxy_port, "gh.test", "/repos/pitorg/pit-ts/x", None).0,
+        raw_request(
+            proxy_port,
+            "gh.test",
+            "/repos/example-org/example-repo/x",
+            None
+        )
+        .0,
         401
     );
     // Expired token → 401.
@@ -290,7 +296,7 @@ fn jwt_scoped_egress_end_to_end() {
         raw_request(
             proxy_port,
             "gh.test",
-            "/repos/pitorg/pit-ts/x",
+            "/repos/example-org/example-repo/x",
             Some(&expired)
         )
         .0,
@@ -298,14 +304,20 @@ fn jwt_scoped_egress_end_to_end() {
     );
     // Valid token, repo OUT of scope → 403.
     assert_eq!(
-        raw_request(proxy_port, "gh.test", "/repos/pitorg/other/x", Some(&token)).0,
+        raw_request(
+            proxy_port,
+            "gh.test",
+            "/repos/example-org/other/x",
+            Some(&token)
+        )
+        .0,
         403
     );
     // Valid token, repo IN scope → 200.
     let (status, _) = raw_request(
         proxy_port,
         "gh.test",
-        "/repos/pitorg/pit-ts/x",
+        "/repos/example-org/example-repo/x",
         Some(&token),
     );
     assert_eq!(status, 200);
@@ -355,8 +367,8 @@ fn github_cli_rest_and_repo_rooted_graphql_are_proxied_without_connect() {
     let token = issuer
         .mint(
             &km,
-            "spiffe://pit/sandbox/test",
-            &ScopeSet::parse("github:pitorg/pit-ts").unwrap(),
+            "spiffe://example/sandbox/test",
+            &ScopeSet::parse("github:example-org/example-repo").unwrap(),
             jsonwebtoken::get_current_timestamp(),
         )
         .unwrap();
@@ -397,7 +409,7 @@ fn github_cli_rest_and_repo_rooted_graphql_are_proxied_without_connect() {
         raw_request_with_authorization(
             proxy_port,
             "github-cli.test",
-            "/api/v3/repos/pitorg/pit-ts/pulls",
+            "/api/v3/repos/example-org/example-repo/pulls",
             &format!("token {token}"),
         )
         .0,
@@ -407,7 +419,7 @@ fn github_cli_rest_and_repo_rooted_graphql_are_proxied_without_connect() {
         raw_request_with_authorization(
             proxy_port,
             "github-cli.test",
-            "/api/v3/repos/pitorg/other/pulls",
+            "/api/v3/repos/example-org/other/pulls",
             &format!("token {token}"),
         )
         .0,
@@ -416,7 +428,7 @@ fn github_cli_rest_and_repo_rooted_graphql_are_proxied_without_connect() {
 
     let graphql = serde_json::json!({
         "query": "query PullRequestList($owner: String!, $repo: String!) { repository(owner: $owner, name: $repo) { pullRequests(first: 10) { totalCount } } }",
-        "variables": {"owner": "pitorg", "repo": "pit-ts"}
+        "variables": {"owner": "example-org", "repo": "example-repo"}
     })
     .to_string();
     assert_eq!(
@@ -435,7 +447,7 @@ fn github_cli_rest_and_repo_rooted_graphql_are_proxied_without_connect() {
     // Global GraphQL operations fail before reaching the upstream.
     let global = serde_json::json!({
         "query": "query Viewer { viewer { login } }",
-        "variables": {"owner": "pitorg", "repo": "pit-ts"}
+        "variables": {"owner": "example-org", "repo": "example-repo"}
     })
     .to_string();
     assert_eq!(
@@ -454,7 +466,7 @@ fn github_cli_rest_and_repo_rooted_graphql_are_proxied_without_connect() {
     std::thread::sleep(Duration::from_millis(100));
     let requests = upstream_reqs.lock().unwrap();
     assert_eq!(requests.len(), 2);
-    assert!(requests[0].starts_with("GET /repos/pitorg/pit-ts/pulls HTTP/1.1"));
+    assert!(requests[0].starts_with("GET /repos/example-org/example-repo/pulls HTTP/1.1"));
     assert!(requests[1].starts_with("POST /graphql HTTP/1.1"));
     assert!(requests[1].ends_with(&graphql));
     for request in requests.iter() {
@@ -478,7 +490,7 @@ fn authenticated_passthrough_preserves_caller_authorization() {
     let token = issuer
         .mint(
             &km,
-            "spiffe://pit/workloads/client",
+            "spiffe://example/workloads/client",
             &ScopeSet::parse("public-api").unwrap(),
             jsonwebtoken::get_current_timestamp(),
         )
@@ -561,22 +573,22 @@ fn issuance_policy_and_grant_decision() {
         build_key_material(&key.serialize_pem(), None).unwrap()
     };
 
-    // Build a policy granting `github:pitorg/*` to `spiffe://pit/ci/pit-ts`.
+    // Build a policy granting `github:example-org/*` to `spiffe://example/ci/example-repo`.
     let policy = ClientPolicy::new(&[ClientEntry {
-        spiffe: "spiffe://pit/ci/pit-ts".into(),
-        allowed_scopes: vec!["github:pitorg/*".into()],
+        spiffe: "spiffe://example/ci/example-repo".into(),
+        allowed_scopes: vec!["github:example-org/*".into()],
     }])
     .unwrap();
 
-    let spiffe = "spiffe://pit/ci/pit-ts";
+    let spiffe = "spiffe://example/ci/example-repo";
 
-    // --- Happy path: request github:pitorg/pit-ts ---
+    // --- Happy path: request github:example-org/example-repo ---
     let allowed = policy
         .allowed_scopes(spiffe)
         .expect("policy should know this identity");
-    let requested_good = ScopeSet::parse("github:pitorg/pit-ts").unwrap();
+    let requested_good = ScopeSet::parse("github:example-org/example-repo").unwrap();
     grant(allowed, &requested_good)
-        .expect("github:pitorg/pit-ts should be covered by github:pitorg/*");
+        .expect("github:example-org/example-repo should be covered by github:example-org/*");
 
     let issuer = Issuer::new(
         "trust".into(),
@@ -590,7 +602,10 @@ fn issuance_policy_and_grant_decision() {
     let got_scopes = verifier
         .verify(&km, &token)
         .expect("minted token should verify");
-    assert_eq!(got_scopes.to_scope_string(), "github:pitorg/pit-ts");
+    assert_eq!(
+        got_scopes.to_scope_string(),
+        "github:example-org/example-repo"
+    );
 
     // --- Denied: request mistral (not in policy) ---
     let requested_bad = ScopeSet::parse("mistral").unwrap();

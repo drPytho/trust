@@ -214,8 +214,8 @@ impl ProxyService {
 
 /// Extract the git path suffix after `/<owner>/<repo>[.git]/`.
 ///
-/// E.g. `/pitorg/pit-ts.git/info/refs` → `info/refs`
-///       `/pitorg/pit-ts/git-upload-pack` → `git-upload-pack`
+/// E.g. `/example-org/example-repo.git/info/refs` → `info/refs`
+///       `/example-org/example-repo/git-upload-pack` → `git-upload-pack`
 fn git_tail<'a>(path: &'a str, owner: &str, repo: &str) -> Option<&'a str> {
     // Build the two prefix variants to strip: with and without `.git`.
     let prefix_with = format!("/{owner}/{repo}.git/");
@@ -1200,13 +1200,13 @@ mod tests {
         let output = rewrite_registry_json(
             input,
             "https://europe-north1-npm.pkg.dev",
-            "http://npm-proxy.pit-workers.svc:6191",
+            "http://npm-proxy.workers.svc:6191",
         )
         .unwrap();
         let output: serde_json::Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(
             output["versions"]["1.0.0"]["dist"]["tarball"],
-            "http://npm-proxy.pit-workers.svc:6191/project/repo/pkg/-/pkg.tgz"
+            "http://npm-proxy.workers.svc:6191/project/repo/pkg/-/pkg.tgz"
         );
         assert_eq!(
             output["versions"]["1.0.0"]["repository"],

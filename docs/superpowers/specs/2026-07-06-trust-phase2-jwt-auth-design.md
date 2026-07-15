@@ -35,12 +35,12 @@ its authorization will reuse the scope model defined below.
 The OAuth `scope` claim is a space-delimited list of scope tokens:
 
 - `<upstream>` (bare, e.g. `anthropic`, `mistral`) — full access to an unscoped upstream.
-- `<upstream>:<owner>/<repo>` (e.g. `github:pitorg/pit-ts`) — one exact repo on a
+- `<upstream>:<owner>/<repo>` (e.g. `github:example-org/example-repo`) — one exact repo on a
   resource-scoped upstream.
-- `<upstream>:<owner>/*` (e.g. `github:pit-customer/*`) — one wildcard segment: any repo
+- `<upstream>:<owner>/*` (e.g. `github:customer-org/*`) — one wildcard segment: any repo
   directly under `owner`.
 
-Example claim: `scope: "anthropic mistral github:pitorg/pit-ts github:pit-customer/*"`.
+Example claim: `scope: "anthropic mistral github:example-org/example-repo github:customer-org/*"`.
 
 Grammar (one wildcard, no `**`, no nested globs):
 
@@ -62,7 +62,7 @@ Two operations:
   - exact `<u>:<owner>/<repo>` covers only itself
 
   A requested scope is grantable iff **some** allowed scope covers it. This lets a caller
-  entitled to `github:pitorg/*` mint `github:pitorg/pit-ts`.
+  entitled to `github:example-org/*` mint `github:example-org/example-repo`.
 
 - **`permits(scopeset, upstream, resource) -> bool`** — authorization check for a proxied
   request:
@@ -82,7 +82,7 @@ New and changed units (each independently testable):
 | `keystore` | Load the private signing key from GCP Secret Manager; derive the public JWK; assemble JWKS from current + previous public keys; background refresh so rotation takes effect without restart. | Uses the Phase-1 `SecretProvider`. |
 | `jwt::Issuer` | Mint a signed JWT: header `{alg: ES256, kid}`, claims `{iss, aud, sub, iat, exp = iat + ttl, scope}`. | ttl from config (default 7d). |
 | `jwt::Verifier` | Verify an incoming Bearer JWT against the keystore's current+previous public keys; validate `exp`, `iss`, `aud`; return a parsed `ScopeSet`. | Rejects on bad signature / expiry / issuer / audience. |
-| `mtls` | Extract the SPIFFE SAN URI from the verified client certificate on the issuance listener. | Identity string, e.g. `spiffe://pit/ci/pit-ts`. |
+| `mtls` | Extract the SPIFFE SAN URI from the verified client certificate on the issuance listener. | Identity string, e.g. `spiffe://example/ci/example-repo`. |
 | `ClientPolicy` | Config table mapping SPIFFE identity (exact or trailing `*` prefix) → maximum grantable scopes. | Deny if no entry matches. |
 | token endpoint | Handle `POST /token` (OAuth2 client_credentials): mTLS identity → policy → validate requested ⊆ allowed via `covers` → mint → OAuth token response. | On its own mTLS listener. |
 | JWKS endpoint | Serve `/.well-known/jwks.json` (current + previous public keys). | Public listener. |
@@ -98,7 +98,7 @@ tcp = "0.0.0.0:6191"
 
 [auth]
 mode = "jwt"
-issuer = "https://trust.pit.internal/"
+issuer = "https://trust.example.internal/"
 audience = "trust-proxy"
 
 [auth.signing]
@@ -116,12 +116,12 @@ client_ca_path = "/etc/trust/client-ca.pem"     # CA that signs client certs
 addr = "0.0.0.0:8080"                            # serves /.well-known/jwks.json
 
 [[issuance.clients]]
-spiffe = "spiffe://pit/ci/pit-ts"                # exact identity
-allowed_scopes = ["github:pitorg/pit-ts"]
+spiffe = "spiffe://example/ci/example-repo"                # exact identity
+allowed_scopes = ["github:example-org/example-repo"]
 
 [[issuance.clients]]
-spiffe = "spiffe://pit/team/platform/*"          # trailing-* prefix match
-allowed_scopes = ["anthropic", "mistral", "github:pitorg/*", "github:pit-customer/*"]
+spiffe = "spiffe://example/team/platform/*"          # trailing-* prefix match
+allowed_scopes = ["anthropic", "mistral", "github:example-org/*", "github:customer-org/*"]
 
 # --- Unscoped API upstream ---
 [[upstreams]]

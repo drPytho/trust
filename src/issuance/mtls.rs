@@ -30,10 +30,10 @@ mod tests {
 
     #[test]
     fn extracts_spiffe_uri() {
-        let der = client_cert_der_with_uri("spiffe://pit/ci/pit-ts");
+        let der = client_cert_der_with_uri("spiffe://example/ci/example-repo");
         assert_eq!(
             extract_spiffe(&der).as_deref(),
-            Some("spiffe://pit/ci/pit-ts")
+            Some("spiffe://example/ci/example-repo")
         );
     }
 

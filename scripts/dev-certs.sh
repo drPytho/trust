@@ -4,7 +4,7 @@
 #   - client-ca.crt/key   : the CA that signs client certs ([issuance].client_ca_path)
 #   - client.crt/key      : a client cert with a SPIFFE URI SAN (the caller identity)
 #
-# The SPIFFE id defaults to spiffe://pit/dev/local — add a matching
+# The SPIFFE id defaults to spiffe://example/dev/local — add a matching
 # [[issuance.clients]] entry granting the scopes that identity may mint.
 #
 # NOT for production. In prod, server certs come from your PKI/ACME and client
@@ -12,7 +12,7 @@
 set -euo pipefail
 
 DIR="${1:-certs}"
-SPIFFE="${SPIFFE_ID:-spiffe://pit/dev/local}"
+SPIFFE="${SPIFFE_ID:-spiffe://example/dev/local}"
 mkdir -p "$DIR"
 cd "$DIR"
 

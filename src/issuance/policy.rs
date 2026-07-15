@@ -58,12 +58,12 @@ mod tests {
     fn entries() -> Vec<ClientEntry> {
         vec![
             ClientEntry {
-                spiffe: "spiffe://pit/ci/pit-ts".into(),
-                allowed_scopes: vec!["github:pitorg/pit-ts".into()],
+                spiffe: "spiffe://example/ci/example-repo".into(),
+                allowed_scopes: vec!["github:example-org/example-repo".into()],
             },
             ClientEntry {
-                spiffe: "spiffe://pit/team/platform/*".into(),
-                allowed_scopes: vec!["anthropic".into(), "github:pitorg/*".into()],
+                spiffe: "spiffe://example/team/platform/*".into(),
+                allowed_scopes: vec!["anthropic".into(), "github:example-org/*".into()],
             },
         ]
     }
@@ -71,22 +71,24 @@ mod tests {
     #[test]
     fn exact_match() {
         let p = ClientPolicy::new(&entries()).unwrap();
-        let s = p.allowed_scopes("spiffe://pit/ci/pit-ts").unwrap();
-        assert_eq!(s.to_scope_string(), "github:pitorg/pit-ts");
+        let s = p
+            .allowed_scopes("spiffe://example/ci/example-repo")
+            .unwrap();
+        assert_eq!(s.to_scope_string(), "github:example-org/example-repo");
     }
 
     #[test]
     fn prefix_match() {
         let p = ClientPolicy::new(&entries()).unwrap();
         let s = p
-            .allowed_scopes("spiffe://pit/team/platform/build-42")
+            .allowed_scopes("spiffe://example/team/platform/build-42")
             .unwrap();
-        assert_eq!(s.to_scope_string(), "anthropic github:pitorg/*");
+        assert_eq!(s.to_scope_string(), "anthropic github:example-org/*");
     }
 
     #[test]
     fn no_match_is_none() {
         let p = ClientPolicy::new(&entries()).unwrap();
-        assert!(p.allowed_scopes("spiffe://pit/other/x").is_none());
+        assert!(p.allowed_scopes("spiffe://example/other/x").is_none());
     }
 }

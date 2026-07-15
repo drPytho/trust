@@ -28,7 +28,7 @@ jwks_addr      = "0.0.0.0:8080"
 
 # The dev client cert's SPIFFE id (from scripts/dev-certs.sh) → may mint `anthropic`.
 [[issuance.clients]]
-spiffe         = "spiffe://pit/dev/local"
+spiffe         = "spiffe://example/dev/local"
 allowed_scopes = ["anthropic"]
 
 [[upstreams]]
