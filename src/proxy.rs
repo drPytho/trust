@@ -9,11 +9,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::{Upstream, UpstreamKind, UpstreamMode};
 use crate::credentials::{CredentialManager, CredentialProvider};
-use crate::decision::{authorize, extract_bearer};
+use crate::decision::{authorize, extract_bearer, extract_client_token};
 use crate::git::backend;
 use crate::git::classify::{GitRequest, classify};
 use crate::git::mirror::MirrorStore;
 use crate::git::sync::SyncManager;
+use crate::github_cli::{
+    MAX_GRAPHQL_BODY_BYTES, is_graphql_path, repository_from_graphql, rest_upstream_path,
+};
 use crate::inject::{inject, injection_value};
 use crate::jwt::Verifier;
 use crate::keystore::Keystore;
@@ -226,6 +229,17 @@ fn git_tail<'a>(path: &'a str, owner: &str, repo: &str) -> Option<&'a str> {
     None
 }
 
+fn rewrite_request_path(session: &mut Session, path: &str) -> Result<()> {
+    let path_and_query = match session.req_header().uri.query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path.to_string(),
+    };
+    session
+        .req_header_mut()
+        .set_raw_path(path_and_query.as_bytes())
+        .map_err(|_| Error::new_str("failed to rewrite request path"))
+}
+
 #[async_trait]
 impl ProxyHttp for ProxyService {
     type CTX = RequestCtx;
@@ -274,16 +288,20 @@ impl ProxyHttp for ProxyService {
         // Verify the JWT. Proxy-Authorization is accepted for every mode and
         // required for passthrough so the caller's Authorization header can be
         // forwarded unchanged. Inject mode retains Authorization compatibility.
+        let github_cli = upstream.resource == Some(ResourceKind::GithubCliRepo);
         let headers = &session.req_header().headers;
-        let auth = headers
-            .get("proxy-authorization")
-            .or_else(|| {
-                (upstream.mode == UpstreamMode::Inject)
-                    .then(|| headers.get("authorization"))
-                    .flatten()
-            })
-            .map(|value| value.as_bytes().to_vec());
-        let Some(token) = extract_bearer(auth.as_deref()) else {
+        let proxy_auth = headers.get("proxy-authorization");
+        let token = if let Some(proxy_auth) = proxy_auth {
+            extract_bearer(Some(proxy_auth.as_bytes()))
+        } else if upstream.mode == UpstreamMode::Inject {
+            extract_client_token(
+                headers.get("authorization").map(|value| value.as_bytes()),
+                github_cli,
+            )
+        } else {
+            None
+        };
+        let Some(token) = token else {
             return self
                 .reject(session, ctx, 401, "missing_token", b"missing token")
                 .await;
@@ -308,18 +326,116 @@ impl ProxyHttp for ProxyService {
             }
         };
 
-        // Authorize by scope (+ resource path).
-        let path = session.req_header().uri.path().to_string();
+        // GitHub CLI treats a custom GH_HOST as an Enterprise host. In the
+        // explicit compatibility mode, translate its REST prefix and inspect
+        // bounded GraphQL request bodies before authorizing or minting a token.
+        let original_path = session.req_header().uri.path().to_string();
         let method = session.req_header().method.as_str().to_string();
-        if !authorize(&scopes, &upstream, &method, &path) {
+        let mut policy_path = original_path.clone();
+        let mut upstream_path: Option<String> = None;
+        if github_cli && is_graphql_path(&original_path) {
+            if method != "POST" {
+                return self
+                    .reject(
+                        session,
+                        ctx,
+                        405,
+                        "unsupported_github_graphql",
+                        b"unsupported GitHub GraphQL request",
+                    )
+                    .await;
+            }
+            if session
+                .req_header()
+                .headers
+                .get("content-length")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<usize>().ok())
+                .is_some_and(|length| length > MAX_GRAPHQL_BODY_BYTES)
+            {
+                return self
+                    .reject(
+                        session,
+                        ctx,
+                        413,
+                        "github_graphql_body_too_large",
+                        b"GitHub GraphQL request too large",
+                    )
+                    .await;
+            }
+            let mut body = Vec::new();
+            session.as_mut().enable_retry_buffering();
+            loop {
+                match session.read_request_body().await {
+                    Ok(Some(chunk)) => {
+                        if body.len() + chunk.len() > MAX_GRAPHQL_BODY_BYTES {
+                            return self
+                                .reject(
+                                    session,
+                                    ctx,
+                                    413,
+                                    "github_graphql_body_too_large",
+                                    b"GitHub GraphQL request too large",
+                                )
+                                .await;
+                        }
+                        body.extend_from_slice(&chunk);
+                    }
+                    Ok(None) => break,
+                    Err(_) => {
+                        return self
+                            .reject(
+                                session,
+                                ctx,
+                                400,
+                                "invalid_github_graphql",
+                                b"invalid GitHub GraphQL request",
+                            )
+                            .await;
+                    }
+                }
+            }
+            let resource = match repository_from_graphql(&body) {
+                Ok(resource) => resource,
+                Err(error) => {
+                    log::warn!(
+                        "GitHub CLI GraphQL request rejected upstream={} reason={error}",
+                        upstream.name
+                    );
+                    return self
+                        .reject(
+                            session,
+                            ctx,
+                            403,
+                            "unsupported_github_graphql",
+                            b"unsupported GitHub GraphQL request",
+                        )
+                        .await;
+                }
+            };
+            policy_path = format!("/repos/{}/{}", resource.owner, resource.repo);
+            upstream_path = Some("/graphql".to_string());
+        } else if github_cli && let Some(path) = rest_upstream_path(&original_path) {
+            policy_path = path.to_string();
+            upstream_path = Some(path.to_string());
+        }
+
+        // Authorize by scope (+ the normalized or body-derived resource path).
+        if !authorize(&scopes, &upstream, &method, &policy_path) {
             return self
                 .reject(session, ctx, 403, "forbidden_scope", b"not allowed")
                 .await;
         }
 
+        if let Some(path) = upstream_path {
+            rewrite_request_path(session, &path)?;
+        }
+
         // --- git-cache branch ---
         if upstream.kind == UpstreamKind::GitCache {
-            return self.handle_git_cache(session, ctx, upstream, &path).await;
+            return self
+                .handle_git_cache(session, ctx, upstream, &policy_path)
+                .await;
         }
 
         if upstream.mode == UpstreamMode::Passthrough {
@@ -334,7 +450,11 @@ impl ProxyHttp for ProxyService {
             .as_ref()
             .ok_or_else(|| Error::new_str("inject upstream missing credential"))?
             .provider_name();
-        match self.credentials.resolve(&upstream, &method, &path).await {
+        match self
+            .credentials
+            .resolve(&upstream, &method, &policy_path)
+            .await
+        {
             Ok(credential) => {
                 self.metrics.credential_resolution(
                     &upstream.name,

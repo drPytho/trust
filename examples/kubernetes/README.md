@@ -64,6 +64,50 @@ owner = "ORG_TWO"
 installation_id = 222222
 ```
 
+The example also configures `github.proxy.internal` as a reverse-proxy-only
+GitHub CLI API endpoint and `git.proxy.internal` as its git-cache companion.
+Configure both names in cluster DNS to resolve to the `trust` Service, and add
+`github.proxy.internal` and `git.proxy.internal` to the reverse-proxy server
+certificate. The example uses an `emptyDir` for git mirrors; replace it with
+persistent storage when cache survival across Pod replacement matters.
+
+Mint a JWT with both exact repository scopes, then configure the sandbox:
+
+```bash
+TRUST_TOKEN=$(curl --fail --silent --show-error \
+  --cert /var/run/trust/client/tls.crt \
+  --key /var/run/trust/client/tls.key \
+  --cacert /var/run/trust/server/ca.crt \
+  https://trust.trust-system.svc:8443/token \
+  --data-urlencode 'grant_type=client_credentials' \
+  --data-urlencode 'scope=github:ORG/REPOSITORY github-git:ORG/REPOSITORY' \
+  | jq -r .access_token)
+
+export GH_HOST=github.proxy.internal
+export GH_ENTERPRISE_TOKEN="$TRUST_TOKEN"
+export GH_REPO=github.proxy.internal/ORG/REPOSITORY
+export SSL_CERT_FILE=/var/run/trust/server/ca.crt
+
+export GIT_CONFIG_COUNT=2
+export GIT_CONFIG_KEY_0=url.https://git.proxy.internal/.insteadOf
+export GIT_CONFIG_VALUE_0=https://github.proxy.internal/
+export GIT_CONFIG_KEY_1=http.https://git.proxy.internal/.extraHeader
+export GIT_CONFIG_VALUE_1="Authorization: Bearer $TRUST_TOKEN"
+export GIT_SSL_CAINFO=/var/run/trust/server/ca.crt
+
+gh repo view "$GH_REPO"
+gh pr list --repo "$GH_REPO"
+gh repo clone ORG/REPOSITORY
+```
+
+No CONNECT listener is involved. `gh` sends the trust JWT using its custom-host
+`token` authorization scheme; trust replaces it with an exact-repository
+GitHub App installation token. Supported GraphQL is deliberately read-only and
+repository-rooted. Global/account queries, mutations, search, node lookups,
+multiple operations, and bodies over 64 KiB are rejected. REST calls must be
+under `/repos/ORG/REPOSITORY/...`. See the main README for the complete command
+support and security boundary.
+
 Artifact Registry npm workers use a non-secret `.npmrc` pointing at the proxy
 and place their short-lived trust JWT in `TRUST_TOKEN`; they do not run
 `gcloud` or `google-artifactregistry-auth`. See the main README for the full

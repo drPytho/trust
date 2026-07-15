@@ -1499,6 +1499,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "graphql-parser"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a818c0d883d7c0801df27be910917750932be279c7bc82dc541b8769425f409"
+dependencies = [
+ "combine",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "group"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4127,6 +4137,7 @@ dependencies = [
  "google-cloud-auth",
  "google-cloud-gax 0.24.0",
  "google-cloud-secretmanager-v1",
+ "graphql-parser",
  "http-body-util",
  "humantime",
  "hyper",

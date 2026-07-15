@@ -48,6 +48,10 @@ pub enum ConfigError {
     BadGithubApp(String),
     #[error("github-app upstream '{0}' requires a GitHub repository resource")]
     GithubAppNeedsResource(String),
+    #[error(
+        "GitHub CLI upstream '{0}' must be an API inject upstream using GitHub App bearer credentials"
+    )]
+    BadGithubCliUpstream(String),
     #[error("gcp-adc upstream '{0}' requires Authorization bearer injection")]
     GcpAdcNeedsBearer(String),
     #[error("CONNECT upstream '{0}' must use api kind and passthrough mode")]
@@ -455,7 +459,9 @@ impl Config {
                 if !matches!(
                     ru.resource,
                     Some(RawResource {
-                        kind: ResourceKind::GithubRepo | ResourceKind::GitRepo
+                        kind: ResourceKind::GithubRepo
+                            | ResourceKind::GithubCliRepo
+                            | ResourceKind::GitRepo
                     })
                 ) {
                     return Err(ConfigError::GithubAppNeedsResource(ru.name));
@@ -470,6 +476,30 @@ impl Config {
                         "basic_username must be a non-empty HTTP Basic username".to_string(),
                     ));
                 }
+            }
+            if matches!(
+                ru.resource,
+                Some(RawResource {
+                    kind: ResourceKind::GithubCliRepo
+                })
+            ) && (ru.kind != UpstreamKind::Api
+                || ru.mode != UpstreamMode::Inject
+                || !matches!(
+                    credential,
+                    Some(CredentialSource::GithubApp {
+                        basic_username: None,
+                        ..
+                    })
+                )
+                || !matches!(
+                    injection,
+                    Some(Injection {
+                        ref header,
+                        scheme: InjectionScheme::Bearer,
+                    }) if header.eq_ignore_ascii_case("authorization")
+                ))
+            {
+                return Err(ConfigError::BadGithubCliUpstream(ru.name));
             }
             if matches!(credential, Some(CredentialSource::GcpAdc { .. }))
                 && !matches!(
@@ -919,6 +949,53 @@ allowed_methods = ["GET", "HEAD"]
         assert!(matches!(
             npm.credential,
             Some(CredentialSource::GcpAdc { .. })
+        ));
+    }
+
+    #[test]
+    fn parses_explicit_github_cli_repo_upstream() {
+        let github_cli = r#"
+[github_app]
+app_id = 123
+private_key_secret_ref = "github-app-key"
+
+[[github_app.installations]]
+owner = "pitorg"
+installation_id = 111
+
+[[upstreams]]
+name = "github-cli"
+kind = "api"
+listen_host = "github-cli.proxy.internal"
+origin = "https://api.github.com"
+credential = { kind = "github-app", permissions = { contents = "read", pull_requests = "read", issues = "read" } }
+injection = { header = "authorization", scheme = "bearer" }
+resource = { kind = "github-cli-repo" }
+"#;
+        let cfg = Config::from_str(&(GOOD.to_string() + github_cli)).unwrap();
+        let upstream = cfg
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.name == "github-cli")
+            .unwrap();
+        assert_eq!(upstream.resource, Some(ResourceKind::GithubCliRepo));
+    }
+
+    #[test]
+    fn rejects_github_cli_resource_without_app_bearer_injection() {
+        let bad = r#"
+[[upstreams]]
+name = "github-cli"
+kind = "api"
+listen_host = "github-cli.proxy.internal"
+origin = "https://api.github.com"
+secret_ref = "github-token"
+injection = { header = "authorization", scheme = "bearer" }
+resource = { kind = "github-cli-repo" }
+"#;
+        assert!(matches!(
+            Config::from_str(&(GOOD.to_string() + bad)),
+            Err(ConfigError::BadGithubCliUpstream(_))
         ));
     }
 
