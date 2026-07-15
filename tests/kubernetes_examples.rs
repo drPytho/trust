@@ -76,6 +76,10 @@ fn deployment_config_allowlists_google_api_connect_endpoints() {
         forward_proxy.tls,
         "example must protect proxy JWTs with TLS"
     );
+    assert!(
+        forward_proxy.audit_unmatched.is_none(),
+        "the production-oriented example must remain deny-by-default"
+    );
 
     for (name, host) in [
         ("gcp-pubsub", "pubsub.googleapis.com"),

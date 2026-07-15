@@ -225,6 +225,30 @@ listener uses the same verifier, scopes, upstream configuration, signing keys,
 rejection logs, and metrics as the reverse proxy. It does not create a second
 trust domain.
 
+For a temporary discovery rollout, enable the unmatched audit fallback and
+grant its dedicated scope only to the sandbox identities being inventoried:
+
+```toml
+[forward_proxy]
+addr = "0.0.0.0:6180"
+tls = true
+allow_private_ips = false
+audit_unmatched = { scope = "outbound-audit" }
+
+[[issuance.clients]]
+spiffe = "spiffe://example/workloads/sandbox-*"
+allowed_scopes = ["public-api", "outbound-audit"]
+```
+
+Every otherwise-unmatched CONNECT request emits a WARN log containing its
+hostname and port. Aggregate outcomes use the bounded Prometheus label
+`upstream="audit-unmatched"`; destinations are deliberately not metric labels.
+Exact configured destinations still require their own scopes, and private IP
+ranges remain blocked while `allow_private_ips = false`. After observing the
+workload, add explicit passthrough upstreams for approved destinations and
+remove both `audit_unmatched` and the `outbound-audit` grant. This mode covers
+HTTPS-style CONNECT traffic only, not plain HTTP absolute-form proxy requests.
+
 CONNECT carries an opaque TLS stream, so it cannot inject credentials or
 enforce HTTP paths or methods. Keep credential-injected endpoints on the
 reverse proxy (`https://anthropic.proxy.internal/...`, for example), and use

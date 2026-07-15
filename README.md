@@ -177,6 +177,8 @@ idle_timeout = "5m"
 max_tunnel_duration = "1h"
 max_concurrent_tunnels = 1024
 allow_private_ips = false
+# Temporary discovery mode for otherwise-unmatched CONNECT destinations:
+# audit_unmatched = { scope = "outbound-audit" }
 
 # JWT auth: issuer/audience embedded in minted tokens and verified on every request.
 [auth]
@@ -350,6 +352,38 @@ The proxy resolves DNS server-side and rejects loopback, link-local, private, un
 multicast, documentation, and carrier-grade NAT addresses by default. Set `allow_private_ips =
 true` only when explicitly configured internal upstreams are required. Tunnels end at JWT expiry,
 the idle timeout, or `max_tunnel_duration`, whichever comes first.
+
+#### Auditing unmatched outbound destinations
+
+During migration, the CONNECT listener can temporarily allow otherwise-unmatched destinations
+while inventorying them. This is opt-in and still requires a valid JWT with a dedicated bare scope:
+
+```toml
+[forward_proxy]
+addr = "0.0.0.0:6180"
+tls = true
+allow_private_ips = false
+audit_unmatched = { scope = "outbound-audit" }
+
+[[issuance.clients]]
+spiffe = "spiffe://pit/sandboxes/*"
+allowed_scopes = ["outbound-audit"]
+```
+
+For an unknown CONNECT authority, trust logs the requested hostname and port at `WARN`, verifies
+the JWT and `outbound-audit` scope, applies the normal DNS/private-IP checks and tunnel limits, and
+then records the result under
+`trust_connect_attempts_total{upstream="audit-unmatched",result="..."}`. Successful tunnels also
+use `audit-unmatched` in the active, duration, and byte metrics. Destination names are kept in logs
+rather than Prometheus labels to avoid unbounded metric cardinality. Authorization headers and
+tokens are never logged.
+
+Exact configured CONNECT destinations always take precedence and continue to require their named
+upstream scopes. Give a sandbox its intended named scopes plus `outbound-audit` during discovery,
+then convert observed destinations into explicit passthrough upstreams and remove the audit scope
+and setting to return to deny-by-default behavior. The audit fallback does not apply to reverse
+proxy hosts, private destinations when `allow_private_ips = false`, or plain HTTP requests sent via
+`HTTP_PROXY`; the forward listener remains CONNECT-only.
 
 ## Running
 

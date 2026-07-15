@@ -21,13 +21,51 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{Instant as TokioInstant, sleep_until, timeout};
 use tokio_rustls::TlsAcceptor;
 
-use crate::config::ForwardProxyConfig;
+use crate::config::{AUDIT_UNMATCHED_METRICS_NAME, ForwardProxyConfig};
 use crate::jwt::{VerifiedToken, Verifier};
 use crate::keystore::Keystore;
 use crate::metrics::ProxyMetrics;
 use crate::router::Router;
 
 type ResponseBody = Full<Bytes>;
+
+enum ConnectDestination {
+    Configured(Arc<crate::config::Upstream>),
+    Audit {
+        host: String,
+        port: u16,
+        scope: String,
+    },
+}
+
+impl ConnectDestination {
+    fn metrics_name(&self) -> &str {
+        match self {
+            ConnectDestination::Configured(upstream) => &upstream.name,
+            ConnectDestination::Audit { .. } => AUDIT_UNMATCHED_METRICS_NAME,
+        }
+    }
+
+    fn required_scope(&self) -> &str {
+        match self {
+            ConnectDestination::Configured(upstream) => &upstream.name,
+            ConnectDestination::Audit { scope, .. } => scope,
+        }
+    }
+
+    fn target(&self) -> (&str, u16) {
+        match self {
+            ConnectDestination::Configured(upstream) => {
+                (&upstream.origin.host, upstream.origin.port)
+            }
+            ConnectDestination::Audit { host, port, .. } => (host, *port),
+        }
+    }
+
+    fn is_audit(&self) -> bool {
+        matches!(self, ConnectDestination::Audit { .. })
+    }
+}
 
 pub struct ConnectProxy {
     router: Arc<Router>,
@@ -83,28 +121,49 @@ impl ConnectProxy {
                 .connect_attempt("unrouted", "invalid_authority");
             return Ok(response(StatusCode::BAD_REQUEST, "CONNECT port required\n"));
         };
-        let host = authority.host();
-        let Some(upstream) = self.router.resolve_connect(host, port) else {
-            self.metrics
-                .connect_attempt("unrouted", "unknown_destination");
-            log::warn!("CONNECT rejected reason=unknown_destination port={port}");
-            return Ok(response(StatusCode::FORBIDDEN, "destination not allowed\n"));
+        let host = authority.host().to_string();
+        let destination = match self.router.resolve_connect(&host, port) {
+            Some(upstream) => ConnectDestination::Configured(upstream),
+            None => match &self.config.audit_unmatched {
+                Some(audit) => {
+                    log::warn!(
+                        "CONNECT unmatched destination observed action=audit_allow_pending_auth \
+                         destination_host={host:?} destination_port={port} required_scope={:?}",
+                        audit.scope
+                    );
+                    ConnectDestination::Audit {
+                        host: host.clone(),
+                        port,
+                        scope: audit.scope.clone(),
+                    }
+                }
+                None => {
+                    self.metrics
+                        .connect_attempt("unrouted", "unknown_destination");
+                    log::warn!(
+                        "CONNECT rejected reason=unknown_destination destination_host={host:?} \
+                         destination_port={port}"
+                    );
+                    return Ok(response(StatusCode::FORBIDDEN, "destination not allowed\n"));
+                }
+            },
         };
+        let metrics_name = destination.metrics_name();
 
         let token = match proxy_token(request.headers().get(PROXY_AUTHORIZATION)) {
             Ok(token) => token,
             Err(reason) => {
-                self.metrics.connect_attempt(&upstream.name, reason);
+                self.metrics.connect_attempt(metrics_name, reason);
                 log::warn!(
-                    "CONNECT rejected reason={reason} upstream={} port={port}",
-                    upstream.name
+                    "CONNECT rejected reason={reason} upstream={metrics_name} \
+                     destination_host={host:?} destination_port={port}"
                 );
                 return Ok(proxy_auth_required());
             }
         };
         let Some(keys) = self.keystore.load() else {
             self.metrics
-                .connect_attempt(&upstream.name, "signing_keys_unavailable");
+                .connect_attempt(metrics_name, "signing_keys_unavailable");
             return Ok(response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "signing keys unavailable\n",
@@ -113,36 +172,34 @@ impl ConnectProxy {
         let verified = match self.verifier.verify_token(&keys, &token) {
             Ok(verified) => verified,
             Err(_) => {
-                self.metrics
-                    .connect_attempt(&upstream.name, "invalid_token");
+                self.metrics.connect_attempt(metrics_name, "invalid_token");
                 return Ok(proxy_auth_required());
             }
         };
-        if !verified.scopes.permits(&upstream.name, None) {
+        if !verified.scopes.permits(destination.required_scope(), None) {
             self.metrics
-                .connect_attempt(&upstream.name, "forbidden_scope");
+                .connect_attempt(metrics_name, "forbidden_scope");
             log::warn!(
-                "CONNECT rejected reason=forbidden_scope upstream={} subject={:?}",
-                upstream.name,
-                verified.subject
+                "CONNECT rejected reason=forbidden_scope upstream={metrics_name} subject={:?} \
+                 destination_host={host:?} destination_port={port}",
+                verified.subject,
             );
             return Ok(response(StatusCode::FORBIDDEN, "not allowed\n"));
         }
 
         let Some(max_duration) = tunnel_duration(&verified, self.config.max_tunnel_duration) else {
-            self.metrics
-                .connect_attempt(&upstream.name, "invalid_token");
+            self.metrics.connect_attempt(metrics_name, "invalid_token");
             return Ok(proxy_auth_required());
         };
         let tunnel_slot = match self.tunnel_slots.clone().try_acquire_owned() {
             Ok(slot) => slot,
             Err(_) => {
                 self.metrics
-                    .connect_attempt(&upstream.name, "capacity_exceeded");
+                    .connect_attempt(metrics_name, "capacity_exceeded");
                 log::warn!(
-                    "CONNECT rejected reason=capacity_exceeded upstream={} subject={:?}",
-                    upstream.name,
-                    verified.subject
+                    "CONNECT rejected reason=capacity_exceeded upstream={metrics_name} \
+                     subject={:?} destination_host={host:?} destination_port={port}",
+                    verified.subject,
                 );
                 return Ok(response(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -151,9 +208,10 @@ impl ConnectProxy {
             }
         };
 
+        let (target_host, target_port) = destination.target();
         let target = match connect_target(
-            &upstream.origin.host,
-            upstream.origin.port,
+            target_host,
+            target_port,
             self.config.allow_private_ips,
             self.config.connect_timeout,
         )
@@ -166,20 +224,27 @@ impl ConnectProxy {
                 } else {
                     "connect_failed"
                 };
-                self.metrics.connect_attempt(&upstream.name, reason);
+                self.metrics.connect_attempt(metrics_name, reason);
                 log::warn!(
-                    "CONNECT target failed reason={reason} upstream={} subject={:?}: {error}",
-                    upstream.name,
-                    verified.subject
+                    "CONNECT target failed reason={reason} upstream={metrics_name} subject={:?} \
+                     destination_host={host:?} destination_port={port}: {error}",
+                    verified.subject,
                 );
                 return Ok(response(StatusCode::BAD_GATEWAY, "connection failed\n"));
             }
         };
 
         let upgrade = hyper::upgrade::on(&mut request);
-        self.metrics.connect_started(&upstream.name);
+        self.metrics.connect_started(metrics_name);
+        if destination.is_audit() {
+            log::warn!(
+                "CONNECT unmatched destination allowed action=audit_allow result=established \
+                 destination_host={host:?} destination_port={port} subject={:?}",
+                verified.subject
+            );
+        }
         let state = self.clone();
-        let upstream_name = upstream.name.clone();
+        let upstream_name = metrics_name.to_string();
         let subject = verified.subject;
         tokio::spawn(async move {
             let _tunnel_slot = tunnel_slot;
@@ -459,7 +524,7 @@ pub async fn serve_connect(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Origin, Upstream, UpstreamKind, UpstreamMode};
+    use crate::config::{AuditUnmatchedConfig, Origin, Upstream, UpstreamKind, UpstreamMode};
     use crate::jwt::Issuer;
     use crate::keystore::build_key_material;
     use crate::scope::ScopeSet;
@@ -578,6 +643,7 @@ mod tests {
                 max_tunnel_duration: Duration::from_secs(30),
                 max_concurrent_tunnels: 10,
                 allow_private_ips: true,
+                audit_unmatched: None,
             },
         ));
         let server = tokio::spawn(serve_connect(listener, None, state));
@@ -651,6 +717,115 @@ mod tests {
                 "trust_connect_bytes_total{direction=\"to_upstream\",upstream=\"docs\"} 19"
             )
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn audit_unmatched_allows_scoped_destination_and_records_metrics() {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = target.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut stream, _) = target.accept().await.unwrap();
+            let mut buffer = [0_u8; 64];
+            let read = stream.read(&mut buffer).await.unwrap();
+            stream.write_all(&buffer[..read]).await.unwrap();
+        });
+
+        let keystore = Arc::new(Keystore::new());
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        keystore.store(build_key_material(&key.serialize_pem(), None).unwrap());
+        let keys = keystore.load().unwrap();
+        let issuer = Issuer::new("trust".into(), "proxy".into(), Duration::from_secs(60));
+        let now = jsonwebtoken::get_current_timestamp();
+        let allowed = issuer
+            .mint(
+                &keys,
+                "sandbox-audit",
+                &ScopeSet::parse("outbound-audit").unwrap(),
+                now,
+            )
+            .unwrap();
+        let forbidden = issuer
+            .mint(
+                &keys,
+                "sandbox-audit",
+                &ScopeSet::parse("other").unwrap(),
+                now,
+            )
+            .unwrap();
+
+        let metrics = Arc::new(ProxyMetrics::new());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let state = Arc::new(ConnectProxy::new(
+            Arc::new(Router::new(&[])),
+            Arc::new(Verifier::new("trust".into(), "proxy".into())),
+            keystore,
+            metrics.clone(),
+            ForwardProxyConfig {
+                addr: proxy_addr.to_string(),
+                tls: false,
+                connect_timeout: Duration::from_secs(1),
+                idle_timeout: Duration::from_secs(5),
+                max_tunnel_duration: Duration::from_secs(30),
+                max_concurrent_tunnels: 10,
+                allow_private_ips: true,
+                audit_unmatched: Some(AuditUnmatchedConfig {
+                    scope: "outbound-audit".into(),
+                }),
+            },
+        ));
+        let server = tokio::spawn(serve_connect(listener, None, state));
+        let authority = format!("127.0.0.1:{target_port}");
+
+        let mut denied = TcpStream::connect(proxy_addr).await.unwrap();
+        denied
+            .write_all(
+                format!(
+                    "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Authorization: Bearer {forbidden}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            read_response_head(&mut denied)
+                .await
+                .starts_with("HTTP/1.1 403")
+        );
+
+        let mut tunnel = TcpStream::connect(proxy_addr).await.unwrap();
+        tunnel
+            .write_all(
+                format!(
+                    "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Authorization: Bearer {allowed}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            read_response_head(&mut tunnel)
+                .await
+                .starts_with("HTTP/1.1 200")
+        );
+        tunnel.write_all(b"audit me").await.unwrap();
+        let mut echoed = [0_u8; 8];
+        tunnel.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"audit me");
+        drop(tunnel);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(rendered.contains(
+            "trust_connect_attempts_total{result=\"forbidden_scope\",upstream=\"audit-unmatched\"} 1"
+        ));
+        assert!(rendered.contains(
+            "trust_connect_attempts_total{result=\"established\",upstream=\"audit-unmatched\"} 1"
+        ));
+        assert!(rendered.contains(
+            "trust_connect_bytes_total{direction=\"to_upstream\",upstream=\"audit-unmatched\"} 8"
+        ));
         server.abort();
     }
 }
