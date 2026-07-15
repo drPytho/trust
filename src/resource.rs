@@ -6,6 +6,7 @@ use crate::scope::Resource;
 #[serde(rename_all = "kebab-case")]
 pub enum ResourceKind {
     GithubRepo,
+    GithubCliRepo,
     GitRepo,
     ArtifactRegistryRepo,
 }
@@ -28,8 +29,16 @@ const GIT_SUFFIXES: &[&str] = &["/info/refs", "/git-upload-pack", "/git-receive-
 
 pub fn extract(kind: ResourceKind, path: &str) -> Option<Resource> {
     match kind {
-        ResourceKind::GithubRepo => {
+        ResourceKind::GithubRepo | ResourceKind::GithubCliRepo => {
             // /repos/{owner}/{repo}/...
+            // GitHub CLI treats a custom GH_HOST as GitHub Enterprise and
+            // prefixes REST requests with /api/v3. The explicit CLI resource
+            // kind accepts both that shape and GitHub.com's native shape.
+            let path = if kind == ResourceKind::GithubCliRepo {
+                path.strip_prefix("/api/v3").unwrap_or(path)
+            } else {
+                path
+            };
             let mut segs = path.split('/').filter(|s| !s.is_empty());
             if segs.next()? != "repos" {
                 return None;
@@ -106,6 +115,17 @@ mod tests {
     #[test]
     fn github_repo_trims_dot_git() {
         let r = extract(ResourceKind::GithubRepo, "/repos/pitorg/pit-ts.git").unwrap();
+        assert_eq!(r.repo, "pit-ts");
+    }
+
+    #[test]
+    fn github_cli_repo_accepts_enterprise_rest_prefix() {
+        let r = extract(
+            ResourceKind::GithubCliRepo,
+            "/api/v3/repos/pitorg/pit-ts/pulls",
+        )
+        .unwrap();
+        assert_eq!(r.owner, "pitorg");
         assert_eq!(r.repo, "pit-ts");
     }
 

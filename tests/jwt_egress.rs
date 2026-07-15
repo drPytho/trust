@@ -36,16 +36,65 @@ fn start_mock_upstream() -> (u16, Arc<Mutex<Vec<String>>>) {
                 Ok(s) => s,
                 Err(_) => continue,
             };
+            let mut request = Vec::new();
             let mut buf = [0u8; 4096];
-            let n = stream.read(&mut buf).unwrap_or(0);
+            loop {
+                let n = stream.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+                let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
             sink.lock()
                 .unwrap()
-                .push(String::from_utf8_lossy(&buf[..n]).to_string());
+                .push(String::from_utf8_lossy(&request).to_string());
             let _ = stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
         }
     });
     (port, received)
+}
+
+fn raw_json_request(
+    proxy_port: u16,
+    host: &str,
+    path: &str,
+    auth_scheme: &str,
+    token: &str,
+    body: &str,
+) -> (u16, String) {
+    let mut stream = TcpStream::connect(("127.0.0.1", proxy_port)).unwrap();
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: {auth_scheme} {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(req.as_bytes()).unwrap();
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).unwrap();
+    let status = resp
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(0);
+    (status, resp)
 }
 
 fn free_port() -> u16 {
@@ -71,6 +120,28 @@ fn raw_request(proxy_port: u16, host: &str, path: &str, bearer: Option<&str>) ->
         .next()
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|c| c.parse::<u16>().ok())
+        .unwrap_or(0);
+    (status, resp)
+}
+
+fn raw_request_with_authorization(
+    proxy_port: u16,
+    host: &str,
+    path: &str,
+    authorization: &str,
+) -> (u16, String) {
+    let mut stream = TcpStream::connect(("127.0.0.1", proxy_port)).unwrap();
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: {authorization}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).unwrap();
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).unwrap();
+    let status = resp
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
         .unwrap_or(0);
     (status, resp)
 }
@@ -268,6 +339,129 @@ fn jwt_scoped_egress_end_to_end() {
         lower.contains("host: 127.0.0.1"),
         "host not rewritten: {last}"
     );
+}
+
+#[test]
+fn github_cli_rest_and_repo_rooted_graphql_are_proxied_without_connect() {
+    let (mock_port, upstream_reqs) = start_mock_upstream();
+    let keystore = Arc::new(Keystore::new());
+    keystore.store(build_key_material(&signing_key_pem(), None).unwrap());
+    let km = keystore.load().unwrap();
+    let issuer = Issuer::new(
+        "trust".into(),
+        "trust-proxy".into(),
+        Duration::from_secs(3600),
+    );
+    let token = issuer
+        .mint(
+            &km,
+            "spiffe://pit/sandbox/test",
+            &ScopeSet::parse("github:pitorg/pit-ts").unwrap(),
+            jsonwebtoken::get_current_timestamp(),
+        )
+        .unwrap();
+
+    let mut upstream = (*scoped_upstream(mock_port)).clone();
+    upstream.resource = Some(ResourceKind::GithubCliRepo);
+    upstream.listen_host = "github-cli.test".into();
+    let service = ProxyService::new(
+        Router::new(&[Arc::new(upstream)]),
+        Verifier::new("trust".into(), "trust-proxy".into()),
+        keystore,
+        Arc::new(FakeSecretProvider::new(&[(
+            "ref/gh",
+            "INJECTED-INSTALLATION-TOKEN",
+        )])),
+        Arc::new(MirrorStore::new("/tmp")),
+        Arc::new(SyncManager::new()),
+    );
+    let proxy_port = free_port();
+    let addr = format!("127.0.0.1:{proxy_port}");
+    std::thread::spawn(move || {
+        let mut server = Server::new(None).unwrap();
+        server.bootstrap();
+        let mut proxy = http_proxy_service(&server.configuration, service);
+        proxy.add_tcp(&addr);
+        server.add_service(proxy);
+        server.run_forever();
+    });
+    for _ in 0..50 {
+        if TcpStream::connect(("127.0.0.1", proxy_port)).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // `gh api` uses the Enterprise REST prefix and the `token` auth scheme.
+    assert_eq!(
+        raw_request_with_authorization(
+            proxy_port,
+            "github-cli.test",
+            "/api/v3/repos/pitorg/pit-ts/pulls",
+            &format!("token {token}"),
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        raw_request_with_authorization(
+            proxy_port,
+            "github-cli.test",
+            "/api/v3/repos/pitorg/other/pulls",
+            &format!("token {token}"),
+        )
+        .0,
+        403
+    );
+
+    let graphql = serde_json::json!({
+        "query": "query PullRequestList($owner: String!, $repo: String!) { repository(owner: $owner, name: $repo) { pullRequests(first: 10) { totalCount } } }",
+        "variables": {"owner": "pitorg", "repo": "pit-ts"}
+    })
+    .to_string();
+    assert_eq!(
+        raw_json_request(
+            proxy_port,
+            "github-cli.test",
+            "/api/graphql",
+            "token",
+            &token,
+            &graphql,
+        )
+        .0,
+        200
+    );
+
+    // Global GraphQL operations fail before reaching the upstream.
+    let global = serde_json::json!({
+        "query": "query Viewer { viewer { login } }",
+        "variables": {"owner": "pitorg", "repo": "pit-ts"}
+    })
+    .to_string();
+    assert_eq!(
+        raw_json_request(
+            proxy_port,
+            "github-cli.test",
+            "/api/graphql",
+            "token",
+            &token,
+            &global,
+        )
+        .0,
+        403
+    );
+
+    std::thread::sleep(Duration::from_millis(100));
+    let requests = upstream_reqs.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].starts_with("GET /repos/pitorg/pit-ts/pulls HTTP/1.1"));
+    assert!(requests[1].starts_with("POST /graphql HTTP/1.1"));
+    assert!(requests[1].ends_with(&graphql));
+    for request in requests.iter() {
+        let lower = request.to_ascii_lowercase();
+        assert!(lower.contains("authorization: bearer injected-installation-token"));
+        assert!(!request.contains(&token));
+    }
 }
 
 #[test]

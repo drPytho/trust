@@ -6,7 +6,8 @@ use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 use serde_yaml_ng::Value;
-use trust::config::{Config, UpstreamMode};
+use trust::config::{Config, UpstreamKind, UpstreamMode};
+use trust::resource::ResourceKind;
 
 fn example_path(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -96,6 +97,32 @@ fn deployment_config_allowlists_google_api_connect_endpoints() {
     let allowed_scopes = &config.issuance.clients[0].allowed_scopes;
     assert!(allowed_scopes.iter().any(|scope| scope == "gcp-pubsub"));
     assert!(allowed_scopes.iter().any(|scope| scope == "gcp-storage"));
+
+    let github = config
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.name == "github")
+        .expect("example must include the GitHub CLI API upstream");
+    assert_eq!(github.resource, Some(ResourceKind::GithubCliRepo));
+    assert_eq!(github.origin.host, "api.github.com");
+
+    let github_git = config
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.name == "github-git")
+        .expect("example must include the gh git subprocess upstream");
+    assert_eq!(github_git.kind, UpstreamKind::GitCache);
+    assert_eq!(github_git.resource, Some(ResourceKind::GitRepo));
+    assert!(
+        allowed_scopes
+            .iter()
+            .any(|scope| scope == "github:ORG/REPOSITORY")
+    );
+    assert!(
+        allowed_scopes
+            .iter()
+            .any(|scope| scope == "github-git:ORG/REPOSITORY")
+    );
 }
 
 #[test]

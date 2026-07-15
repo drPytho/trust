@@ -44,7 +44,15 @@ data:
 
     [[issuance.clients]]
     spiffe = "spiffe://example/workloads/*"
-    allowed_scopes = ["anthropic", "public-api", "gcp-pubsub", "gcp-storage"]
+    allowed_scopes = ["anthropic", "github:ORG/REPOSITORY", "github-git:ORG/REPOSITORY", "public-api", "gcp-pubsub", "gcp-storage"]
+
+    [github_app]
+    app_id = 123456
+    private_key_secret_ref = "projects/PROJECT_ID/secrets/github-app-key/versions/latest"
+
+    [[github_app.installations]]
+    owner = "ORG"
+    installation_id = 111111
 
     [[upstreams]]
     name = "anthropic"
@@ -53,6 +61,28 @@ data:
     origin = "https://api.anthropic.com"
     secret_ref = "projects/PROJECT_ID/secrets/anthropic-key/versions/latest"
     injection = { header = "x-api-key", scheme = "raw" }
+
+    # Reverse-proxy-only GitHub CLI API. gh supplies the trust JWT as its
+    # enterprise token; trust injects an exact-repository installation token.
+    [[upstreams]]
+    name = "github"
+    kind = "api"
+    listen_host = "github.proxy.internal"
+    origin = "https://api.github.com"
+    credential = { kind = "github-app", permissions = { contents = "read", pull_requests = "read", issues = "read" } }
+    injection = { header = "authorization", scheme = "bearer" }
+    resource = { kind = "github-cli-repo" }
+
+    # git subprocesses spawned by gh are rewritten to this cache endpoint.
+    [[upstreams]]
+    name = "github-git"
+    kind = "git-cache"
+    listen_host = "git.proxy.internal"
+    origin = "https://github.com"
+    credential = { kind = "github-app", permissions = { contents = "read" }, basic_username = "x-access-token" }
+    injection = { header = "authorization", scheme = "basic" }
+    resource = { kind = "git-repo" }
+    git = { storage_path = "/var/lib/trust/mirrors" }
 
     [[upstreams]]
     name = "public-api"
@@ -143,6 +173,8 @@ spec:
             - name: tls
               mountPath: /etc/trust/tls
               readOnly: true
+            - name: git-mirrors
+              mountPath: /var/lib/trust/mirrors
       volumes:
         - name: config
           configMap:
@@ -150,6 +182,8 @@ spec:
         - name: tls
           secret:
             secretName: trust-tls
+        - name: git-mirrors
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service

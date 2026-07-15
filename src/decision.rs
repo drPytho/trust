@@ -4,9 +4,21 @@ use crate::scope::ScopeSet;
 
 /// Extract the raw bearer token (a JWT here) from an Authorization header value.
 pub fn extract_bearer(header: Option<&[u8]>) -> Option<String> {
+    extract_client_token(header, false)
+}
+
+/// Extract the trust JWT from the client authentication header. GitHub CLI
+/// sends `Authorization: token ...` to custom hosts; that alternate scheme is
+/// accepted only by an explicitly configured GitHub CLI upstream.
+pub fn extract_client_token(header: Option<&[u8]>, allow_github_token: bool) -> Option<String> {
     let raw = header?;
     let text = std::str::from_utf8(raw).ok()?;
-    let token = text.strip_prefix("Bearer ")?;
+    let (scheme, token) = text.split_once(' ')?;
+    if !(scheme.eq_ignore_ascii_case("bearer")
+        || allow_github_token && scheme.eq_ignore_ascii_case("token"))
+    {
+        return None;
+    }
     if token.is_empty() {
         return None;
     }
@@ -73,8 +85,14 @@ mod tests {
     #[test]
     fn extract_bearer_parses() {
         assert_eq!(extract_bearer(Some(b"Bearer abc")).as_deref(), Some("abc"));
+        assert_eq!(extract_bearer(Some(b"bearer abc")).as_deref(), Some("abc"));
         assert!(extract_bearer(None).is_none());
         assert!(extract_bearer(Some(b"Basic abc")).is_none());
+        assert!(extract_bearer(Some(b"token abc")).is_none());
+        assert_eq!(
+            extract_client_token(Some(b"token abc"), true).as_deref(),
+            Some("abc")
+        );
     }
 
     #[test]

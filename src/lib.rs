@@ -3,6 +3,7 @@ pub mod connect;
 pub mod credentials;
 pub mod decision;
 pub mod git;
+pub mod github_cli;
 pub mod inject;
 pub mod issuance;
 pub mod jwt;

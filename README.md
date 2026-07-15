@@ -141,7 +141,8 @@ Rules:
   `HTTPS_PROXY` clients. Only explicitly enabled `host:port` destinations are reachable, and every
   tunnel requires a scoped JWT.
 - **Repo-scoped authz** for `github-repo` upstreams — the request path is parsed for
-  `owner/repo`; the JWT scope must cover it.
+  `owner/repo`; the JWT scope must cover it. `github-cli-repo` additionally supports the
+  GitHub Enterprise-style REST and repository-rooted GraphQL requests emitted by `gh`.
 - **git-cache upstream** — serves `git clone`/`fetch` from a local bare mirror (fresh refs,
   cached objects; incremental `git fetch` per read, no TTL); passes `git push` through to
   the origin. Reuses JWT auth and repo-scoped authz (`git-repo` resource).
@@ -199,7 +200,7 @@ jwks_addr       = "0.0.0.0:8080"
 # Per-identity issuance policy.  spiffe may end with `*` for a prefix match.
 [[issuance.clients]]
 spiffe         = "spiffe://pit/ci/pit-ts"
-allowed_scopes = ["github:pitorg/pit-ts"]
+allowed_scopes = ["github:pitorg/pit-ts", "github-git:pitorg/pit-ts"]
 
 [[issuance.clients]]
 spiffe         = "spiffe://pit/team/platform/*"
@@ -234,9 +235,9 @@ name        = "github"
 kind        = "api"
 listen_host = "github.proxy.internal"
 origin      = "https://api.github.com"
-credential  = { kind = "github-app", permissions = { contents = "read", pull_requests = "read" } }
+credential  = { kind = "github-app", permissions = { contents = "read", pull_requests = "read", issues = "read" } }
 injection   = { header = "authorization", scheme = "bearer" }
-resource    = { kind = "github-repo" }   # enables per-repo scope authz
+resource    = { kind = "github-cli-repo" } # native REST plus fail-closed gh CLI compatibility
 
 # Read-only npm access through GCP Artifact Registry. The proxy obtains the upstream token via
 # ADC; grant its workload identity Artifact Registry Reader on only this repository.
@@ -264,7 +265,7 @@ allow_connect = true
 # git-cache upstream: bare mirror + pass-through push.
 # Requires `git` in PATH where trust runs.
 [[upstreams]]
-name        = "git-mirror"
+name        = "github-git"
 kind        = "git-cache"
 listen_host = "git.proxy.internal"
 origin      = "https://github.com"
@@ -376,7 +377,8 @@ TRUST_CONFIG=./config.toml RUST_LOG=info cargo run --release
 JWT=$(curl -s --cert client.crt --key client.key \
   --cacert server-ca.pem \
   https://trust.pit.internal:8443/token \
-  -d "grant_type=client_credentials&scope=github:pitorg/pit-ts" \
+  --data-urlencode "grant_type=client_credentials" \
+  --data-urlencode "scope=github:pitorg/pit-ts github-git:pitorg/pit-ts" \
   | jq -r .access_token)
 ```
 
@@ -384,7 +386,7 @@ JWT=$(curl -s --cert client.crt --key client.key \
 
 ```bash
 # API call through the proxy:
-curl -H "Authorization: Bearer $JWT" \
+curl -H "Authorization: Bearer $ANTHROPIC_JWT" \
   -H "Host: anthropic.proxy.internal" \
   https://trust.pit.internal:6443/v1/messages
 
@@ -403,6 +405,52 @@ git -c http.extraHeader="Authorization: Bearer $JWT" \
 git -c http.extraHeader="Authorization: Bearer $JWT" \
   push https://git.proxy.internal/pitorg/pit-ts.git HEAD:main
 ```
+
+### GitHub CLI without CONNECT
+
+Configure the GitHub API upstream with `resource = { kind = "github-cli-repo" }`, then point
+`gh` at its reverse-proxy hostname. Because `gh` treats a custom host as GitHub Enterprise,
+trust rewrites `/api/v3/...` to GitHub.com's REST paths and `/api/graphql` to `/graphql`. The
+value in `GH_ENTERPRISE_TOKEN` is the trust JWT, not a GitHub token:
+
+```bash
+export GH_HOST=github.proxy.internal
+export GH_ENTERPRISE_TOKEN="$JWT"
+export GH_REPO=github.proxy.internal/pitorg/pit-ts
+# Or install the internal CA in the sandbox's system trust store.
+export SSL_CERT_FILE=/var/run/trust/server/ca.crt
+
+gh repo view "$GH_REPO"
+gh pr list --repo "$GH_REPO"
+gh issue list --repo "$GH_REPO"
+gh api repos/pitorg/pit-ts/pulls
+```
+
+The CLI sends `Authorization: token <JWT>`; that scheme is accepted only by the explicit
+`github-cli-repo` mode. trust validates the JWT, derives the exact repository, mints/caches an
+installation token restricted to that repository, replaces the client header, and forwards the
+request. REST calls must use `/repos/{owner}/{repo}/...`. GraphQL is limited to named query
+operations whose root fields all select the same repository through variables. Mutations, global
+queries, node lookups, search, multiple operations, and bodies over 64 KiB fail closed. This
+supports the read paths used by `gh repo view`, `gh repo clone`, `gh pr list/view/checks/checkout`,
+and `gh issue list/view`; account-level commands and write operations are not supported.
+
+`gh repo clone` and `gh pr checkout` invoke `git` after their API query. Route that child process
+to the separate git-cache reverse-proxy hostname and give the JWT both the `github:owner/repo` and
+`github-git:owner/repo` scopes:
+
+```bash
+export GIT_CONFIG_COUNT=2
+export GIT_CONFIG_KEY_0=url.https://git.proxy.internal/.insteadOf
+export GIT_CONFIG_VALUE_0=https://github.proxy.internal/
+export GIT_CONFIG_KEY_1=http.https://git.proxy.internal/.extraHeader
+export GIT_CONFIG_VALUE_1="Authorization: Bearer $JWT"
+export GIT_SSL_CAINFO=/var/run/trust/server/ca.crt
+
+gh repo clone pitorg/pit-ts
+```
+
+These inherited Git settings avoid CONNECT and ensure the git subprocess also stays behind trust.
 
 ### git-cache behaviour
 
@@ -438,7 +486,7 @@ git -c http.extraHeader="Authorization: Bearer $JWT" \
 ## Testing
 
 ```bash
-cargo test                                 # 121 unit + 5 integration tests (126 total)
+cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
@@ -448,6 +496,8 @@ cargo fmt --check
 - end-to-end proxy authz with JWT: unknown host → 404, missing/invalid JWT → 401,
   wrong scope → 403, and on success the upstream received the injected secret with the
   client JWT stripped and the Host rewritten.
+- GitHub CLI REST rewriting, `token`-scheme JWT auth, bounded GraphQL body replay,
+  repository scope enforcement, credential replacement, and global-query rejection.
 
 `tests/git_cache.rs` spins a real `git http-backend` origin and the full Pingora proxy and asserts:
 - clone through the git-cache upstream populates a local mirror and delivers objects
@@ -462,6 +512,7 @@ src/
   config.rs        # TOML load + validation; [auth], [issuance], per-upstream resource
   scope.rs         # Scope/ScopeSet parse, permits, covers, grant
   resource.rs      # ResourceKind, path → Resource extraction
+  github_cli.rs    # gh REST translation + repository-rooted GraphQL validation
   router.rs        # Host → upstream
   decision.rs      # route + JWT verify + scope authz (404/401/403 / forward)
   inject.rs        # per-scheme secret injection
