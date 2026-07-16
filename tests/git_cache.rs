@@ -491,7 +491,7 @@ fn mint_jwt(keystore: &Keystore, scope: &str) -> String {
     let now = jsonwebtoken::get_current_timestamp();
     let scopes = ScopeSet::parse(scope).unwrap();
     issuer
-        .mint(&km, "spiffe://pit/ci/test", &scopes, now)
+        .mint(&km, "spiffe://example/ci/test", &scopes, now)
         .unwrap()
 }
 

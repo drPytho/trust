@@ -23,7 +23,7 @@ Run everything from the **repo root** so the config's `certs/` paths resolve.
 
 1. **Dev certs** (server cert + client CA + client cert with a SPIFFE SAN):
    ```bash
-   ./scripts/dev-certs.sh certs         # SPIFFE defaults to spiffe://pit/dev/local
+   ./scripts/dev-certs.sh certs         # SPIFFE defaults to spiffe://example/dev/local
    ```
 2. **Signing key** in GCP Secret Manager:
    ```bash

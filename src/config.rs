@@ -723,7 +723,7 @@ cert_path = "/etc/trust/server.crt"
 key_path = "/etc/trust/server.key"
 
 [auth]
-issuer = "https://trust.pit.internal/"
+issuer = "https://trust.example.internal/"
 audience = "trust-proxy"
 
 [auth.signing]
@@ -737,8 +737,8 @@ client_ca_path = "/etc/trust/client-ca.pem"
 jwks_addr = "0.0.0.0:8080"
 
 [[issuance.clients]]
-spiffe = "spiffe://pit/ci/pit-ts"
-allowed_scopes = ["github:pitorg/pit-ts"]
+spiffe = "spiffe://example/ci/example-repo"
+allowed_scopes = ["github:example-org/example-repo"]
 
 [[upstreams]]
 name = "anthropic"
@@ -761,14 +761,17 @@ resource = { kind = "github-repo" }
     #[test]
     fn parses_auth_issuance_and_resource() {
         let cfg = Config::from_str(GOOD).unwrap();
-        assert_eq!(cfg.auth.issuer, "https://trust.pit.internal/");
+        assert_eq!(cfg.auth.issuer, "https://trust.example.internal/");
         assert_eq!(cfg.auth.audience, "trust-proxy");
         assert_eq!(
             cfg.auth.signing.token_ttl,
             std::time::Duration::from_secs(7 * 24 * 3600)
         );
         assert_eq!(cfg.issuance.clients.len(), 1);
-        assert_eq!(cfg.issuance.clients[0].spiffe, "spiffe://pit/ci/pit-ts");
+        assert_eq!(
+            cfg.issuance.clients[0].spiffe,
+            "spiffe://example/ci/example-repo"
+        );
         assert!(cfg.upstreams[0].resource.is_none());
         assert_eq!(cfg.upstreams[0].mode, UpstreamMode::Inject);
         assert!(matches!(
@@ -789,7 +792,7 @@ resource = { kind = "github-repo" }
     #[test]
     fn rejects_bad_allowed_scope() {
         let bad = GOOD.replace(
-            r#"allowed_scopes = ["github:pitorg/pit-ts"]"#,
+            r#"allowed_scopes = ["github:example-org/example-repo"]"#,
             r#"allowed_scopes = ["bad:too/many/parts"]"#,
         );
         assert!(matches!(
@@ -995,7 +998,7 @@ app_id = 123
 private_key_secret_ref = "github-app-key"
 
 [[github_app.installations]]
-owner = "pitorg"
+owner = "example-org"
 installation_id = 111
 
 [[upstreams]]

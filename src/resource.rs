@@ -107,26 +107,34 @@ mod tests {
 
     #[test]
     fn github_repo_from_repos_path() {
-        let r = extract(ResourceKind::GithubRepo, "/repos/pitorg/pit-ts/issues").unwrap();
-        assert_eq!(r.owner, "pitorg");
-        assert_eq!(r.repo, "pit-ts");
+        let r = extract(
+            ResourceKind::GithubRepo,
+            "/repos/example-org/example-repo/issues",
+        )
+        .unwrap();
+        assert_eq!(r.owner, "example-org");
+        assert_eq!(r.repo, "example-repo");
     }
 
     #[test]
     fn github_repo_trims_dot_git() {
-        let r = extract(ResourceKind::GithubRepo, "/repos/pitorg/pit-ts.git").unwrap();
-        assert_eq!(r.repo, "pit-ts");
+        let r = extract(
+            ResourceKind::GithubRepo,
+            "/repos/example-org/example-repo.git",
+        )
+        .unwrap();
+        assert_eq!(r.repo, "example-repo");
     }
 
     #[test]
     fn github_cli_repo_accepts_enterprise_rest_prefix() {
         let r = extract(
             ResourceKind::GithubCliRepo,
-            "/api/v3/repos/pitorg/pit-ts/pulls",
+            "/api/v3/repos/example-org/example-repo/pulls",
         )
         .unwrap();
-        assert_eq!(r.owner, "pitorg");
-        assert_eq!(r.repo, "pit-ts");
+        assert_eq!(r.owner, "example-org");
+        assert_eq!(r.repo, "example-repo");
     }
 
     #[test]
@@ -143,7 +151,7 @@ mod tests {
     #[test]
     fn non_repo_paths_are_none() {
         assert!(extract(ResourceKind::GithubRepo, "/user").is_none());
-        assert!(extract(ResourceKind::GithubRepo, "/repos/pitorg").is_none());
+        assert!(extract(ResourceKind::GithubRepo, "/repos/example-org").is_none());
         assert!(extract(ResourceKind::GithubRepo, "/").is_none());
     }
 
@@ -152,7 +160,7 @@ mod tests {
     #[test]
     fn safe_component_accepts_normal_names() {
         assert!(safe_component("abc"));
-        assert!(safe_component("pit-ts"));
+        assert!(safe_component("example-repo"));
         assert!(safe_component("my.repo"));
         assert!(safe_component("owner123"));
     }
@@ -181,18 +189,26 @@ mod tests {
 
     #[test]
     fn git_repo_info_refs_with_dot_git() {
-        // /pitorg/pit-ts.git/info/refs → owner=pitorg, repo=pit-ts
-        let r = extract(ResourceKind::GitRepo, "/pitorg/pit-ts.git/info/refs").unwrap();
-        assert_eq!(r.owner, "pitorg");
-        assert_eq!(r.repo, "pit-ts");
+        // /example-org/example-repo.git/info/refs → owner=example-org, repo=example-repo
+        let r = extract(
+            ResourceKind::GitRepo,
+            "/example-org/example-repo.git/info/refs",
+        )
+        .unwrap();
+        assert_eq!(r.owner, "example-org");
+        assert_eq!(r.repo, "example-repo");
     }
 
     #[test]
     fn git_repo_upload_pack_without_dot_git() {
-        // /pitorg/pit-ts/git-upload-pack → owner=pitorg, repo=pit-ts
-        let r = extract(ResourceKind::GitRepo, "/pitorg/pit-ts/git-upload-pack").unwrap();
-        assert_eq!(r.owner, "pitorg");
-        assert_eq!(r.repo, "pit-ts");
+        // /example-org/example-repo/git-upload-pack → owner=example-org, repo=example-repo
+        let r = extract(
+            ResourceKind::GitRepo,
+            "/example-org/example-repo/git-upload-pack",
+        )
+        .unwrap();
+        assert_eq!(r.owner, "example-org");
+        assert_eq!(r.repo, "example-repo");
     }
 
     #[test]
@@ -217,8 +233,8 @@ mod tests {
 
     #[test]
     fn git_repo_missing_repo_segment_is_none() {
-        // /pitorg/info/refs — only one segment before the suffix → None
-        assert!(extract(ResourceKind::GitRepo, "/pitorg/info/refs").is_none());
+        // /example-org/info/refs — only one segment before the suffix → None
+        assert!(extract(ResourceKind::GitRepo, "/example-org/info/refs").is_none());
     }
 
     #[test]

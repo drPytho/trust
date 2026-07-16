@@ -143,13 +143,13 @@ mod tests {
         let body = request(
             "query RepositoryInfo($owner: String!, $name: String!) { \
              repository(owner: $owner, name: $name) { id name } }",
-            json!({"owner": "pitorg", "name": "pit-ts"}),
+            json!({"owner": "example-org", "name": "example-repo"}),
         );
         assert_eq!(
             repository_from_graphql(&body).unwrap(),
             Resource {
-                owner: "pitorg".into(),
-                repo: "pit-ts".into()
+                owner: "example-org".into(),
+                repo: "example-repo".into()
             }
         );
     }
@@ -159,16 +159,16 @@ mod tests {
         let body = request(
             "query PullRequestList($owner: String!, $repo: String!) { \
              repository(owner: $owner, name: $repo) { pullRequests(first: 10) { totalCount } } }",
-            json!({"owner": "pitorg", "repo": "pit-ts"}),
+            json!({"owner": "example-org", "repo": "example-repo"}),
         );
-        assert_eq!(repository_from_graphql(&body).unwrap().repo, "pit-ts");
+        assert_eq!(repository_from_graphql(&body).unwrap().repo, "example-repo");
     }
 
     #[test]
     fn rejects_global_or_ambiguous_queries() {
         let global = request(
             "query Viewer { viewer { login } }",
-            json!({"owner": "pitorg", "repo": "pit-ts"}),
+            json!({"owner": "example-org", "repo": "example-repo"}),
         );
         assert_eq!(
             repository_from_graphql(&global),
@@ -199,7 +199,7 @@ mod tests {
         let multiple = request(
             "query A($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { id } } \
              query B($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { id } }",
-            json!({"owner": "pitorg", "name": "pit-ts"}),
+            json!({"owner": "example-org", "name": "example-repo"}),
         );
         assert_eq!(
             repository_from_graphql(&multiple),

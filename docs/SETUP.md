@@ -65,10 +65,10 @@ secret (or project-wide for dev).
 **Local dev** — generate everything with one script:
 
 ```bash
-SPIFFE_ID=spiffe://pit/dev/local ./scripts/dev-certs.sh certs
+SPIFFE_ID=spiffe://example/dev/local ./scripts/dev-certs.sh certs
 # → certs/server.{crt,key}  (the [tls] server cert)
 #   certs/client-ca.{crt,key} (the [issuance].client_ca_path)
-#   certs/client.{crt,key}  (your caller cert, SAN URI:spiffe://pit/dev/local)
+#   certs/client.{crt,key}  (your caller cert, SAN URI:spiffe://example/dev/local)
 ```
 
 **Production** — server certs come from your PKI/ACME; client certs are SPIFFE
@@ -116,8 +116,8 @@ jwks_addr      = "0.0.0.0:8080"
 
 # Which SPIFFE identity may mint which scopes (exact, or trailing '*' prefix).
 [[issuance.clients]]
-spiffe = "spiffe://pit/dev/local"
-allowed_scopes = ["anthropic", "github:pitorg/*", "public-api"]
+spiffe = "spiffe://example/dev/local"
+allowed_scopes = ["anthropic", "github:example-org/*", "public-api"]
 
 [[upstreams]]
 name = "anthropic"
@@ -173,7 +173,7 @@ Under the hood that's an mTLS `client_credentials` call; the requested scopes ar
 curl --cert certs/client.crt --key certs/client.key --cacert certs/server.crt \
   https://localhost:8443/token \
   --data-urlencode grant_type=client_credentials \
-  --data-urlencode "scope=anthropic github:pitorg/pit-ts"
+  --data-urlencode "scope=anthropic github:example-org/example-repo"
 # → {"access_token":"<jwt>","token_type":"Bearer","expires_in":604800,"scope":"..."}
 ```
 
@@ -216,9 +216,9 @@ listener accepts CONNECT only, so plain HTTP sent through `HTTP_PROXY` receives
 **git smart-HTTP cache:**
 
 ```bash
-JWT=$(./scripts/mint-jwt.sh "github:pitorg/pit-ts")
+JWT=$(./scripts/mint-jwt.sh "github:example-org/example-repo")
 git -c http.extraHeader="Authorization: Bearer $JWT" \
-  clone https://github-git.proxy.internal/pitorg/pit-ts.git
+  clone https://github-git.proxy.internal/example-org/example-repo.git
 ```
 
 ## 8. Local-dev quickstart (end to end)

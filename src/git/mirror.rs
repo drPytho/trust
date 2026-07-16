@@ -206,10 +206,12 @@ mod tests {
     #[test]
     fn path_for_builds_correct_path() {
         let s = store();
-        let p = s.path_for("github.com", "pitorg", "pit-ts").unwrap();
+        let p = s
+            .path_for("github.com", "example-org", "example-repo")
+            .unwrap();
         assert_eq!(
             p,
-            PathBuf::from("/var/lib/trust/mirrors/github.com/pitorg/pit-ts.git")
+            PathBuf::from("/var/lib/trust/mirrors/github.com/example-org/example-repo.git")
         );
     }
 
@@ -291,8 +293,8 @@ mod tests {
     #[test]
     fn git_error_display_does_not_contain_auth_header() {
         let err = GitError::Clone {
-            clone_url: "https://github.com/pitorg/pit-ts.git".to_owned(),
-            path: PathBuf::from("/mirrors/github.com/pitorg/pit-ts.git"),
+            clone_url: "https://github.com/example-org/example-repo.git".to_owned(),
+            path: PathBuf::from("/mirrors/github.com/example-org/example-repo.git"),
             exit_code: Some(128),
         };
         let sample_secret = "ghp_supersecrettoken";
@@ -305,7 +307,7 @@ mod tests {
     #[test]
     fn git_error_spawn_display_does_not_contain_auth_header() {
         let err = GitError::Spawn {
-            path: PathBuf::from("/mirrors/github.com/pitorg/pit-ts.git"),
+            path: PathBuf::from("/mirrors/github.com/example-org/example-repo.git"),
             source: std::io::Error::new(std::io::ErrorKind::NotFound, "git not found"),
         };
         let sample_secret = "ghp_supersecrettoken";

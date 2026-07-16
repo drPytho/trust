@@ -139,10 +139,13 @@ mod tests {
             std::time::Duration::from_secs(3600),
         );
         let verifier = Verifier::new("iss".into(), "aud".into());
-        let scopes = ScopeSet::parse("anthropic github:pitorg/pit-ts").unwrap();
+        let scopes = ScopeSet::parse("anthropic github:example-org/example-repo").unwrap();
         let token = issuer.mint(&km, "user:filip", &scopes, now()).unwrap();
         let got = verifier.verify(&km, &token).unwrap();
-        assert_eq!(got.to_scope_string(), "anthropic github:pitorg/pit-ts");
+        assert_eq!(
+            got.to_scope_string(),
+            "anthropic github:example-org/example-repo"
+        );
         let verified = verifier.verify_token(&km, &token).unwrap();
         assert_eq!(verified.subject, "user:filip");
         assert!(verified.expires_at > now());

@@ -189,20 +189,20 @@ mod tests {
         assert!(
             matches!(Scope::parse("anthropic").unwrap(), Scope::Upstream(u) if u == "anthropic")
         );
-        match Scope::parse("github:pitorg/pit-ts").unwrap() {
+        match Scope::parse("github:example-org/example-repo").unwrap() {
             Scope::Resource {
                 upstream,
                 owner,
                 repo,
             } => {
                 assert_eq!(upstream, "github");
-                assert_eq!(owner, "pitorg");
-                assert!(matches!(repo, RepoPat::Exact(r) if r == "pit-ts"));
+                assert_eq!(owner, "example-org");
+                assert!(matches!(repo, RepoPat::Exact(r) if r == "example-repo"));
             }
             _ => panic!("expected resource"),
         }
         assert!(matches!(
-            Scope::parse("github:pit-customer/*").unwrap(),
+            Scope::parse("github:customer-org/*").unwrap(),
             Scope::Resource {
                 repo: RepoPat::Wildcard,
                 ..
@@ -214,8 +214,11 @@ mod tests {
 
     #[test]
     fn scopeset_roundtrip() {
-        let s = ScopeSet::parse("anthropic github:pitorg/pit-ts").unwrap();
-        assert_eq!(s.to_scope_string(), "anthropic github:pitorg/pit-ts");
+        let s = ScopeSet::parse("anthropic github:example-org/example-repo").unwrap();
+        assert_eq!(
+            s.to_scope_string(),
+            "anthropic github:example-org/example-repo"
+        );
     }
 
     #[test]
@@ -227,10 +230,10 @@ mod tests {
 
     #[test]
     fn permits_resource_scoped() {
-        let s = ScopeSet::parse("github:pitorg/pit-ts github:pit-customer/*").unwrap();
-        assert!(s.permits("github", Some(&res("pitorg", "pit-ts")))); // exact
-        assert!(s.permits("github", Some(&res("pit-customer", "acme")))); // wildcard
-        assert!(!s.permits("github", Some(&res("pitorg", "other")))); // not granted
+        let s = ScopeSet::parse("github:example-org/example-repo github:customer-org/*").unwrap();
+        assert!(s.permits("github", Some(&res("example-org", "example-repo")))); // exact
+        assert!(s.permits("github", Some(&res("customer-org", "acme")))); // wildcard
+        assert!(!s.permits("github", Some(&res("example-org", "other")))); // not granted
         assert!(!s.permits("github", None)); // no bare token
     }
 
@@ -244,8 +247,8 @@ mod tests {
     #[test]
     fn covers_for_issuance() {
         let bare = Scope::parse("github").unwrap();
-        let wild = Scope::parse("github:pitorg/*").unwrap();
-        let exact = Scope::parse("github:pitorg/pit-ts").unwrap();
+        let wild = Scope::parse("github:example-org/*").unwrap();
+        let exact = Scope::parse("github:example-org/example-repo").unwrap();
         assert!(covers(&bare, &exact)); // bare grants any repo
         assert!(covers(&wild, &exact)); // wildcard grants a specific repo
         assert!(covers(&wild, &wild));
@@ -255,8 +258,14 @@ mod tests {
 
     #[test]
     fn grant_reports_first_uncovered() {
-        let allowed = ScopeSet::parse("anthropic github:pitorg/*").unwrap();
-        assert!(grant(&allowed, &ScopeSet::parse("github:pitorg/pit-ts").unwrap()).is_ok());
+        let allowed = ScopeSet::parse("anthropic github:example-org/*").unwrap();
+        assert!(
+            grant(
+                &allowed,
+                &ScopeSet::parse("github:example-org/example-repo").unwrap()
+            )
+            .is_ok()
+        );
         assert_eq!(
             grant(&allowed, &ScopeSet::parse("mistral").unwrap()),
             Err("mistral".to_string())
@@ -267,7 +276,7 @@ mod tests {
     fn covers_different_upstream_false() {
         assert!(!covers(
             &Scope::parse("gitlab").unwrap(),
-            &Scope::parse("github:pitorg/pit-ts").unwrap()
+            &Scope::parse("github:example-org/example-repo").unwrap()
         ));
         assert!(!covers(
             &Scope::parse("github").unwrap(),

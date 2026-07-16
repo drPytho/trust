@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Mint a scoped JWT from trust's mTLS OAuth2 token endpoint.
 #
-#   ./scripts/mint-jwt.sh "anthropic github:pitorg/pit-ts"
+#   ./scripts/mint-jwt.sh "anthropic github:example-org/example-repo"
 #
 # Env overrides:
 #   TOKEN_URL  (default https://localhost:8443/token)
@@ -13,7 +13,7 @@ TOKEN_URL="${TOKEN_URL:-https://localhost:8443/token}"
 CERT_DIR="${CERT_DIR:-certs}"
 
 if [[ -z "$SCOPE" ]]; then
-  echo "usage: $0 \"<space-separated scopes>\"   e.g. \"anthropic github:pitorg/*\"" >&2
+  echo "usage: $0 \"<space-separated scopes>\"   e.g. \"anthropic github:example-org/*\"" >&2
   exit 2
 fi
 

@@ -24,7 +24,7 @@ want to distribute to every client, script, or CI job. Instead:
 - The client mints a **scoped JWT** from the `/token` endpoint; the JWT is short-lived and
   never carries real upstream keys.
 - The real key lives in a secret manager and is injected at the edge.
-- Access is per-upstream and per-repo: a token scoped to `github:pitorg/pit-ts` cannot
+- Access is per-upstream and per-repo: a token scoped to `github:example-org/example-repo` cannot
   reach `anthropic` or any other GitHub repo.
 - Rotating an upstream key is a secret-manager change — clients are untouched.
 
@@ -40,7 +40,7 @@ allowed for that identity in the `[[issuance.clients]]` policy.
   client (mTLS)          trust :8443
   POST /token            ──────────────────────────────────────────
   grant_type=client_credentials
-  &scope=github:pitorg/pit-ts
+  &scope=github:example-org/example-repo
                          1. verify client cert → extract SPIFFE URI
                          2. look up allowed scopes for that identity
                          3. cap requested scopes to allowed set
@@ -182,7 +182,7 @@ allow_private_ips = false
 
 # JWT auth: issuer/audience embedded in minted tokens and verified on every request.
 [auth]
-issuer   = "https://trust.pit.internal/"
+issuer   = "https://trust.example.internal/"
 audience = "trust-proxy"
 
 [auth.signing]
@@ -201,12 +201,12 @@ jwks_addr       = "0.0.0.0:8080"
 
 # Per-identity issuance policy.  spiffe may end with `*` for a prefix match.
 [[issuance.clients]]
-spiffe         = "spiffe://pit/ci/pit-ts"
-allowed_scopes = ["github:pitorg/pit-ts", "github-git:pitorg/pit-ts"]
+spiffe         = "spiffe://example/ci/example-repo"
+allowed_scopes = ["github:example-org/example-repo", "github-git:example-org/example-repo"]
 
 [[issuance.clients]]
-spiffe         = "spiffe://pit/team/platform/*"
-allowed_scopes = ["anthropic", "github:pitorg/*", "npm-artifacts:my-proj/npm-private"]
+spiffe         = "spiffe://example/team/platform/*"
+allowed_scopes = ["anthropic", "github:example-org/*", "npm-artifacts:my-proj/npm-private"]
 
 # One GitHub App can have a different installation in each organization. Owner matching is
 # case-insensitive and requests for an unmapped owner fail closed.
@@ -215,11 +215,11 @@ app_id = 123456
 private_key_secret_ref = "projects/my-proj/secrets/github-app-key/versions/latest"
 
 [[github_app.installations]]
-owner = "pitorg"
+owner = "example-org"
 installation_id = 111111
 
 [[github_app.installations]]
-owner = "pit-customer"
+owner = "customer-org"
 installation_id = 222222
 
 # Upstreams. Each owns a listen_host; the Host header routes to it.
@@ -324,7 +324,7 @@ policies.
 Clients that can set proxy headers directly should use Bearer authentication:
 
 ```bash
-curl --proxy https://trust.pit.internal:6180 \
+curl --proxy https://trust.example.internal:6180 \
   --proxy-cacert server-ca.pem \
   --proxy-header "Proxy-Authorization: Bearer $JWT" \
   https://api.example.com/resource
@@ -334,8 +334,8 @@ For tools that only understand proxy URL credentials, `trust` also accepts HTTP 
 fixed username `jwt` and the JWT as its password:
 
 ```bash
-export HTTPS_PROXY="https://jwt:${JWT}@trust.pit.internal:6180"
-export NO_PROXY="trust.pit.internal,.proxy.internal"
+export HTTPS_PROXY="https://jwt:${JWT}@trust.example.internal:6180"
+export NO_PROXY="trust.example.internal,.proxy.internal"
 ```
 
 The `https://` proxy scheme means TLS is used between the client and `trust`; client support varies.
@@ -366,7 +366,7 @@ allow_private_ips = false
 audit_unmatched = { scope = "outbound-audit" }
 
 [[issuance.clients]]
-spiffe = "spiffe://pit/sandboxes/*"
+spiffe = "spiffe://example/sandboxes/*"
 allowed_scopes = ["outbound-audit"]
 ```
 
@@ -410,9 +410,9 @@ TRUST_CONFIG=./config.toml RUST_LOG=info cargo run --release
 # Mint a JWT for a specific repo scope:
 JWT=$(curl -s --cert client.crt --key client.key \
   --cacert server-ca.pem \
-  https://trust.pit.internal:8443/token \
+  https://trust.example.internal:8443/token \
   --data-urlencode "grant_type=client_credentials" \
-  --data-urlencode "scope=github:pitorg/pit-ts github-git:pitorg/pit-ts" \
+  --data-urlencode "scope=github:example-org/example-repo github-git:example-org/example-repo" \
   | jq -r .access_token)
 ```
 
@@ -422,22 +422,22 @@ JWT=$(curl -s --cert client.crt --key client.key \
 # API call through the proxy:
 curl -H "Authorization: Bearer $ANTHROPIC_JWT" \
   -H "Host: anthropic.proxy.internal" \
-  https://trust.pit.internal:6443/v1/messages
+  https://trust.example.internal:6443/v1/messages
 
 # Authenticated passthrough. The trust JWT is consumed by the proxy while the caller's
 # upstream credential is forwarded in Authorization without modification:
 curl -H "Proxy-Authorization: Bearer $JWT" \
   -H "Authorization: Bearer $CALLER_UPSTREAM_TOKEN" \
   -H "Host: public.proxy.internal" \
-  https://trust.pit.internal:6443/resource
+  https://trust.example.internal:6443/resource
 
 # git clone via the git-cache upstream (cached mirror, fresh refs):
 git -c http.extraHeader="Authorization: Bearer $JWT" \
-  clone https://git.proxy.internal/pitorg/pit-ts.git
+  clone https://git.proxy.internal/example-org/example-repo.git
 
 # git push via the git-cache upstream (passed through to origin):
 git -c http.extraHeader="Authorization: Bearer $JWT" \
-  push https://git.proxy.internal/pitorg/pit-ts.git HEAD:main
+  push https://git.proxy.internal/example-org/example-repo.git HEAD:main
 ```
 
 ### GitHub CLI without CONNECT
@@ -450,14 +450,14 @@ value in `GH_ENTERPRISE_TOKEN` is the trust JWT, not a GitHub token:
 ```bash
 export GH_HOST=github.proxy.internal
 export GH_ENTERPRISE_TOKEN="$JWT"
-export GH_REPO=github.proxy.internal/pitorg/pit-ts
+export GH_REPO=github.proxy.internal/example-org/example-repo
 # Or install the internal CA in the sandbox's system trust store.
 export SSL_CERT_FILE=/var/run/trust/server/ca.crt
 
 gh repo view "$GH_REPO"
 gh pr list --repo "$GH_REPO"
 gh issue list --repo "$GH_REPO"
-gh api repos/pitorg/pit-ts/pulls
+gh api repos/example-org/example-repo/pulls
 ```
 
 The CLI sends `Authorization: token <JWT>`; that scheme is accepted only by the explicit
@@ -481,7 +481,7 @@ export GIT_CONFIG_KEY_1=http.https://git.proxy.internal/.extraHeader
 export GIT_CONFIG_VALUE_1="Authorization: Bearer $JWT"
 export GIT_SSL_CAINFO=/var/run/trust/server/ca.crt
 
-gh repo clone pitorg/pit-ts
+gh repo clone example-org/example-repo
 ```
 
 These inherited Git settings avoid CONNECT and ensure the git subprocess also stays behind trust.

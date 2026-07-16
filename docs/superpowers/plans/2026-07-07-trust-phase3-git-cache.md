@@ -56,7 +56,7 @@ Request body (POST negotiation): `session.read_request_body().await? -> Option<B
 
 **Behavior:** parse the FIRST two path segments as `owner`/`repo` when the path ends in a git smart-HTTP suffix (`/info/refs`, `/git-upload-pack`, `/git-receive-pack`), stripping a trailing `.git` from `repo`. **Reject** any segment that is empty, `.`, `..`, or contains no content → `None` (path-traversal safety). Non-git paths → `None`.
 
-- [ ] Step 1 — failing tests: `/pitorg/pit-ts.git/info/refs` → owner=pitorg repo=pit-ts; `/pitorg/pit-ts/git-upload-pack` → same; `/o/r.git/git-receive-pack` → o/r; `/repos/x/y` (API-style, not git) → None; `/../etc/info/refs` → None; `/pitorg/info/refs` (missing repo) → None.
+- [ ] Step 1 — failing tests: `/example-org/example-repo.git/info/refs` → owner=example-org repo=example-repo; `/example-org/example-repo/git-upload-pack` → same; `/o/r.git/git-receive-pack` → o/r; `/repos/x/y` (API-style, not git) → None; `/../etc/info/refs` → None; `/example-org/info/refs` (missing repo) → None.
 - [ ] Step 2 — `cargo test resource::` fails.
 - [ ] Step 3 — implement the `GitRepo` arm + a shared component-safety check (reused by MirrorStore in Task 5 — consider a `pub(crate) fn safe_component(&str) -> bool`).
 - [ ] Step 4 — `cargo test resource::` passes.

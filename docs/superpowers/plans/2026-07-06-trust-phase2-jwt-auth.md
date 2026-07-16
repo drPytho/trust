@@ -98,16 +98,16 @@ mod tests {
     #[test]
     fn parses_tokens() {
         assert!(matches!(Scope::parse("anthropic").unwrap(), Scope::Upstream(u) if u == "anthropic"));
-        match Scope::parse("github:pitorg/pit-ts").unwrap() {
+        match Scope::parse("github:example-org/example-repo").unwrap() {
             Scope::Resource { upstream, owner, repo } => {
                 assert_eq!(upstream, "github");
-                assert_eq!(owner, "pitorg");
-                assert!(matches!(repo, RepoPat::Exact(r) if r == "pit-ts"));
+                assert_eq!(owner, "example-org");
+                assert!(matches!(repo, RepoPat::Exact(r) if r == "example-repo"));
             }
             _ => panic!("expected resource"),
         }
         assert!(matches!(
-            Scope::parse("github:pit-customer/*").unwrap(),
+            Scope::parse("github:customer-org/*").unwrap(),
             Scope::Resource { repo: RepoPat::Wildcard, .. }
         ));
         assert!(Scope::parse("bad:too/many/parts").is_err());
@@ -116,8 +116,8 @@ mod tests {
 
     #[test]
     fn scopeset_roundtrip() {
-        let s = ScopeSet::parse("anthropic github:pitorg/pit-ts").unwrap();
-        assert_eq!(s.to_scope_string(), "anthropic github:pitorg/pit-ts");
+        let s = ScopeSet::parse("anthropic github:example-org/example-repo").unwrap();
+        assert_eq!(s.to_scope_string(), "anthropic github:example-org/example-repo");
     }
 
     #[test]
@@ -129,10 +129,10 @@ mod tests {
 
     #[test]
     fn permits_resource_scoped() {
-        let s = ScopeSet::parse("github:pitorg/pit-ts github:pit-customer/*").unwrap();
-        assert!(s.permits("github", Some(&res("pitorg", "pit-ts"))));       // exact
-        assert!(s.permits("github", Some(&res("pit-customer", "acme"))));   // wildcard
-        assert!(!s.permits("github", Some(&res("pitorg", "other"))));       // not granted
+        let s = ScopeSet::parse("github:example-org/example-repo github:customer-org/*").unwrap();
+        assert!(s.permits("github", Some(&res("example-org", "example-repo"))));       // exact
+        assert!(s.permits("github", Some(&res("customer-org", "acme"))));   // wildcard
+        assert!(!s.permits("github", Some(&res("example-org", "other"))));       // not granted
         assert!(!s.permits("github", None));                               // no bare token
     }
 
@@ -146,8 +146,8 @@ mod tests {
     #[test]
     fn covers_for_issuance() {
         let bare = Scope::parse("github").unwrap();
-        let wild = Scope::parse("github:pitorg/*").unwrap();
-        let exact = Scope::parse("github:pitorg/pit-ts").unwrap();
+        let wild = Scope::parse("github:example-org/*").unwrap();
+        let exact = Scope::parse("github:example-org/example-repo").unwrap();
         assert!(covers(&bare, &exact));            // bare grants any repo
         assert!(covers(&wild, &exact));            // wildcard grants a specific repo
         assert!(covers(&wild, &wild));
@@ -157,8 +157,8 @@ mod tests {
 
     #[test]
     fn grant_reports_first_uncovered() {
-        let allowed = ScopeSet::parse("anthropic github:pitorg/*").unwrap();
-        assert!(grant(&allowed, &ScopeSet::parse("github:pitorg/pit-ts").unwrap()).is_ok());
+        let allowed = ScopeSet::parse("anthropic github:example-org/*").unwrap();
+        assert!(grant(&allowed, &ScopeSet::parse("github:example-org/example-repo").unwrap()).is_ok());
         assert_eq!(
             grant(&allowed, &ScopeSet::parse("mistral").unwrap()),
             Err("mistral".to_string())
@@ -368,21 +368,21 @@ mod tests {
 
     #[test]
     fn github_repo_from_repos_path() {
-        let r = extract(ResourceKind::GithubRepo, "/repos/pitorg/pit-ts/issues").unwrap();
-        assert_eq!(r.owner, "pitorg");
-        assert_eq!(r.repo, "pit-ts");
+        let r = extract(ResourceKind::GithubRepo, "/repos/example-org/example-repo/issues").unwrap();
+        assert_eq!(r.owner, "example-org");
+        assert_eq!(r.repo, "example-repo");
     }
 
     #[test]
     fn github_repo_trims_dot_git() {
-        let r = extract(ResourceKind::GithubRepo, "/repos/pitorg/pit-ts.git").unwrap();
-        assert_eq!(r.repo, "pit-ts");
+        let r = extract(ResourceKind::GithubRepo, "/repos/example-org/example-repo.git").unwrap();
+        assert_eq!(r.repo, "example-repo");
     }
 
     #[test]
     fn non_repo_paths_are_none() {
         assert!(extract(ResourceKind::GithubRepo, "/user").is_none());
-        assert!(extract(ResourceKind::GithubRepo, "/repos/pitorg").is_none());
+        assert!(extract(ResourceKind::GithubRepo, "/repos/example-org").is_none());
         assert!(extract(ResourceKind::GithubRepo, "/").is_none());
     }
 }
@@ -477,7 +477,7 @@ mod tests {
 tcp = "0.0.0.0:6191"
 
 [auth]
-issuer = "https://trust.pit.internal/"
+issuer = "https://trust.example.internal/"
 audience = "trust-proxy"
 
 [auth.signing]
@@ -491,8 +491,8 @@ client_ca_path = "/etc/trust/client-ca.pem"
 jwks_addr = "0.0.0.0:8080"
 
 [[issuance.clients]]
-spiffe = "spiffe://pit/ci/pit-ts"
-allowed_scopes = ["github:pitorg/pit-ts"]
+spiffe = "spiffe://example/ci/example-repo"
+allowed_scopes = ["github:example-org/example-repo"]
 
 [[upstreams]]
 name = "anthropic"
@@ -515,11 +515,11 @@ resource = { kind = "github-repo" }
     #[test]
     fn parses_auth_issuance_and_resource() {
         let cfg = Config::from_str(GOOD).unwrap();
-        assert_eq!(cfg.auth.issuer, "https://trust.pit.internal/");
+        assert_eq!(cfg.auth.issuer, "https://trust.example.internal/");
         assert_eq!(cfg.auth.audience, "trust-proxy");
         assert_eq!(cfg.auth.signing.token_ttl, std::time::Duration::from_secs(7 * 24 * 3600));
         assert_eq!(cfg.issuance.clients.len(), 1);
-        assert_eq!(cfg.issuance.clients[0].spiffe, "spiffe://pit/ci/pit-ts");
+        assert_eq!(cfg.issuance.clients[0].spiffe, "spiffe://example/ci/example-repo");
         assert!(cfg.upstreams[0].resource.is_none());
         assert!(matches!(
             cfg.upstreams[1].resource,
@@ -535,7 +535,7 @@ resource = { kind = "github-repo" }
 
     #[test]
     fn rejects_bad_allowed_scope() {
-        let bad = GOOD.replace(r#"allowed_scopes = ["github:pitorg/pit-ts"]"#, r#"allowed_scopes = ["bad:too/many/parts"]"#);
+        let bad = GOOD.replace(r#"allowed_scopes = ["github:example-org/example-repo"]"#, r#"allowed_scopes = ["bad:too/many/parts"]"#);
         assert!(matches!(Config::from_str(&bad), Err(ConfigError::BadScope { .. })));
     }
 
@@ -957,10 +957,10 @@ mod tests {
         let km = km();
         let issuer = Issuer::new("iss".into(), "aud".into(), std::time::Duration::from_secs(3600));
         let verifier = Verifier::new("iss".into(), "aud".into());
-        let scopes = ScopeSet::parse("anthropic github:pitorg/pit-ts").unwrap();
+        let scopes = ScopeSet::parse("anthropic github:example-org/example-repo").unwrap();
         let token = issuer.mint(&km, "user:filip", &scopes, now()).unwrap();
         let got = verifier.verify(&km, &token).unwrap();
-        assert_eq!(got.to_scope_string(), "anthropic github:pitorg/pit-ts");
+        assert_eq!(got.to_scope_string(), "anthropic github:example-org/example-repo");
     }
 
     #[test]
@@ -1152,8 +1152,8 @@ mod tests {
 
     #[test]
     fn extracts_spiffe_uri() {
-        let der = client_cert_der_with_uri("spiffe://pit/ci/pit-ts");
-        assert_eq!(extract_spiffe(&der).as_deref(), Some("spiffe://pit/ci/pit-ts"));
+        let der = client_cert_der_with_uri("spiffe://example/ci/example-repo");
+        assert_eq!(extract_spiffe(&der).as_deref(), Some("spiffe://example/ci/example-repo"));
     }
 
     #[test]
@@ -1174,12 +1174,12 @@ mod tests {
     fn entries() -> Vec<ClientEntry> {
         vec![
             ClientEntry {
-                spiffe: "spiffe://pit/ci/pit-ts".into(),
-                allowed_scopes: vec!["github:pitorg/pit-ts".into()],
+                spiffe: "spiffe://example/ci/example-repo".into(),
+                allowed_scopes: vec!["github:example-org/example-repo".into()],
             },
             ClientEntry {
-                spiffe: "spiffe://pit/team/platform/*".into(),
-                allowed_scopes: vec!["anthropic".into(), "github:pitorg/*".into()],
+                spiffe: "spiffe://example/team/platform/*".into(),
+                allowed_scopes: vec!["anthropic".into(), "github:example-org/*".into()],
             },
         ]
     }
@@ -1187,21 +1187,21 @@ mod tests {
     #[test]
     fn exact_match() {
         let p = ClientPolicy::new(&entries()).unwrap();
-        let s = p.allowed_scopes("spiffe://pit/ci/pit-ts").unwrap();
-        assert_eq!(s.to_scope_string(), "github:pitorg/pit-ts");
+        let s = p.allowed_scopes("spiffe://example/ci/example-repo").unwrap();
+        assert_eq!(s.to_scope_string(), "github:example-org/example-repo");
     }
 
     #[test]
     fn prefix_match() {
         let p = ClientPolicy::new(&entries()).unwrap();
-        let s = p.allowed_scopes("spiffe://pit/team/platform/build-42").unwrap();
-        assert_eq!(s.to_scope_string(), "anthropic github:pitorg/*");
+        let s = p.allowed_scopes("spiffe://example/team/platform/build-42").unwrap();
+        assert_eq!(s.to_scope_string(), "anthropic github:example-org/*");
     }
 
     #[test]
     fn no_match_is_none() {
         let p = ClientPolicy::new(&entries()).unwrap();
-        assert!(p.allowed_scopes("spiffe://pit/other/x").is_none());
+        assert!(p.allowed_scopes("spiffe://example/other/x").is_none());
     }
 }
 ```
@@ -1589,9 +1589,9 @@ mod tests {
     #[test]
     fn authorize_resource_scoped() {
         let up = upstream("github", Some(ResourceKind::GithubRepo));
-        let s = ScopeSet::parse("github:pitorg/pit-ts").unwrap();
-        assert!(authorize(&s, &up, "/repos/pitorg/pit-ts/issues"));
-        assert!(!authorize(&s, &up, "/repos/pitorg/other/issues"));
+        let s = ScopeSet::parse("github:example-org/example-repo").unwrap();
+        assert!(authorize(&s, &up, "/repos/example-org/example-repo/issues"));
+        assert!(!authorize(&s, &up, "/repos/example-org/other/issues"));
         // Non-repo path on a scoped upstream: only a bare token authorizes.
         assert!(!authorize(&s, &up, "/user"));
         assert!(authorize(&ScopeSet::parse("github").unwrap(), &up, "/user"));
@@ -2050,11 +2050,11 @@ fn jwt_scoped_egress_end_to_end() {
     keystore.store(build_key_material(&signing_key_pem(), None).unwrap());
     let km = keystore.load().unwrap();
 
-    // Mint a token scoped to github:pitorg/pit-ts.
+    // Mint a token scoped to github:example-org/example-repo.
     let issuer = Issuer::new("trust".into(), "trust-proxy".into(), Duration::from_secs(3600));
     let now = jsonwebtoken::get_current_timestamp();
-    let scopes = ScopeSet::parse("github:pitorg/pit-ts").unwrap();
-    let token = issuer.mint(&km, "spiffe://pit/ci/pit-ts", &scopes, now).unwrap();
+    let scopes = ScopeSet::parse("github:example-org/example-repo").unwrap();
+    let token = issuer.mint(&km, "spiffe://example/ci/example-repo", &scopes, now).unwrap();
     let expired = issuer.mint(&km, "s", &scopes, now - 100_000).unwrap();
 
     // Build the proxy with the same keystore + a github upstream pointing at the mock.
@@ -2084,13 +2084,13 @@ fn jwt_scoped_egress_end_to_end() {
     }
 
     // Missing token → 401.
-    assert_eq!(raw_request(proxy_port, "gh.test", "/repos/pitorg/pit-ts/x", None).0, 401);
+    assert_eq!(raw_request(proxy_port, "gh.test", "/repos/example-org/example-repo/x", None).0, 401);
     // Expired token → 401.
-    assert_eq!(raw_request(proxy_port, "gh.test", "/repos/pitorg/pit-ts/x", Some(&expired)).0, 401);
+    assert_eq!(raw_request(proxy_port, "gh.test", "/repos/example-org/example-repo/x", Some(&expired)).0, 401);
     // Valid token, repo OUT of scope → 403.
-    assert_eq!(raw_request(proxy_port, "gh.test", "/repos/pitorg/other/x", Some(&token)).0, 403);
+    assert_eq!(raw_request(proxy_port, "gh.test", "/repos/example-org/other/x", Some(&token)).0, 403);
     // Valid token, repo IN scope → 200.
-    let (status, _) = raw_request(proxy_port, "gh.test", "/repos/pitorg/pit-ts/x", Some(&token));
+    let (status, _) = raw_request(proxy_port, "gh.test", "/repos/example-org/example-repo/x", Some(&token));
     assert_eq!(status, 200);
 
     std::thread::sleep(Duration::from_millis(100));
@@ -2110,7 +2110,7 @@ Expected: PASS. Iterate on harness details (startup wait, header casing) if need
 
 - [ ] **Step 3: Add the issuance (mTLS) sub-test**
 
-Append a second `#[test]` to `tests/jwt_egress.rs` that generates a client CA + client cert with a SPIFFE URI SAN via `rcgen` (see the pattern in `src/issuance/mtls.rs` tests and the plan's research), builds `IssuanceState` (keystore + `Issuer` + `ClientPolicy` from a `ClientEntry` granting `github:pitorg/*`), and drives `issuance::server::token_router` in-process using `axum`'s testing (`tower::ServiceExt::oneshot`) with the `PeerCertificates` extension injected manually from the generated client cert DER — asserting: a `client_credentials` request for `scope=github:pitorg/pit-ts` returns 200 with a JWT whose `verify` yields that scope, and a request for `scope=mistral` returns 400 `invalid_scope`. Add `tower = "0.5"` to `[dev-dependencies]` for `oneshot`.
+Append a second `#[test]` to `tests/jwt_egress.rs` that generates a client CA + client cert with a SPIFFE URI SAN via `rcgen` (see the pattern in `src/issuance/mtls.rs` tests and the plan's research), builds `IssuanceState` (keystore + `Issuer` + `ClientPolicy` from a `ClientEntry` granting `github:example-org/*`), and drives `issuance::server::token_router` in-process using `axum`'s testing (`tower::ServiceExt::oneshot`) with the `PeerCertificates` extension injected manually from the generated client cert DER — asserting: a `client_credentials` request for `scope=github:example-org/example-repo` returns 200 with a JWT whose `verify` yields that scope, and a request for `scope=mistral` returns 400 `invalid_scope`. Add `tower = "0.5"` to `[dev-dependencies]` for `oneshot`.
 
 Run: `cargo test --test jwt_egress -- --nocapture`
 Expected: both tests PASS. If wiring `PeerCertificates` in a `oneshot` proves impractical (its constructor may be private), instead assert the issuance decision path directly by testing `ClientPolicy` + `grant` + `Issuer::mint` composed (the mTLS transport itself is exercised by the proxy path and the `extract_spiffe` unit test). Document whichever approach you took in the report.
