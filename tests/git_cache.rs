@@ -34,6 +34,8 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use pingora::prelude::*;
 use trust::config::{
     CredentialSource, GitConfig, Injection, InjectionScheme, Origin, Upstream, UpstreamKind,
@@ -112,6 +114,11 @@ fn git_status_with_stderr(args: &[&str], cwd: &Path, envs: &[(&str, &str)]) -> (
     output.push_str("\n--- STDOUT ---\n");
     output.push_str(&String::from_utf8_lossy(&out.stdout));
     (code, output)
+}
+
+/// Encode one ASCII Git pkt-line, including its four-byte hexadecimal length.
+fn git_pkt_line(value: &str) -> String {
+    format!("{:04x}{value}", value.len() + 4)
 }
 
 // ---------------------------------------------------------------------------
@@ -667,6 +674,66 @@ fn git_cache_end_to_end() {
             "Assertion 1 (clone + multi-chunk): ✓ ({} KiB)",
             cloned_data.len() / 1024
         );
+    }
+
+    // ---- ASSERTION 1b: gzip smart-HTTP POST through proxy succeeds ----
+    //
+    // Git may gzip an upload-pack request body. The proxy passes the body to
+    // `git http-backend`, which needs the CGI `HTTP_CONTENT_ENCODING` variable
+    // to inflate it before parsing the pkt-line request.
+    {
+        let wanted = git(&["rev-parse", "HEAD"], &clone_dir, &[]);
+        let request = [
+            git_pkt_line("command=fetch\n"),
+            git_pkt_line("object-format=sha1\n"),
+            "0001".to_owned(),
+            git_pkt_line("thin-pack\n"),
+            git_pkt_line("no-progress\n"),
+            git_pkt_line("ofs-delta\n"),
+            git_pkt_line(&format!("want {}\n", wanted.trim())),
+            git_pkt_line("done\n"),
+            "0000".to_owned(),
+        ]
+        .concat();
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(request.as_bytes()).unwrap();
+        let compressed_request = encoder.finish().unwrap();
+
+        let mut socket = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        let header = format!(
+            "POST /testorg/testrepo.git/git-upload-pack HTTP/1.1\r\n\
+             Host: 127.0.0.1:{proxy_port}\r\n\
+             Authorization: Bearer {good_jwt}\r\n\
+             Content-Type: application/x-git-upload-pack-request\r\n\
+             Content-Encoding: gzip\r\n\
+             Git-Protocol: version=2\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\r\n",
+            compressed_request.len(),
+        );
+        socket.write_all(header.as_bytes()).unwrap();
+        socket.write_all(&compressed_request).unwrap();
+        let mut response = Vec::new();
+        socket.read_to_end(&mut response).unwrap();
+
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "gzip upload-pack request should succeed; got: {}",
+            String::from_utf8_lossy(&response[..response.len().min(300)]),
+        );
+        assert!(
+            response
+                .windows(b"packfile\n".len())
+                .any(|window| window == b"packfile\n"),
+            "gzip upload-pack response should contain the protocol-v2 packfile section",
+        );
+        println!("Assertion 1b (gzip upload-pack): ✓");
     }
 
     git(&["config", "user.email", "test@test.com"], &clone_dir, &[]);

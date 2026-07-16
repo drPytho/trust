@@ -16,6 +16,10 @@ use crate::git::mirror::GitError;
 /// Only the `Some` optional fields are included in the returned vector.
 /// `CONTENT_LENGTH` is intentionally omitted here; callers that know the
 /// length (e.g. a buffered POST body) should append it themselves.
+///
+/// `HTTP_CONTENT_ENCODING` deliberately uses the CGI header form rather than
+/// `CONTENT_ENCODING`: `git http-backend` uses it to inflate gzip-compressed
+/// smart-HTTP request bodies before handing them to `git-upload-pack`.
 #[allow(clippy::too_many_arguments)] // CGI env needs all HTTP fields; a struct would be heavier.
 pub fn cgi_env(
     storage_path: &Path,
@@ -25,6 +29,7 @@ pub fn cgi_env(
     query: &str,
     method: &str,
     content_type: Option<&str>,
+    content_encoding: Option<&str>,
     git_protocol: Option<&str>,
     remote_user: Option<&str>,
 ) -> Vec<(String, String)> {
@@ -44,6 +49,9 @@ pub fn cgi_env(
 
     if let Some(ct) = content_type {
         env.push(("CONTENT_TYPE".to_owned(), ct.to_owned()));
+    }
+    if let Some(encoding) = content_encoding {
+        env.push(("HTTP_CONTENT_ENCODING".to_owned(), encoding.to_owned()));
     }
     if let Some(proto) = git_protocol {
         env.push(("GIT_PROTOCOL".to_owned(), proto.to_owned()));
@@ -217,6 +225,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         assert_eq!(
@@ -247,9 +256,11 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         assert!(!env_has_key(&env, "CONTENT_TYPE"));
+        assert!(!env_has_key(&env, "HTTP_CONTENT_ENCODING"));
         assert!(!env_has_key(&env, "GIT_PROTOCOL"));
         assert!(!env_has_key(&env, "REMOTE_USER"));
     }
@@ -264,6 +275,7 @@ mod tests {
             "",
             "POST",
             Some("application/x-git-upload-pack-request"),
+            Some("gzip"),
             Some("version=2"),
             Some("alice"),
         );
@@ -272,6 +284,7 @@ mod tests {
             env_get(&env, "CONTENT_TYPE"),
             Some("application/x-git-upload-pack-request")
         );
+        assert_eq!(env_get(&env, "HTTP_CONTENT_ENCODING"), Some("gzip"));
         assert_eq!(env_get(&env, "GIT_PROTOCOL"), Some("version=2"));
         assert_eq!(env_get(&env, "REMOTE_USER"), Some("alice"));
     }
@@ -285,6 +298,7 @@ mod tests {
             "git-receive-pack",
             "",
             "POST",
+            None,
             None,
             None,
             None,
