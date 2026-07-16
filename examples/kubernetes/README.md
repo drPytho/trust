@@ -71,6 +71,14 @@ Configure both names in cluster DNS to resolve to the `trust` Service, and add
 certificate. The example uses an `emptyDir` for git mirrors; replace it with
 persistent storage when cache survival across Pod replacement matters.
 
+It also includes `linear.proxy.internal` for Linear's GraphQL API. Create a
+Linear personal API key, store it in the referenced `linear-key` Secret Manager
+secret, add `linear.proxy.internal` to cluster DNS and the reverse-proxy
+certificate, then mint the `linear` scope. Workloads POST to
+`https://linear.proxy.internal/graphql` with `Authorization: Bearer <trust JWT>`;
+trust replaces that header with the raw Linear key. With `@linear/sdk`, use the
+trust JWT as `accessToken` and the complete proxy GraphQL URL as `apiUrl`.
+
 Mint a JWT with both exact repository scopes, then configure the sandbox:
 
 ```bash

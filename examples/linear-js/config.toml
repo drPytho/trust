@@ -1,0 +1,45 @@
+# Example trust config for the linear-js demo.
+# Paths are relative to trust's working directory — run trust from the repo root
+# (where you generated `certs/` via scripts/dev-certs.sh), or make them absolute.
+# No plaintext secrets here: the signing key and Linear personal API key both
+# live in GCP Secret Manager (see the README).
+
+[listen]
+tcp = "0.0.0.0:6191"        # the JS client points here (http://localhost:6191)
+
+[tls]                        # required; the issuance server reuses this cert/key
+addr = "0.0.0.0:6443"
+cert_path = "certs/server.crt"
+key_path  = "certs/server.key"
+
+[auth]
+issuer   = "https://trust.local/"
+audience = "trust-proxy"
+
+[auth.signing]
+algorithm = "ES256"
+token_ttl = "7d"
+key_secret_ref = "projects/YOUR_PROJECT/secrets/trust-signing-key/versions/latest"
+
+[issuance]
+mtls_addr      = "0.0.0.0:8443"
+client_ca_path = "certs/client-ca.crt"
+jwks_addr      = "0.0.0.0:8080"
+
+# The dev client cert's SPIFFE id (from scripts/dev-certs.sh) → may mint `linear`.
+[[issuance.clients]]
+spiffe         = "spiffe://example/dev/local"
+allowed_scopes = ["linear"]
+
+# Linear's GraphQL API accepts personal API keys as `Authorization: <key>`
+# without a Bearer prefix. `raw` preserves that exact value after trust strips
+# the caller's JWT. Use `scheme = "bearer"` instead when the stored secret is a
+# Linear OAuth access token.
+[[upstreams]]
+name            = "linear"
+kind            = "api"
+listen_host     = "localhost"    # the SDK sends Host: localhost → routes here
+origin          = "https://api.linear.app"
+secret_ref      = "projects/YOUR_PROJECT/secrets/linear-key/versions/latest"
+injection       = { header = "authorization", scheme = "raw" }
+allowed_methods = ["POST"]       # Linear GraphQL operations

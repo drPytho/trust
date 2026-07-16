@@ -781,6 +781,30 @@ resource = { kind = "github-repo" }
     }
 
     #[test]
+    fn parses_linear_personal_api_key_upstream() {
+        let cfg = Config::from_str(include_str!("../examples/linear-js/config.toml")).unwrap();
+        let upstream = cfg
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.name == "linear")
+            .expect("Linear upstream should be configured");
+
+        assert_eq!(upstream.origin.host, "api.linear.app");
+        assert_eq!(upstream.allowed_methods, ["POST"]);
+        assert!(matches!(
+            upstream.credential,
+            Some(CredentialSource::StaticSecret { .. })
+        ));
+        assert!(matches!(
+            upstream.injection,
+            Some(Injection {
+                ref header,
+                scheme: InjectionScheme::Raw,
+            }) if header.eq_ignore_ascii_case("authorization")
+        ));
+    }
+
+    #[test]
     fn rejects_bad_ttl() {
         let bad = GOOD.replace(r#"token_ttl = "7d""#, r#"token_ttl = "banana""#);
         assert!(matches!(

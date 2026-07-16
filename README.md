@@ -17,7 +17,7 @@ forwarded upstream.
 
 ## Why
 
-You have shared upstream credentials (Anthropic, Mistral, GitHub API, …) that you don't
+You have shared upstream credentials (Anthropic, Linear, Mistral, GitHub API, …) that you don't
 want to distribute to every client, script, or CI job. Instead:
 
 - Each client is identified by its **SPIFFE URI** (in its mTLS certificate SAN).
@@ -102,6 +102,7 @@ A scope is either a bare upstream name or a resource-scoped token:
 | Scope                  | Meaning                                                  |
 |------------------------|----------------------------------------------------------|
 | `anthropic`            | Full access to the `anthropic` upstream                  |
+| `linear`               | Full access to the `linear` GraphQL upstream             |
 | `mistral`              | Full access to the `mistral` upstream                    |
 | `github:owner/repo`    | Exact repo match on the `github` upstream                |
 | `github:owner/*`       | All repos under `owner` (one wildcard segment)           |
@@ -206,7 +207,7 @@ allowed_scopes = ["github:example-org/example-repo", "github-git:example-org/exa
 
 [[issuance.clients]]
 spiffe         = "spiffe://example/team/platform/*"
-allowed_scopes = ["anthropic", "github:example-org/*", "npm-artifacts:my-proj/npm-private"]
+allowed_scopes = ["anthropic", "linear", "github:example-org/*", "npm-artifacts:my-proj/npm-private"]
 
 # One GitHub App can have a different installation in each organization. Owner matching is
 # case-insensitive and requests for an unmapped owner fail closed.
@@ -231,6 +232,18 @@ listen_host = "anthropic.proxy.internal"
 origin      = "https://api.anthropic.com"
 secret_ref  = "projects/my-proj/secrets/anthropic-key/versions/latest"
 injection   = { header = "x-api-key", scheme = "raw" }
+
+# Linear's GraphQL API accepts personal API keys as `Authorization: <key>`
+# (without a Bearer prefix). If the stored secret is an OAuth access token,
+# use `scheme = "bearer"` instead.
+[[upstreams]]
+name            = "linear"
+kind            = "api"
+listen_host     = "linear.proxy.internal"
+origin          = "https://api.linear.app"
+secret_ref      = "projects/my-proj/secrets/linear-key/versions/latest"
+injection       = { header = "authorization", scheme = "raw" }
+allowed_methods = ["POST"]
 
 [[upstreams]]
 name        = "github"
@@ -285,7 +298,7 @@ is now JWT-based via the issuance endpoint.
 
 | Scheme   | Header value written               | Use for                                   |
 |----------|------------------------------------|-------------------------------------------|
-| `raw`    | `<secret>` verbatim                | API-key headers, e.g. `x-api-key`         |
+| `raw`    | `<secret>` verbatim                | API-key headers, e.g. `x-api-key` or Linear personal keys |
 | `bearer` | `Bearer <secret>`                  | OAuth/PAT bearer auth                      |
 | `basic`  | `Basic base64(<secret>)`           | HTTP Basic (secret is the `user:pass` string) |
 
@@ -423,6 +436,17 @@ JWT=$(curl -s --cert client.crt --key client.key \
 curl -H "Authorization: Bearer $ANTHROPIC_JWT" \
   -H "Host: anthropic.proxy.internal" \
   https://trust.example.internal:6443/v1/messages
+
+# Linear GraphQL call. The proxy replaces the trust JWT with the stored Linear key.
+curl -X POST -H "Authorization: Bearer $LINEAR_JWT" \
+  -H "Content-Type: application/json" \
+  -H "Host: linear.proxy.internal" \
+  --data '{"query":"{ viewer { id name } }"}' \
+  https://trust.example.internal:6443/graphql
+
+# With @linear/sdk, set `accessToken` to the trust JWT and `apiUrl` to the
+# complete proxy endpoint (`https://linear.proxy.internal/graphql`).
+# See examples/linear-js for a runnable configuration and query.
 
 # Authenticated passthrough. The trust JWT is consumed by the proxy while the caller's
 # upstream credential is forwarded in Authorization without modification:

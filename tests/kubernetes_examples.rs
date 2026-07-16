@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 use serde_yaml_ng::Value;
-use trust::config::{Config, UpstreamKind, UpstreamMode};
+use trust::config::{Config, CredentialSource, InjectionScheme, UpstreamKind, UpstreamMode};
 use trust::resource::ResourceKind;
 
 fn example_path(name: &str) -> PathBuf {
@@ -101,6 +101,25 @@ fn deployment_config_allowlists_google_api_connect_endpoints() {
     let allowed_scopes = &config.issuance.clients[0].allowed_scopes;
     assert!(allowed_scopes.iter().any(|scope| scope == "gcp-pubsub"));
     assert!(allowed_scopes.iter().any(|scope| scope == "gcp-storage"));
+
+    let linear = config
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.name == "linear")
+        .expect("example must include the Linear GraphQL upstream");
+    assert_eq!(linear.origin.host, "api.linear.app");
+    assert_eq!(linear.allowed_methods, ["POST"]);
+    assert!(matches!(
+        linear.credential,
+        Some(CredentialSource::StaticSecret { .. })
+    ));
+    assert!(matches!(
+        linear.injection,
+        Some(ref injection)
+            if injection.header.eq_ignore_ascii_case("authorization")
+                && injection.scheme == InjectionScheme::Raw
+    ));
+    assert!(allowed_scopes.iter().any(|scope| scope == "linear"));
 
     let github = config
         .upstreams

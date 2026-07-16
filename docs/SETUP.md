@@ -117,7 +117,7 @@ jwks_addr      = "0.0.0.0:8080"
 # Which SPIFFE identity may mint which scopes (exact, or trailing '*' prefix).
 [[issuance.clients]]
 spiffe = "spiffe://example/dev/local"
-allowed_scopes = ["anthropic", "github:example-org/*", "public-api"]
+allowed_scopes = ["anthropic", "linear", "github:example-org/*", "public-api"]
 
 [[upstreams]]
 name = "anthropic"
@@ -126,6 +126,17 @@ listen_host = "anthropic.proxy.internal"     # Host header routes here
 origin = "https://api.anthropic.com"
 secret_ref = "projects/PROJECT/secrets/anthropic-key/versions/latest"
 injection = { header = "x-api-key", scheme = "raw" }
+
+# Linear personal API keys use `Authorization: <key>` without a Bearer prefix.
+# Use `scheme = "bearer"` instead when storing a Linear OAuth access token.
+[[upstreams]]
+name = "linear"
+kind = "api"
+listen_host = "linear.proxy.internal"
+origin = "https://api.linear.app"
+secret_ref = "projects/PROJECT/secrets/linear-key/versions/latest"
+injection = { header = "authorization", scheme = "raw" }
+allowed_methods = ["POST"]
 
 # Straight-through reverse proxy and CONNECT destination. CONNECT is opaque,
 # so it cannot use injection, resource extraction, or allowed_methods.
@@ -138,7 +149,7 @@ origin = "https://api.example.com"
 allow_connect = true
 ```
 
-Scope grammar: `anthropic` (whole upstream); `github:owner/repo` (exact repo);
+Scope grammar: `anthropic` or `linear` (whole upstream); `github:owner/repo` (exact repo);
 `github:owner/*` (one wildcard segment — end prefix grants with `/*`). Injection
 schemes: `raw` (verbatim), `bearer` (`Bearer <s>`), `basic` (`Basic base64(s)`).
 
@@ -197,6 +208,25 @@ curl https://anthropic.proxy.internal:6443/v1/messages \
 trust validates the JWT, authorizes `anthropic`, strips your `Authorization`,
 injects the real `x-api-key`, and forwards. Your JWT never reaches the upstream;
 the real key never reaches you.
+
+**Linear GraphQL API** (a personal API key stays only in Secret Manager):
+
+```bash
+JWT=$(./scripts/mint-jwt.sh "linear")
+curl https://linear.proxy.internal:6443/graphql \
+  --resolve linear.proxy.internal:6443:127.0.0.1 \
+  --cacert certs/server.crt \
+  -H "Authorization: Bearer $JWT" \
+  -H "content-type: application/json" \
+  -d '{"query":"{ viewer { id name } }"}'
+```
+
+For the official JavaScript SDK, configure `accessToken` with the trust JWT and
+`apiUrl` with the complete proxy endpoint (for example
+`https://linear.proxy.internal/graphql`). Do not give the client the stored
+Linear personal API key; `accessToken` makes the SDK send the JWT as a Bearer
+credential, which trust replaces with the raw Linear key. See
+[`examples/linear-js`](../examples/linear-js/README.md) for a runnable example.
 
 **CONNECT forward proxy** (the JWT needs the `public-api` scope):
 

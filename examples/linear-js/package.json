@@ -1,0 +1,12 @@
+{
+  "name": "trust-linear-js-example",
+  "private": true,
+  "type": "module",
+  "description": "Query Linear through the trust proxy with on-the-fly secret injection",
+  "scripts": {
+    "start": "node query.mjs"
+  },
+  "dependencies": {
+    "@linear/sdk": "^86.0.0"
+  }
+}
