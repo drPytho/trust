@@ -889,6 +889,15 @@ impl ProxyService {
             .get("content-type")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
+        // Git clients may gzip smart-HTTP POST bodies. `git http-backend`
+        // knows how to inflate them, but only when the CGI
+        // `HTTP_CONTENT_ENCODING` environment variable is populated.
+        let content_encoding = session
+            .req_header()
+            .headers
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
         let git_protocol = session
             .req_header()
             .headers
@@ -937,6 +946,7 @@ impl ProxyService {
             query,
             method,
             content_type.as_deref(),
+            content_encoding.as_deref(),
             git_protocol.as_deref(),
             None, // remote_user: principal not available (JWT verified but sub not extracted)
         );
