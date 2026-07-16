@@ -199,6 +199,32 @@ fn scoped_upstream(mock_port: u16) -> Arc<Upstream> {
     })
 }
 
+fn linear_upstream(mock_port: u16) -> Arc<Upstream> {
+    Arc::new(Upstream {
+        name: "linear".into(),
+        kind: UpstreamKind::Api,
+        listen_host: "linear.test".into(),
+        origin: Origin {
+            host: "127.0.0.1".into(),
+            port: mock_port,
+            tls: false,
+            sni: String::new(),
+        },
+        mode: UpstreamMode::Inject,
+        credential: Some(CredentialSource::StaticSecret {
+            secret_ref: "ref/linear".into(),
+        }),
+        injection: Some(Injection {
+            header: "authorization".into(),
+            scheme: InjectionScheme::Raw,
+        }),
+        resource: None,
+        git: None,
+        allowed_methods: vec!["POST".into()],
+        allow_connect: false,
+    })
+}
+
 fn passthrough_upstream(mock_port: u16) -> Arc<Upstream> {
     Arc::new(Upstream {
         name: "public-api".into(),
@@ -351,6 +377,77 @@ fn jwt_scoped_egress_end_to_end() {
         lower.contains("host: 127.0.0.1"),
         "host not rewritten: {last}"
     );
+}
+
+#[test]
+fn linear_personal_api_key_is_injected_verbatim() {
+    let (mock_port, upstream_reqs) = start_mock_upstream();
+    let keystore = Arc::new(Keystore::new());
+    keystore.store(build_key_material(&signing_key_pem(), None).unwrap());
+    let km = keystore.load().unwrap();
+    let issuer = Issuer::new(
+        "trust".into(),
+        "trust-proxy".into(),
+        Duration::from_secs(3600),
+    );
+    let token = issuer
+        .mint(
+            &km,
+            "spiffe://example/workloads/linear-client",
+            &ScopeSet::parse("linear").unwrap(),
+            jsonwebtoken::get_current_timestamp(),
+        )
+        .unwrap();
+
+    let service = ProxyService::new(
+        Router::new(&[linear_upstream(mock_port)]),
+        Verifier::new("trust".into(), "trust-proxy".into()),
+        keystore,
+        Arc::new(FakeSecretProvider::new(&[(
+            "ref/linear",
+            "lin_api_INJECTED_SECRET",
+        )])),
+        Arc::new(MirrorStore::new("/tmp")),
+        Arc::new(SyncManager::new()),
+    );
+    let proxy_port = free_port();
+    let addr = format!("127.0.0.1:{proxy_port}");
+    std::thread::spawn(move || {
+        let mut server = Server::new(None).unwrap();
+        server.bootstrap();
+        let mut proxy = http_proxy_service(&server.configuration, service);
+        proxy.add_tcp(&addr);
+        server.add_service(proxy);
+        server.run_forever();
+    });
+    for _ in 0..50 {
+        if TcpStream::connect(("127.0.0.1", proxy_port)).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let graphql = r#"{"query":"{ viewer { id name } }"}"#;
+    assert_eq!(
+        raw_json_request(
+            proxy_port,
+            "linear.test",
+            "/graphql",
+            "Bearer",
+            &token,
+            graphql,
+        )
+        .0,
+        200
+    );
+
+    std::thread::sleep(Duration::from_millis(100));
+    let requests = upstream_reqs.lock().unwrap();
+    let request = requests.last().expect("upstream got a request");
+    let lower = request.to_ascii_lowercase();
+    assert!(request.starts_with("POST /graphql HTTP/1.1"));
+    assert!(lower.contains("authorization: lin_api_injected_secret"));
+    assert!(!request.contains(&token));
 }
 
 #[test]

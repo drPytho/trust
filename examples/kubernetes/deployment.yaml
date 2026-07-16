@@ -47,7 +47,7 @@ data:
 
     [[issuance.clients]]
     spiffe = "spiffe://example/workloads/*"
-    allowed_scopes = ["anthropic", "github:ORG/REPOSITORY", "github-git:ORG/REPOSITORY", "public-api", "gcp-pubsub", "gcp-storage"]
+    allowed_scopes = ["anthropic", "linear", "github:ORG/REPOSITORY", "github-git:ORG/REPOSITORY", "public-api", "gcp-pubsub", "gcp-storage"]
 
     [github_app]
     app_id = 123456
@@ -64,6 +64,17 @@ data:
     origin = "https://api.anthropic.com"
     secret_ref = "projects/PROJECT_ID/secrets/anthropic-key/versions/latest"
     injection = { header = "x-api-key", scheme = "raw" }
+
+    # Linear's GraphQL API accepts personal API keys as a raw Authorization
+    # value. Store the key in Secret Manager; workloads supply only a trust JWT.
+    [[upstreams]]
+    name = "linear"
+    kind = "api"
+    listen_host = "linear.proxy.internal"
+    origin = "https://api.linear.app"
+    secret_ref = "projects/PROJECT_ID/secrets/linear-key/versions/latest"
+    injection = { header = "authorization", scheme = "raw" }
+    allowed_methods = ["POST"]
 
     # Reverse-proxy-only GitHub CLI API. gh supplies the trust JWT as its
     # enterprise token; trust injects an exact-repository installation token.
