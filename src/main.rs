@@ -8,7 +8,7 @@ use pingora::prelude::*;
 
 use trust::config::{Config, UpstreamKind};
 use trust::connect::{ConnectProxy, serve_connect};
-use trust::credentials::CredentialManager;
+use trust::credentials::{CredentialManager, CredentialProvider};
 use trust::git::mirror::MirrorStore;
 use trust::git::sync::SyncManager;
 use trust::issuance::policy::ClientPolicy;
@@ -19,6 +19,7 @@ use trust::issuance::server::{
 use trust::jwt::{Issuer, Verifier};
 use trust::keystore::{Keystore, fetch};
 use trust::metrics::ProxyMetrics;
+use trust::mitm::runtime::MitmRuntime;
 use trust::proxy::ProxyService;
 use trust::router::Router;
 use trust::secrets::gcp::GcpSecretProvider;
@@ -156,6 +157,8 @@ fn main() {
         .unwrap_or_else(|| "/var/cache/trust/mirrors".to_string());
     let mirrors = Arc::new(MirrorStore::new(mirror_root));
     let sync = Arc::new(SyncManager::new());
+    let mut server = Server::new(None).expect("failed to create server");
+    server.bootstrap();
 
     if let Some(forward) = config.forward_proxy.clone() {
         let listener = std::net::TcpListener::bind(&forward.addr).unwrap_or_else(|error| {
@@ -180,7 +183,18 @@ fn main() {
             );
             None
         };
-        let state = Arc::new(ConnectProxy::new(
+        let mitm = forward.mitm.as_ref().map(|_| {
+            let credentials: Arc<dyn CredentialProvider> = credentials.clone();
+            MitmRuntime::new(
+                &server.configuration,
+                &forward,
+                &config.upstreams,
+                credentials,
+                metrics.clone(),
+            )
+            .expect("initialize forward-proxy TLS interception")
+        });
+        let state = Arc::new(ConnectProxy::with_mitm(
             Arc::new(Router::new(&config.upstreams)),
             Arc::new(Verifier::new(
                 config.auth.issuer.clone(),
@@ -189,6 +203,7 @@ fn main() {
             keystore.clone(),
             metrics.clone(),
             forward,
+            mitm.clone(),
         ));
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -216,8 +231,6 @@ fn main() {
         metrics,
     );
 
-    let mut server = Server::new(None).expect("failed to create server");
-    server.bootstrap();
     let mut proxy = http_proxy_service(&server.configuration, service);
     if let Some(tcp) = &config.listen.tcp {
         proxy.add_tcp(tcp);

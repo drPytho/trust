@@ -29,7 +29,9 @@ use crate::config::{AUDIT_UNMATCHED_METRICS_NAME, ForwardProxyConfig};
 use crate::jwt::{VerifiedToken, Verifier};
 use crate::keystore::Keystore;
 use crate::metrics::ProxyMetrics;
-use crate::router::Router;
+use crate::mitm::MitmConnectionContext;
+use crate::mitm::runtime::MitmRuntime;
+use crate::router::{ConnectRoute, Router};
 
 type ResponseBody = BoxBody<Bytes, hyper::Error>;
 type ProxyResponse = Response<ResponseBody>;
@@ -51,7 +53,8 @@ impl ForwardOperation {
 }
 
 enum ConnectDestination {
-    Configured(Arc<crate::config::Upstream>),
+    ConfiguredOpaque(Arc<crate::config::Upstream>),
+    ConfiguredIntercept(Arc<crate::config::Upstream>),
     Audit {
         host: String,
         port: u16,
@@ -62,21 +65,24 @@ enum ConnectDestination {
 impl ConnectDestination {
     fn metrics_name(&self) -> &str {
         match self {
-            ConnectDestination::Configured(upstream) => &upstream.name,
+            ConnectDestination::ConfiguredOpaque(upstream)
+            | ConnectDestination::ConfiguredIntercept(upstream) => &upstream.name,
             ConnectDestination::Audit { .. } => AUDIT_UNMATCHED_METRICS_NAME,
         }
     }
 
     fn required_scope(&self) -> &str {
         match self {
-            ConnectDestination::Configured(upstream) => &upstream.name,
+            ConnectDestination::ConfiguredOpaque(upstream)
+            | ConnectDestination::ConfiguredIntercept(upstream) => &upstream.name,
             ConnectDestination::Audit { scope, .. } => scope,
         }
     }
 
     fn target(&self) -> (&str, u16) {
         match self {
-            ConnectDestination::Configured(upstream) => {
+            ConnectDestination::ConfiguredOpaque(upstream)
+            | ConnectDestination::ConfiguredIntercept(upstream) => {
                 (&upstream.origin.host, upstream.origin.port)
             }
             ConnectDestination::Audit { host, port, .. } => (host, *port),
@@ -95,6 +101,7 @@ pub struct ConnectProxy {
     metrics: Arc<ProxyMetrics>,
     config: ForwardProxyConfig,
     tunnel_slots: Arc<Semaphore>,
+    mitm: Option<Arc<MitmRuntime>>,
 }
 
 impl ConnectProxy {
@@ -105,6 +112,17 @@ impl ConnectProxy {
         metrics: Arc<ProxyMetrics>,
         config: ForwardProxyConfig,
     ) -> ConnectProxy {
+        ConnectProxy::with_mitm(router, verifier, keystore, metrics, config, None)
+    }
+
+    pub fn with_mitm(
+        router: Arc<Router>,
+        verifier: Arc<Verifier>,
+        keystore: Arc<Keystore>,
+        metrics: Arc<ProxyMetrics>,
+        config: ForwardProxyConfig,
+        mitm: Option<Arc<MitmRuntime>>,
+    ) -> ConnectProxy {
         let tunnel_slots = Arc::new(Semaphore::new(config.max_concurrent_tunnels));
         ConnectProxy {
             router,
@@ -113,6 +131,13 @@ impl ConnectProxy {
             metrics,
             config,
             tunnel_slots,
+            mitm,
+        }
+    }
+
+    fn start_background_tasks(&self) {
+        if let Some(mitm) = &self.mitm {
+            mitm.start_background_refresh();
         }
     }
 
@@ -130,7 +155,19 @@ impl ConnectProxy {
         operation: ForwardOperation,
     ) -> ProxyResult<ConnectDestination> {
         match self.router.resolve_connect(host, port) {
-            Some(upstream) => Ok(ConnectDestination::Configured(upstream)),
+            Some(ConnectRoute::Opaque(upstream)) => {
+                Ok(ConnectDestination::ConfiguredOpaque(upstream))
+            }
+            Some(ConnectRoute::Intercept(upstream)) => {
+                if matches!(operation, ForwardOperation::Http) {
+                    self.record_attempt(operation, &upstream.name, "intercept_requires_connect");
+                    return Err(Box::new(response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "intercepted destinations require HTTPS CONNECT\n",
+                    )));
+                }
+                Ok(ConnectDestination::ConfiguredIntercept(upstream))
+            }
             None => match &self.config.audit_unmatched {
                 Some(audit) => {
                     log::warn!(
@@ -271,6 +308,60 @@ impl ConnectProxy {
                 ));
             }
         };
+
+        if let ConnectDestination::ConfiguredIntercept(upstream) = &destination {
+            let Some(mitm) = self.mitm.clone() else {
+                self.record_attempt(ForwardOperation::Connect, metrics_name, "mitm_not_ready");
+                log::error!(
+                    "CONNECT interception rejected reason=mitm_not_ready upstream={metrics_name} \
+                     subject={:?} destination_host={host:?} destination_port={port}",
+                    verified.subject,
+                );
+                return Ok(response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "TLS interception is not initialized\n",
+                ));
+            };
+            let connection = Arc::new(MitmConnectionContext {
+                upstream: upstream.clone(),
+                authority_host: upstream.origin.host.clone(),
+                authority_port: upstream.origin.port,
+                subject: verified.subject.clone(),
+                scopes: verified.scopes.clone(),
+                expires_at: verified.expires_at,
+            });
+            let upgrade = hyper::upgrade::on(&mut request);
+            self.metrics.connect_started(metrics_name);
+            let state = self.clone();
+            let upstream_name = metrics_name.to_string();
+            let subject = verified.subject;
+            tokio::spawn(async move {
+                let _tunnel_slot = tunnel_slot;
+                let started = Instant::now();
+                match upgrade.await {
+                    Ok(upgraded) => {
+                        if let Err(error) = mitm.intercept(upgraded, connection, max_duration).await
+                        {
+                            log::warn!(
+                                "MITM CONNECT ended upstream={upstream_name} subject={subject:?}: {error}"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "CONNECT upgrade failed upstream={upstream_name} subject={subject:?}: {error}"
+                        );
+                    }
+                }
+                state.metrics.connect_finished(
+                    &upstream_name,
+                    started.elapsed().as_secs_f64(),
+                    0,
+                    0,
+                );
+            });
+            return Ok(response(StatusCode::OK, ""));
+        }
 
         let (target_host, target_port) = destination.target();
         let target = match connect_target(
@@ -743,6 +834,7 @@ pub async fn serve_connect(
     state: Arc<ConnectProxy>,
 ) -> io::Result<()> {
     let tls = tls.map(TlsAcceptor::from);
+    state.start_background_tasks();
     loop {
         let (stream, peer) = listener.accept().await?;
         let state = state.clone();
@@ -809,6 +901,26 @@ mod tests {
     }
 
     #[test]
+    fn tunnel_lifetime_is_capped_by_connect_token_expiry() {
+        let now = jsonwebtoken::get_current_timestamp();
+        let token = VerifiedToken {
+            subject: "sandbox".to_string(),
+            scopes: ScopeSet::parse("provider").unwrap(),
+            expires_at: now + 60,
+        };
+        assert_eq!(
+            tunnel_duration(&token, Duration::from_secs(5)),
+            Some(Duration::from_secs(5))
+        );
+
+        let expired = VerifiedToken {
+            expires_at: jsonwebtoken::get_current_timestamp(),
+            ..token
+        };
+        assert!(tunnel_duration(&expired, Duration::from_secs(5)).is_none());
+    }
+
+    #[test]
     fn strips_hop_by_hop_proxy_headers_without_touching_origin_authorization() {
         let mut headers = hyper::HeaderMap::new();
         headers.insert(CONNECTION, HeaderValue::from_static("x-connection-header"));
@@ -858,6 +970,92 @@ mod tests {
         );
     }
 
+    #[test]
+    fn audit_scope_cannot_select_an_intercepted_provider() {
+        let upstream = Arc::new(Upstream {
+            name: "provider".into(),
+            kind: UpstreamKind::Api,
+            listen_host: "provider.proxy.internal".into(),
+            origin: Origin {
+                host: "api.example.com".into(),
+                port: 443,
+                tls: true,
+                sni: "api.example.com".into(),
+            },
+            mode: UpstreamMode::Inject,
+            credential: Some(crate::config::CredentialSource::StaticSecret {
+                secret_ref: "provider-key".into(),
+            }),
+            injection: Some(crate::config::Injection {
+                header: "x-api-key".into(),
+                scheme: crate::config::InjectionScheme::Raw,
+            }),
+            resource: None,
+            git: None,
+            allowed_methods: Vec::new(),
+            allow_connect: false,
+            intercept_connect: true,
+        });
+        let keystore = Arc::new(Keystore::new());
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        keystore.store(build_key_material(&key.serialize_pem(), None).unwrap());
+        let keys = keystore.load().unwrap();
+        let token = Issuer::new("trust".into(), "proxy".into(), Duration::from_secs(60))
+            .mint(
+                &keys,
+                "sandbox-audit",
+                &ScopeSet::parse("outbound-audit").unwrap(),
+                jsonwebtoken::get_current_timestamp(),
+            )
+            .unwrap();
+        let state = ConnectProxy::new(
+            Arc::new(Router::new(std::slice::from_ref(&upstream))),
+            Arc::new(Verifier::new("trust".into(), "proxy".into())),
+            keystore,
+            Arc::new(ProxyMetrics::new()),
+            ForwardProxyConfig {
+                addr: "127.0.0.1:6180".into(),
+                tls: false,
+                connect_timeout: Duration::from_secs(1),
+                idle_timeout: Duration::from_secs(5),
+                max_tunnel_duration: Duration::from_secs(30),
+                max_concurrent_tunnels: 10,
+                allow_private_ips: false,
+                audit_unmatched: Some(AuditUnmatchedConfig {
+                    scope: "outbound-audit".into(),
+                }),
+                mitm: None,
+            },
+        );
+        let destination = state
+            .resolve_destination("API.EXAMPLE.COM.", 443, ForwardOperation::Connect)
+            .unwrap();
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            PROXY_AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        let result = state.authorize(
+            &headers,
+            &destination,
+            "api.example.com",
+            443,
+            ForwardOperation::Connect,
+        );
+        let response = match result {
+            Err(response) => response,
+            Ok(_) => panic!("audit scope must not authorize a named provider"),
+        };
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response =
+            match state.resolve_destination("api.example.com", 443, ForwardOperation::Http) {
+                Err(response) => response,
+                Ok(_) => panic!("intercept routes must require CONNECT"),
+            };
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
     #[tokio::test]
     async fn connect_is_authenticated_scoped_and_tunnels_bytes() {
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -901,6 +1099,7 @@ mod tests {
             git: None,
             allowed_methods: Vec::new(),
             allow_connect: true,
+            intercept_connect: false,
         });
         let router = Arc::new(Router::new(&[upstream]));
         let keystore = Arc::new(Keystore::new());
@@ -932,6 +1131,7 @@ mod tests {
                 max_concurrent_tunnels: 10,
                 allow_private_ips: true,
                 audit_unmatched: None,
+                mitm: None,
             },
         ));
         let server = tokio::spawn(serve_connect(listener, None, state));
@@ -1061,6 +1261,7 @@ mod tests {
                 audit_unmatched: Some(AuditUnmatchedConfig {
                     scope: "outbound-audit".into(),
                 }),
+                mitm: None,
             },
         ));
         let server = tokio::spawn(serve_connect(listener, None, state));
@@ -1166,6 +1367,7 @@ mod tests {
                 audit_unmatched: Some(AuditUnmatchedConfig {
                     scope: "outbound-audit".into(),
                 }),
+                mitm: None,
             },
         ));
         let server = tokio::spawn(serve_connect(listener, None, state));

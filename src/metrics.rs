@@ -16,6 +16,10 @@ pub struct ProxyMetrics {
     connect_duration: HistogramVec,
     connect_bytes: IntCounterVec,
     forward_proxy_requests: IntCounterVec,
+    mitm_handshakes: IntCounterVec,
+    mitm_certificate_cache: IntCounterVec,
+    mitm_active_connections: IntGaugeVec,
+    mitm_connection_duration: HistogramVec,
 }
 
 impl ProxyMetrics {
@@ -106,6 +110,38 @@ impl ProxyMetrics {
             &["upstream", "result"],
         )
         .expect("valid HTTP forward-proxy requests metric");
+        let mitm_handshakes = IntCounterVec::new(
+            Opts::new(
+                "trust_mitm_handshakes_total",
+                "TLS interception handshakes by configured upstream and bounded result.",
+            ),
+            &["upstream", "result"],
+        )
+        .expect("valid MITM handshake metric");
+        let mitm_certificate_cache = IntCounterVec::new(
+            Opts::new(
+                "trust_mitm_certificate_cache_total",
+                "TLS interception leaf certificate cache outcomes.",
+            ),
+            &["result"],
+        )
+        .expect("valid MITM cache metric");
+        let mitm_active_connections = IntGaugeVec::new(
+            Opts::new(
+                "trust_mitm_active_connections",
+                "Active TLS-intercepted connections by configured upstream.",
+            ),
+            &["upstream"],
+        )
+        .expect("valid MITM active metric");
+        let mitm_connection_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "trust_mitm_connection_duration_seconds",
+                "TLS-intercepted connection duration by configured upstream.",
+            ),
+            &["upstream"],
+        )
+        .expect("valid MITM connection duration metric");
 
         registry
             .register(Box::new(requests.clone()))
@@ -140,6 +176,18 @@ impl ProxyMetrics {
         registry
             .register(Box::new(forward_proxy_requests.clone()))
             .expect("register HTTP forward-proxy requests metric");
+        registry
+            .register(Box::new(mitm_handshakes.clone()))
+            .expect("register MITM handshake metric");
+        registry
+            .register(Box::new(mitm_certificate_cache.clone()))
+            .expect("register MITM cache metric");
+        registry
+            .register(Box::new(mitm_active_connections.clone()))
+            .expect("register MITM active metric");
+        registry
+            .register(Box::new(mitm_connection_duration.clone()))
+            .expect("register MITM connection duration metric");
 
         ProxyMetrics {
             registry,
@@ -154,6 +202,10 @@ impl ProxyMetrics {
             connect_duration,
             connect_bytes,
             forward_proxy_requests,
+            mitm_handshakes,
+            mitm_certificate_cache,
+            mitm_active_connections,
+            mitm_connection_duration,
         }
     }
 
@@ -232,6 +284,33 @@ impl ProxyMetrics {
             .inc();
     }
 
+    pub fn mitm_handshake(&self, upstream: &str, result: &str) {
+        self.mitm_handshakes
+            .with_label_values(&[upstream, result])
+            .inc();
+    }
+
+    pub fn mitm_certificate_cache(&self, result: &str) {
+        self.mitm_certificate_cache
+            .with_label_values(&[result])
+            .inc();
+    }
+
+    pub fn mitm_connection_started(&self, upstream: &str) {
+        self.mitm_active_connections
+            .with_label_values(&[upstream])
+            .inc();
+    }
+
+    pub fn mitm_connection_finished(&self, upstream: &str, elapsed_seconds: f64) {
+        self.mitm_active_connections
+            .with_label_values(&[upstream])
+            .dec();
+        self.mitm_connection_duration
+            .with_label_values(&[upstream])
+            .observe(elapsed_seconds);
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>, prometheus::Error> {
         let encoder = prometheus::TextEncoder::new();
         let families = self.registry.gather();
@@ -259,6 +338,10 @@ mod tests {
         metrics.credential_resolution("anthropic", "static-secret", "static", 0.01);
         metrics.connect_started("docs");
         metrics.connect_finished("docs", 0.5, 12, 34);
+        metrics.mitm_handshake("anthropic", "established");
+        metrics.mitm_certificate_cache("hit");
+        metrics.mitm_connection_started("anthropic");
+        metrics.mitm_connection_finished("anthropic", 0.1);
         metrics.request_finished("anthropic", 200, 0.25);
 
         let output = String::from_utf8(metrics.encode().unwrap()).unwrap();
@@ -285,6 +368,15 @@ mod tests {
             output.contains(
                 "trust_connect_bytes_total{direction=\"to_upstream\",upstream=\"docs\"} 12"
             )
+        );
+        assert!(output.contains(
+            "trust_mitm_handshakes_total{result=\"established\",upstream=\"anthropic\"} 1"
+        ));
+        assert!(output.contains("trust_mitm_certificate_cache_total{result=\"hit\"} 1"));
+        assert!(output.contains("trust_mitm_active_connections{upstream=\"anthropic\"} 0"));
+        assert!(
+            output
+                .contains("trust_mitm_connection_duration_seconds_count{upstream=\"anthropic\"} 1")
         );
     }
 }

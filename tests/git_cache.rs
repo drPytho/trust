@@ -450,6 +450,7 @@ fn build_proxy_upstream(origin_port: u16, storage_path: &Path) -> Arc<Upstream> 
         }),
         allowed_methods: Vec::new(),
         allow_connect: false,
+        intercept_connect: false,
     })
 }
 

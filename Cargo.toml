@@ -45,9 +45,10 @@ hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 tokio-rustls = "0.26"
+rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
+rand = "0.9"
 
 [dev-dependencies]
-rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
 openssl = "0.10"
