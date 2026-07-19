@@ -19,6 +19,24 @@ kubectl -n trust-system create secret generic trust-tls \
   --from-file=client-ca.pem=/path/to/client-ca.pem
 ```
 
+The example also enables interception for one provider. Generate or obtain a
+dedicated egress CA hierarchy first; the root must stay outside the cluster.
+For development, `./scripts/dev-egress-mitm-ca.sh dev-egress-mitm-ca` creates
+the expected layout. Mount only the online intermediate into Trust:
+
+```bash
+kubectl -n trust-system create secret generic trust-egress-mitm-intermediate \
+  --from-file=intermediate-chain.pem=dev-egress-mitm-ca/intermediate/intermediate-chain.pem \
+  --from-file=intermediate.key=dev-egress-mitm-ca/intermediate/intermediate.key
+```
+
+Never add the root private key to this Secret. The separate
+`trust-egress-mitm-ca` ConfigMap in `client-workload.yaml` contains only the
+public egress root and is intended solely for a tenant explicitly enabled for
+interception. Replace its placeholder with `egress-root-ca.pem` (or create the
+ConfigMap from that file). Do not mount the intermediate, any private key, or a
+cluster-wide extra root into ordinary workloads.
+
 Apply the example:
 
 ```bash
@@ -78,6 +96,16 @@ certificate, then mint the `linear` scope. Workloads POST to
 `https://linear.proxy.internal/graphql` with `Authorization: Bearer <trust JWT>`;
 trust replaces that header with the raw Linear key. With `@linear/sdk`, use the
 trust JWT as `accessToken` and the complete proxy GraphQL URL as `apiUrl`.
+
+The `anthropic` upstream additionally sets `intercept_connect = true`. A
+selected Sandbox may call `https://api.anthropic.com` through `HTTPS_PROXY`
+with its short-lived `anthropic` scope and the public egress root in its TLS
+trust bundle. Trust requires exact CONNECT authority, TLS SNI, and inner HTTP
+Host agreement, then injects the configured `x-api-key`; an `outbound-audit`
+token cannot reach this path. The existing `anthropic.proxy.internal` reverse
+proxy remains a compatibility path. HTTP/2, HTTP/3/QUIC, certificate-pinned,
+and non-reviewed provider traffic should remain opaque or use a separately
+reviewed exception.
 
 Mint a JWT with both exact repository scopes, then configure the sandbox:
 
@@ -260,11 +288,18 @@ After observing the workload, add explicit passthrough upstreams for approved
 destinations and remove both `audit_unmatched` and the `outbound-audit` grant.
 
 CONNECT carries an opaque TLS stream, so it cannot inject credentials or
-enforce HTTP paths or methods. Keep credential-injected endpoints on the
-reverse proxy (`https://anthropic.proxy.internal/...`, for example), and use
-CONNECT for explicitly allowlisted straight-through destinations. Configure
-cluster DNS for each `*.proxy.internal` reverse-proxy name to resolve to the
-`trust` Service, or use equivalent stable internal DNS names in `listen_host`.
+enforce HTTP paths or methods. That remains the behavior for audit traffic and
+`allow_connect = true` upstreams. Only a reviewed `intercept_connect = true`
+API inject upstream enters the dedicated TLS-interception path; it is HTTP/1.1
+only and never selected by the audit fallback. Configure cluster DNS for each
+`*.proxy.internal` reverse-proxy name to resolve to the `trust` Service, or use
+equivalent stable internal DNS names in `listen_host`.
+
+The `sandbox-egress-network-policy.yaml` allowlists Trust, DNS, and the GKE
+metadata exception only. It intentionally has no UDP/443 rule, so QUIC cannot
+bypass the HTTP proxy. The Sandbox operator is responsible for injecting
+`HTTP_PROXY`/`HTTPS_PROXY`, the public egress root only into opt-in tenants,
+and enforcing any direct-egress exceptions through a separate review.
 
 An orchestrator can mint a narrowly scoped JWT over mTLS, pass the short-lived
 token and proxy URL into the sandbox, and configure clients in either of these

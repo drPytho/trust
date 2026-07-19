@@ -18,6 +18,20 @@ data:
     REPLACE_WITH_TRUST_SERVER_CA_CERTIFICATE
     -----END CERTIFICATE-----
 ---
+# Mount this public root only into Sandbox workloads that are explicitly opted
+# in to TLS interception. It is not Trust's server CA and must never contain
+# an intermediate or any private key.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trust-egress-mitm-ca
+  namespace: workloads
+data:
+  ca.crt: |
+    -----BEGIN CERTIFICATE-----
+    REPLACE_WITH_TRUST_EGRESS_MITM_ROOT_CA_CERTIFICATE
+    -----END CERTIFICATE-----
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -58,6 +72,17 @@ spec:
             # Proxy-Authorization: Bearer <JWT> (or Basic jwt:<JWT>) here.
             - name: TRUST_FORWARD_PROXY
               value: http://trust.trust-system.svc:6180
+            # The sandbox operator may inject these globally instead. Keep
+            # NO_PROXY below so token minting and internal reverse-proxy names
+            # do not traverse the generic egress listener.
+            - name: HTTP_PROXY
+              value: http://trust.trust-system.svc:6180
+            - name: HTTPS_PROXY
+              value: http://trust.trust-system.svc:6180
+            # Configure the runtime's CA bundle to include this opt-in public
+            # root for intercepted provider TLS. Do not distribute a signer.
+            - name: TRUST_EGRESS_MITM_CA
+              value: /var/run/trust/egress-mitm/ca.crt
             - name: NO_PROXY
               value: >-
                 metadata.google.internal,
@@ -72,6 +97,9 @@ spec:
             - name: trust-server-ca
               mountPath: /var/run/trust/server
               readOnly: true
+            - name: trust-egress-mitm-ca
+              mountPath: /var/run/trust/egress-mitm
+              readOnly: true
       volumes:
         - name: trust-client
           secret:
@@ -79,3 +107,6 @@ spec:
         - name: trust-server-ca
           configMap:
             name: trust-server-ca
+        - name: trust-egress-mitm-ca
+          configMap:
+            name: trust-egress-mitm-ca

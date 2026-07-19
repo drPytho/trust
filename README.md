@@ -10,8 +10,8 @@ destinations can instead pass caller credentials through or accept authenticated
 forward-proxy traffic. The upstream credential is never handed to clients, and the client's JWT
 is never forwarded upstream.
 
-> **Status:** credential-injected API proxying, authenticated passthrough, HTTP(S) forward proxying,
-> and git smart-HTTP caching are implemented. API credentials may be static Secret Manager values,
+> **Status:** credential-injected API proxying, authenticated passthrough, selective TLS interception,
+> HTTP(S) forward proxying, and git smart-HTTP caching are implemented. API credentials may be static Secret Manager values,
 > repository-scoped GitHub App installation tokens, or Google ADC access tokens for services such
 > as Artifact Registry.
 
@@ -68,6 +68,10 @@ key to be loaded. The exported proxy metrics are:
 - `trust_connect_duration_seconds{upstream}`
 - `trust_connect_bytes_total{upstream,direction}`
 - `trust_forward_proxy_requests_total{upstream,result}`
+- `trust_mitm_handshakes_total{upstream,result}`
+- `trust_mitm_certificate_cache_total{result}`
+- `trust_mitm_active_connections{upstream}`
+- `trust_mitm_connection_duration_seconds{upstream}`
 
 Rejected reverse-proxy and forward-proxy calls are also logged at `WARN` with bounded reason labels
 and safe request metadata. CONNECT distinguishes invalid authorities, unknown destinations, missing
@@ -141,7 +145,8 @@ Rules:
   injection while retaining scoped JWT authorization and preserving the caller's headers.
 - **Authenticated HTTP(S) forwarding** — an optional forward-proxy listener accepts absolute-form
   HTTP and HTTPS CONNECT requests. Explicit destinations retain their named scope; an opt-in audit
-  fallback allows all public destinations with the dedicated `outbound-audit` scope.
+  fallback allows all public destinations with the dedicated `outbound-audit` scope. Selected HTTPS
+  origins can instead opt in to per-host TLS interception and provider credential injection.
 - **Repo-scoped authz** for `github-repo` upstreams — the request path is parsed for
   `owner/repo`; the JWT scope must cover it. `github-cli-repo` additionally supports the
   GitHub Enterprise-style REST and repository-rooted GraphQL requests emitted by `gh`.
@@ -183,6 +188,16 @@ max_concurrent_tunnels = 1024
 allow_private_ips = false
 # Audit fallback for otherwise-unmatched public HTTP(S) destinations:
 # audit_unmatched = { scope = "outbound-audit" }
+
+# Optional dedicated online signer for explicitly intercepted HTTPS CONNECT
+# destinations. Mount an intermediate chain/key here; never mount the root.
+[forward_proxy.mitm]
+issuer_cert_chain_path = "/etc/trust/egress-mitm/intermediate-chain.pem"
+issuer_key_path = "/etc/trust/egress-mitm/intermediate.key"
+leaf_ttl = "24h"
+refresh_before = "1h"
+leaf_cache_capacity = 256
+handshake_timeout = "10s"
 
 # JWT auth: issuer/audience embedded in minted tokens and verified on every request.
 [auth]
@@ -235,6 +250,9 @@ listen_host = "anthropic.proxy.internal"
 origin      = "https://api.anthropic.com"
 secret_ref  = "projects/my-proj/secrets/anthropic-key/versions/latest"
 injection   = { header = "x-api-key", scheme = "raw" }
+# A standard HTTPS client can use api.anthropic.com through HTTPS_PROXY.
+# It still needs the named `anthropic` scope; outbound-audit does not suffice.
+intercept_connect = true
 
 # Linear's GraphQL API accepts personal API keys as `Authorization: <key>`
 # (without a Bearer prefix). If the stored secret is an OAuth access token,
@@ -306,9 +324,12 @@ is now JWT-based via the issuance endpoint.
 | `basic`  | `Basic base64(<secret>)`           | HTTP Basic (secret is the `user:pass` string) |
 
 Config is validated at startup: duplicate upstream names/listen hosts, malformed origins, ambiguous
-CONNECT authorities, zero tunnel capacity, and CONNECT on injection/resource/method-restricted
-upstreams are rejected before the server binds. `secret_ref = "..."` remains supported as
-shorthand for `credential = { kind = "static-secret", secret_ref = "..." }`.
+CONNECT authorities, zero tunnel capacity, and invalid CONNECT mode combinations are rejected before
+the server binds. `allow_connect` is opaque passthrough only. `intercept_connect` requires an API
+inject upstream with an HTTPS, exact DNS origin and `[forward_proxy.mitm]`; it cannot be combined
+with `allow_connect`, an IP/wildcard origin, or a cache too small to prewarm every interception host.
+`secret_ref = "..."` remains supported as shorthand for `credential = { kind = "static-secret",
+secret_ref = "..." }`.
 
 ### npm client configuration
 
@@ -330,11 +351,19 @@ Registry Writer access.
 
 ### Using the HTTP(S) forward proxy
 
-The listener accepts absolute-form `http://` requests and HTTPS CONNECT tunnels. Explicit CONNECT
-destinations must exactly match a configured passthrough upstream's `host:port` and require that
-upstream's scope. When `audit_unmatched` is configured, any public destination instead requires
-the audit scope and is logged for review. Because CONNECT is opaque to `trust`, it cannot inject
-credentials or enforce HTTP paths or methods; use a reverse-proxy host for those policies.
+The listener accepts absolute-form `http://` requests and HTTPS CONNECT tunnels. Its paths are
+deliberately distinct:
+
+| CONNECT destination | Required scope | TLS handling | Credential injection |
+|---|---|---|---|
+| Unknown public host with `audit_unmatched` | `outbound-audit` | opaque TCP tunnel | never |
+| `allow_connect = true` upstream | that upstream's name | opaque TCP tunnel | never |
+| `intercept_connect = true` upstream | that upstream's name | per-host TLS termination and verified upstream TLS | configured inject mode |
+
+An exact configured route takes precedence over the audit fallback. Consequently an
+`outbound-audit` token cannot select a configured intercepted host: it receives `403` before the
+TLS upgrade begins. Opaque paths remain compatible with HTTP/2, gRPC, and other TLS protocols, but
+the intercepted path deliberately accepts HTTP/1.1 only in this release.
 
 Clients that can set proxy headers directly should use Bearer authentication:
 
@@ -376,6 +405,47 @@ multicast, documentation, and carrier-grade NAT addresses by default. Set `allow
 true` only when explicitly configured internal upstreams are required. Tunnels end at JWT expiry,
 the idle timeout, or `max_tunnel_duration`, whichever comes first.
 
+#### Selective TLS interception
+
+TLS interception is an explicit tenant opt-in, not a generic egress feature. Create a dedicated
+offline root and a scoped online intermediate; do not reuse the reverse-proxy certificate, workload
+mTLS CA, or JWT signing key. For development, the helper creates the three materials separately:
+
+```bash
+./scripts/dev-egress-mitm-ca.sh dev-egress-mitm-ca
+# Trust mount: dev-egress-mitm-ca/intermediate/{intermediate-chain.pem,intermediate.key}
+# Opt-in workload trust anchor: dev-egress-mitm-ca/egress-root-ca.pem
+# Keep dev-egress-mitm-ca/root/egress-root-ca.key offline.
+```
+
+Mount only the intermediate chain/key read-only in the Trust Pod and install only the public root
+in the opted-in Sandbox CA bundle. `trust` synchronously prewarms a bounded in-memory leaf cache at
+startup and refreshes it locally; TLS handshakes never call Secret Manager or KMS. Each leaf has one
+exact DNS SAN, the response chain omits the root, and upstream certificate/hostname verification
+stays enabled.
+
+For an intercepted origin, the CONNECT authority, TLS SNI, and decrypted HTTP/1 `Host` must all
+match the canonical configured host and port. A mismatch, missing SNI, absent/duplicate `Host`,
+expired CONNECT JWT, cache miss, or unsupported ALPN fails before an upstream request. The outer
+`Proxy-Authorization` and client `Authorization` are stripped; the stored provider credential is
+the only credential injected upstream.
+
+With a plaintext in-cluster proxy listener, a client that trusts the egress root can make a normal
+provider request without changing its destination hostname:
+
+```bash
+curl --proxy http://trust.example.internal:6180 \
+  --proxy-header "Proxy-Authorization: Bearer $ANTHROPIC_JWT" \
+  --cacert dev-egress-mitm-ca/egress-root-ca.pem \
+  https://api.anthropic.com/v1/messages
+```
+
+When `forward_proxy.tls = true`, keep the existing `--proxy-cacert` for the outer proxy TLS
+certificate and use `--cacert` (or a combined workload CA bundle) for the egress root. Certificate
+pinning and clients that require HTTP/2/HTTP/3 are not compatible with interception; retain an
+opaque or reverse-proxy route only after an explicit review. Block direct UDP/443 for egress-enforced
+Sandboxes so QUIC cannot bypass the HTTP proxy policy.
+
 #### Auditing unmatched outbound destinations
 
 During migration, the forward proxy can allow otherwise-unmatched public destinations while
@@ -403,9 +473,10 @@ headers and tokens are never logged.
 
 Exact configured CONNECT destinations always take precedence and continue to require their named
 upstream scopes. Give a sandbox its intended named scopes plus `outbound-audit` during discovery,
-then convert observed destinations into explicit passthrough upstreams and remove the audit scope
-and setting to return to deny-by-default behavior. The audit fallback does not apply to reverse
-proxy hosts or private destinations when `allow_private_ips = false`.
+then convert observed destinations into explicit opaque passthrough upstreams or carefully reviewed
+`intercept_connect` providers, and remove the audit scope and setting to return to deny-by-default
+behavior. The audit fallback never enters interception and does not apply to reverse-proxy hosts or
+private destinations when `allow_private_ips = false`.
 
 ## Running
 
@@ -542,10 +613,13 @@ These inherited Git settings avoid CONNECT and ensure the git subprocess also st
 - No request reaches an upstream without a valid, authorized JWT (verified ES256, `iss`, `aud`,
   `exp`, and scope).
 - Unknown hosts are denied, and passthrough must be enabled explicitly per configured upstream.
-- CONNECT destinations are denied unless their exact origin `host:port` has `allow_connect = true`.
-  CONNECT reuses the same JWT verifier, scope names, upstream allowlist, logs, and metrics as the
-  reverse proxy, but cannot inspect or inject into the encrypted tunnel. The optional audit fallback
-  is the only policy that permits otherwise-unmatched public destinations.
+- CONNECT destinations are denied unless their exact origin `host:port` has `allow_connect = true`
+  (opaque) or `intercept_connect = true` (selective TLS interception). The latter requires a named
+  provider scope, exact CONNECT/SNI/Host agreement, and a dedicated egress CA; it cannot be reached
+  with `outbound-audit`. Opaque CONNECT reuses the same JWT verifier, scope names, upstream
+  allowlist, logs, and metrics but never inspects or injects into the encrypted tunnel. The optional
+  audit fallback is the only policy that permits otherwise-unmatched public destinations, and it is
+  always opaque.
 - The issuance server is mTLS-only — unauthenticated clients cannot reach the `/token` endpoint.
 - Scopes are capped at issuance to the per-identity policy; clients cannot self-escalate.
 - The config file contains no plaintext secrets — only secret-manager references. Keep your

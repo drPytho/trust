@@ -20,8 +20,8 @@ A client authenticates to the **issuance** endpoint with an mTLS client cert
 (its SPIFFE identity), receives a short-lived scoped JWT, then uses that JWT on
 the proxy. trust verifies the JWT and authorizes by scope. A reverse-proxy
 upstream can inject a server-side credential or pass the caller's credential
-through; a CONNECT upstream opens an opaque tunnel only to an exact configured
-destination unless the audited fallback is enabled.
+through; a CONNECT upstream is either an opaque tunnel or, for an explicitly
+configured provider, a selectively intercepted HTTP/1.1 connection.
 
 ## Prerequisites
 
@@ -76,6 +76,29 @@ SVIDs issued by SPIRE or your service mesh. trust only needs: a server cert/key
 for `[tls]`, and the client CA bundle at `[issuance].client_ca_path` that signs
 your callers' certs.
 
+### Optional: dedicated egress interception CA
+
+TLS interception uses a separate CA hierarchy. The root stays offline; Trust
+receives only a scoped intermediate and explicitly opted-in Sandbox workloads
+receive only the public root. Do not reuse `[tls]`, the workload mTLS CA, or the
+JWT signing key.
+
+For development:
+
+```bash
+./scripts/dev-egress-mitm-ca.sh dev-egress-mitm-ca
+# Mount in Trust only:
+#   dev-egress-mitm-ca/intermediate/intermediate-chain.pem
+#   dev-egress-mitm-ca/intermediate/intermediate.key
+# Install in opted-in workload trust bundles only:
+#   dev-egress-mitm-ca/egress-root-ca.pem
+```
+
+Never mount or distribute `dev-egress-mitm-ca/root/egress-root-ca.key`. In
+production, generate and retain the root outside the cluster, rotate the
+intermediate deliberately, and use root removal from a tenant bundle as the
+immediate trust rollback.
+
 ## 4. Configuration
 
 trust reads a TOML file (`TRUST_CONFIG`, default `/etc/trust/config.toml` in the
@@ -98,6 +121,14 @@ idle_timeout = "5m"
 max_tunnel_duration = "1h"
 max_concurrent_tunnels = 1024
 allow_private_ips = false
+
+[forward_proxy.mitm]                  # enable only with intercept_connect routes
+issuer_cert_chain_path = "/etc/trust/egress-mitm/intermediate-chain.pem"
+issuer_key_path = "/etc/trust/egress-mitm/intermediate.key"
+leaf_ttl = "24h"
+refresh_before = "1h"
+leaf_cache_capacity = 256
+handshake_timeout = "10s"
 
 [auth]
 issuer   = "https://trust.local/"
@@ -126,6 +157,7 @@ listen_host = "anthropic.proxy.internal"     # Host header routes here
 origin = "https://api.anthropic.com"
 secret_ref = "projects/PROJECT/secrets/anthropic-key/versions/latest"
 injection = { header = "x-api-key", scheme = "raw" }
+intercept_connect = true               # api.anthropic.com through HTTPS_PROXY
 
 # Linear personal API keys use `Authorization: <key>` without a Bearer prefix.
 # Use `scheme = "bearer"` instead when storing a Linear OAuth access token.
@@ -160,6 +192,7 @@ docker run --rm \
   -p 6191:6191 -p 6443:6443 -p 6180:6180 -p 8443:8443 -p 8080:8080 \
   -v "$PWD/config.toml:/etc/trust/config.toml:ro" \
   -v "$PWD/certs:/etc/trust/certs:ro" \
+  -v "$PWD/dev-egress-mitm-ca/intermediate:/etc/trust/egress-mitm:ro" \
   -v "$HOME/.config/gcloud/application_default_credentials.json:/gcp/adc.json:ro" \
   -e GOOGLE_APPLICATION_CREDENTIALS=/gcp/adc.json \
   -e RUST_LOG=info \
@@ -247,6 +280,26 @@ NetworkPolicy-restricted internal listener configured with `tls = false`, use
 same URL. Unknown destinations or ports receive `403` unless `audit_unmatched`
 is configured.
 
+**Selective HTTPS interception** (the JWT needs the named `anthropic` scope,
+not `outbound-audit`):
+
+```bash
+./scripts/dev-egress-mitm-ca.sh dev-egress-mitm-ca
+JWT=$(./scripts/mint-jwt.sh "anthropic")
+curl --proxy https://localhost:6180 \
+  --proxy-cacert certs/server.crt \
+  --proxy-header "Proxy-Authorization: Bearer $JWT" \
+  --cacert dev-egress-mitm-ca/egress-root-ca.pem \
+  https://api.anthropic.com/v1/messages
+```
+
+The CONNECT authority, TLS SNI, and decrypted HTTP `Host` must match the exact
+configured DNS host and port. Trust presents a cached one-host leaf from its
+dedicated intermediate, strips both client authorization headers, injects the
+configured provider credential, and still verifies the upstream TLS certificate.
+The first release supports HTTP/1.1 inside an intercepted tunnel only. Keep
+certificate-pinned, HTTP/2, HTTP/3, or unreviewed providers opaque.
+
 **git smart-HTTP cache:**
 
 ```bash
@@ -287,10 +340,12 @@ curl -sS https://anthropic.proxy.internal:6443/v1/models \
   proxy DNS names in its SANs. JWKS (`8080`) is safe to expose to verifiers, but
   `/metrics` may reveal operational metadata. The issuance endpoint (`8443`)
   must stay mTLS-only.
-- **HTTP(S) forwarding:** only passthrough API upstreams with `allow_connect = true`
-  are reachable by CONNECT, matched by exact origin `host:port`. The optional
-  `audit_unmatched` fallback allows public destinations with its own scope and
-  logs every unmatched destination. Private, loopback, link-local, and other
+- **HTTP(S) forwarding:** `allow_connect = true` creates an opaque, exact
+  passthrough CONNECT route; `intercept_connect = true` creates an exact
+  HTTPS provider route with TLS termination, HTTP/1 request policy, and inject
+  mode. The optional `audit_unmatched` fallback is always opaque and can never
+  trigger provider credential injection. Intercepted routes require a named
+  upstream scope, not `outbound-audit`. Private, loopback, link-local, and other
   non-public targets are rejected unless explicitly enabled. Tunnels end at JWT
   expiry, idle timeout, maximum duration, or process shutdown.
 - **Token TTL:** `token_ttl` (configured as 7d in this local example) trades

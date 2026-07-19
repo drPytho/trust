@@ -32,6 +32,16 @@ data:
     # should reach otherwise-unmatched public HTTP(S) destinations.
     # audit_unmatched = { scope = "outbound-audit" }
 
+    # This signer is a dedicated online egress intermediate. It is unrelated
+    # to the reverse-proxy server certificate, issuance client CA, and JWT key.
+    [forward_proxy.mitm]
+    issuer_cert_chain_path = "/etc/trust/egress-mitm/intermediate-chain.pem"
+    issuer_key_path = "/etc/trust/egress-mitm/intermediate.key"
+    leaf_ttl = "24h"
+    refresh_before = "1h"
+    leaf_cache_capacity = 256
+    handshake_timeout = "10s"
+
     [auth]
     issuer = "https://trust.example.com/"
     audience = "trust-proxy"
@@ -65,6 +75,10 @@ data:
     origin = "https://api.anthropic.com"
     secret_ref = "projects/PROJECT_ID/secrets/anthropic-key/versions/latest"
     injection = { header = "x-api-key", scheme = "raw" }
+    # Opt-in standard HTTPS proxy path. A sandbox must trust the dedicated
+    # egress root and mint the named `anthropic` scope; outbound-audit alone
+    # can never enter this credential-injection path.
+    intercept_connect = true
 
     # Linear's GraphQL API accepts personal API keys as a raw Authorization
     # value. Store the key in Secret Manager; workloads supply only a trust JWT.
@@ -188,6 +202,9 @@ spec:
             - name: tls
               mountPath: /etc/trust/tls
               readOnly: true
+            - name: egress-mitm-intermediate
+              mountPath: /etc/trust/egress-mitm
+              readOnly: true
             - name: git-mirrors
               mountPath: /var/lib/trust/mirrors
       volumes:
@@ -197,6 +214,11 @@ spec:
         - name: tls
           secret:
             secretName: trust-tls
+        # Contains only intermediate-chain.pem and intermediate.key. Never
+        # place the offline root key in this Secret or any running Pod.
+        - name: egress-mitm-intermediate
+          secret:
+            secretName: trust-egress-mitm-intermediate
         - name: git-mirrors
           emptyDir: {}
 ---

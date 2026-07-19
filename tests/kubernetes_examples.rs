@@ -80,6 +80,17 @@ fn deployment_config_allowlists_google_api_connect_endpoints() {
         forward_proxy.audit_unmatched.is_none(),
         "the production-oriented example must remain deny-by-default"
     );
+    let mitm = forward_proxy
+        .mitm
+        .expect("example must configure its dedicated egress signer");
+    assert_eq!(
+        mitm.issuer_cert_chain_path,
+        "/etc/trust/egress-mitm/intermediate-chain.pem"
+    );
+    assert_eq!(
+        mitm.issuer_key_path,
+        "/etc/trust/egress-mitm/intermediate.key"
+    );
 
     for (name, host) in [
         ("gcp-pubsub", "pubsub.googleapis.com"),
@@ -121,6 +132,15 @@ fn deployment_config_allowlists_google_api_connect_endpoints() {
     ));
     assert!(allowed_scopes.iter().any(|scope| scope == "linear"));
 
+    let anthropic = config
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.name == "anthropic")
+        .expect("example must include the opt-in Anthropic interception route");
+    assert!(anthropic.intercept_connect);
+    assert!(!anthropic.allow_connect);
+    assert!(allowed_scopes.iter().any(|scope| scope == "anthropic"));
+
     let github = config
         .upstreams
         .iter()
@@ -145,6 +165,76 @@ fn deployment_config_allowlists_google_api_connect_endpoints() {
         allowed_scopes
             .iter()
             .any(|scope| scope == "github-git:ORG/REPOSITORY")
+    );
+}
+
+#[test]
+fn kubernetes_examples_keep_mitm_signer_and_workload_ca_separate() {
+    let trust_documents = yaml_documents("deployment.yaml");
+    let trust = document(&trust_documents, "Deployment", "trust");
+    let trust_pod = &trust["spec"]["template"]["spec"];
+    let trust_container = &trust_pod["containers"]
+        .as_sequence()
+        .expect("trust deployment must have a container")[0];
+    let signer_mount = trust_container["volumeMounts"]
+        .as_sequence()
+        .expect("trust container must have volume mounts")
+        .iter()
+        .find(|mount| mount["name"].as_str() == Some("egress-mitm-intermediate"))
+        .expect("trust must mount the egress signer");
+    assert_eq!(
+        signer_mount["mountPath"].as_str(),
+        Some("/etc/trust/egress-mitm")
+    );
+    assert_eq!(signer_mount["readOnly"].as_bool(), Some(true));
+    let signer_volume = trust_pod["volumes"]
+        .as_sequence()
+        .expect("trust pod must have volumes")
+        .iter()
+        .find(|volume| volume["name"].as_str() == Some("egress-mitm-intermediate"))
+        .expect("trust must define the egress signer volume");
+    assert_eq!(
+        signer_volume["secret"]["secretName"].as_str(),
+        Some("trust-egress-mitm-intermediate")
+    );
+
+    let workload_documents = yaml_documents("client-workload.yaml");
+    let workload_ca = document(&workload_documents, "ConfigMap", "trust-egress-mitm-ca");
+    let ca_data = workload_ca["data"]
+        .as_mapping()
+        .expect("egress CA ConfigMap must have data");
+    assert_eq!(ca_data.len(), 1, "workload receives only the public CA");
+    let ca = workload_ca["data"]["ca.crt"]
+        .as_str()
+        .expect("egress CA ConfigMap must provide ca.crt");
+    assert!(ca.contains("BEGIN CERTIFICATE"));
+    assert!(!ca.contains("PRIVATE KEY"));
+
+    let workload = document(&workload_documents, "Deployment", "my-service");
+    let workload_pod = &workload["spec"]["template"]["spec"];
+    let workload_container = &workload_pod["containers"]
+        .as_sequence()
+        .expect("workload deployment must have a container")[0];
+    let ca_mount = workload_container["volumeMounts"]
+        .as_sequence()
+        .expect("workload container must have volume mounts")
+        .iter()
+        .find(|mount| mount["name"].as_str() == Some("trust-egress-mitm-ca"))
+        .expect("workload must mount the opt-in public CA");
+    assert_eq!(
+        ca_mount["mountPath"].as_str(),
+        Some("/var/run/trust/egress-mitm")
+    );
+    assert_eq!(ca_mount["readOnly"].as_bool(), Some(true));
+    let ca_volume = workload_pod["volumes"]
+        .as_sequence()
+        .expect("workload pod must have volumes")
+        .iter()
+        .find(|volume| volume["name"].as_str() == Some("trust-egress-mitm-ca"))
+        .expect("workload must define the egress CA volume");
+    assert_eq!(
+        ca_volume["configMap"]["name"].as_str(),
+        Some("trust-egress-mitm-ca")
     );
 }
 
@@ -227,6 +317,17 @@ fn workload_uses_the_internal_proxy_without_a_relay_sidecar() {
     assert!(env.iter().any(
         |entry| entry["name"].as_str() == Some("TRUST_FORWARD_PROXY")
             && entry["value"].as_str() == Some("http://trust.trust-system.svc:6180")
+    ));
+    for proxy_variable in ["HTTP_PROXY", "HTTPS_PROXY"] {
+        assert!(
+            env.iter()
+                .any(|entry| entry["name"].as_str() == Some(proxy_variable)
+                    && entry["value"].as_str() == Some("http://trust.trust-system.svc:6180"))
+        );
+    }
+    assert!(env.iter().any(
+        |entry| entry["name"].as_str() == Some("TRUST_EGRESS_MITM_CA")
+            && entry["value"].as_str() == Some("/var/run/trust/egress-mitm/ca.crt")
     ));
 }
 
