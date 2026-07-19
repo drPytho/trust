@@ -347,9 +347,11 @@ curl -sS https://anthropic.proxy.internal:6443/v1/models \
   HTTPS provider route with TLS termination, HTTP/1 request policy, and inject
   mode. The optional `audit_unmatched` fallback is always opaque and can never
   trigger provider credential injection. Intercepted routes require a named
-  upstream scope, not `outbound-audit`. Private, loopback, link-local, and other
-  non-public targets are rejected unless explicitly enabled. Tunnels end at JWT
-  expiry, idle timeout, maximum duration, or process shutdown.
+  upstream scope, not `outbound-audit`. Audit fallback targets are always
+  public-only; private, loopback, link-local, and other non-public targets are
+  allowed only for exact configured routes with `allow_private_ips = true`.
+  Tunnels end at JWT expiry, idle timeout, maximum duration, or process
+  shutdown.
 - **Token TTL:** `token_ttl` (configured as 7d in this local example) trades
   revocation latency for fewer mints. Shorten it in production if you need
   tighter revocation.

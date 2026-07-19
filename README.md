@@ -400,11 +400,12 @@ Keep that listener private and restrict its sources with NetworkPolicy. Trust
 remains responsible for proxy authentication, scope checks, destination policy,
 and audit logs.
 
-The proxy resolves DNS server-side and rejects loopback, link-local, private, unique-local,
-multicast, documentation, and carrier-grade NAT addresses by default. For intercepted routes, the
-approved address is resolved and frozen at CONNECT time before Trust returns `200`; the decrypted
-upstream connection uses that address rather than performing a second DNS lookup. Set
-`allow_private_ips = true` only when explicitly configured internal upstreams are required.
+The proxy resolves DNS server-side and rejects non-global special-use addresses (including
+loopback, link-local, private, multicast, documentation, benchmarking, and reserved ranges) by
+default. For intercepted routes, the approved addresses are resolved and frozen at CONNECT time
+before Trust returns `200`; the decrypted upstream connection tries only that set rather than
+performing a second DNS lookup. Set `allow_private_ips = true` only when explicitly configured
+internal upstreams are required; the caller-selected audit fallback always remains public-only.
 Tunnels end at JWT expiry, the idle timeout, or `max_tunnel_duration`, whichever comes first.
 
 #### Selective TLS interception
@@ -479,7 +480,7 @@ upstream scopes. Give a sandbox its intended named scopes plus `outbound-audit` 
 then convert observed destinations into explicit opaque passthrough upstreams or carefully reviewed
 `intercept_connect` providers, and remove the audit scope and setting to return to deny-by-default
 behavior. The audit fallback never enters interception and does not apply to reverse-proxy hosts or
-private destinations when `allow_private_ips = false`.
+private destinations, even when exact configured routes enable `allow_private_ips`.
 
 ## Running
 

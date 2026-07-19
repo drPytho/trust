@@ -28,9 +28,10 @@ data:
     max_tunnel_duration = "1h"
     max_concurrent_tunnels = 1024
     allow_private_ips = false
-    # Audit fallback. Grant the dedicated scope to each sandbox identity that
-    # should reach otherwise-unmatched public HTTP(S) destinations.
-    # audit_unmatched = { scope = "outbound-audit" }
+    # Generic sandbox egress is audit-allowed by default. Exact configured
+    # routes still require their named scopes; every other public HTTP(S)
+    # destination is opaque and logged under this dedicated scope.
+    audit_unmatched = { scope = "outbound-audit" }
 
     # This signer is a dedicated online egress intermediate. It is unrelated
     # to the reverse-proxy server certificate, issuance client CA, and JWT key.
@@ -58,7 +59,7 @@ data:
 
     [[issuance.clients]]
     spiffe = "spiffe://example/workloads/*"
-    allowed_scopes = ["anthropic", "linear", "github:ORG/REPOSITORY", "github-git:ORG/REPOSITORY", "public-api", "gcp-pubsub", "gcp-storage"]
+    allowed_scopes = ["outbound-audit", "anthropic", "linear", "github:ORG/REPOSITORY", "github-git:ORG/REPOSITORY", "public-api", "gcp-pubsub", "gcp-storage"]
 
     [github_app]
     app_id = 123456

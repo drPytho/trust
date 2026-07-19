@@ -61,7 +61,7 @@ fn all_kubernetes_examples_are_valid_yaml() {
 }
 
 #[test]
-fn deployment_config_allowlists_google_api_connect_endpoints() {
+fn deployment_config_enables_audit_egress_and_allowlists_google_api_connect_endpoints() {
     let documents = yaml_documents("deployment.yaml");
     let config_map = document(&documents, "ConfigMap", "trust-config");
     let config_source = config_map["data"]["config.toml"]
@@ -76,9 +76,13 @@ fn deployment_config_allowlists_google_api_connect_endpoints() {
         !forward_proxy.tls,
         "example confines the plaintext proxy listener with NetworkPolicy"
     );
-    assert!(
-        forward_proxy.audit_unmatched.is_none(),
-        "the production-oriented example must remain deny-by-default"
+    assert_eq!(
+        forward_proxy
+            .audit_unmatched
+            .as_ref()
+            .map(|audit| audit.scope.as_str()),
+        Some("outbound-audit"),
+        "the sandbox egress example must audit-allow unmatched public destinations"
     );
     let mitm = forward_proxy
         .mitm
@@ -112,6 +116,7 @@ fn deployment_config_allowlists_google_api_connect_endpoints() {
     let allowed_scopes = &config.issuance.clients[0].allowed_scopes;
     assert!(allowed_scopes.iter().any(|scope| scope == "gcp-pubsub"));
     assert!(allowed_scopes.iter().any(|scope| scope == "gcp-storage"));
+    assert!(allowed_scopes.iter().any(|scope| scope == "outbound-audit"));
 
     let linear = config
         .upstreams

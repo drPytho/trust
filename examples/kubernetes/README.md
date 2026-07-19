@@ -53,6 +53,14 @@ The Service exposes these listeners inside the cluster:
 | `8443` | mTLS token endpoint | client certificate with authorized SPIFFE URI |
 | `8080` | management | restricted by NetworkPolicy in this example |
 
+The supplied sandbox-oriented Trust configuration enables
+`audit_unmatched = { scope = "outbound-audit" }` and grants that baseline scope
+to its sample sandbox SPIFFE policy. This makes otherwise-unmatched **public**
+HTTP(S) destinations work through the injected proxy while emitting audit logs;
+they remain opaque and never receive a provider credential. Remove the fallback
+and grant to return a tenant to deny-by-default egress after its destination
+inventory is complete.
+
 The example leaves the plain reverse listener disabled so JWTs are not sent
 over an unencrypted hop. For a private GHCR package, also configure an
 `imagePullSecret`. For production, pin the image to the immutable `sha-...`
@@ -284,7 +292,7 @@ Every otherwise-unmatched CONNECT or absolute-form HTTP request emits a WARN
 log containing its hostname and port. Aggregate outcomes use the bounded
 Prometheus label `upstream="audit-unmatched"`; destinations are deliberately
 not metric labels. Exact configured destinations still require their own
-scopes, and private IP ranges remain blocked while `allow_private_ips = false`.
+scopes, and caller-selected audit destinations always remain public-only.
 After observing the workload, add explicit passthrough upstreams for approved
 destinations and remove both `audit_unmatched` and the `outbound-audit` grant.
 

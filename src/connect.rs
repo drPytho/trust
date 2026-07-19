@@ -1,8 +1,10 @@
 use std::convert::Infallible;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -19,7 +21,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use rustls::ServerConfig;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{Instant as TokioInstant, sleep_until, timeout};
@@ -91,6 +93,13 @@ impl ConnectDestination {
 
     fn is_audit(&self) -> bool {
         matches!(self, ConnectDestination::Audit { .. })
+    }
+
+    fn permits_private_ips(&self, configured_allow_private_ips: bool) -> bool {
+        // An audit scope intentionally permits only public generic egress.
+        // The global switch exists solely for exact, operator-configured
+        // internal routes, never for caller-selected fallback destinations.
+        !self.is_audit() && configured_allow_private_ips
     }
 }
 
@@ -293,6 +302,7 @@ impl ConnectProxy {
             self.record_attempt(ForwardOperation::Connect, metrics_name, "invalid_token");
             return Ok(proxy_auth_required());
         };
+        let deadline = TokioInstant::now() + max_duration;
         let tunnel_slot = match self.tunnel_slots.clone().try_acquire_owned() {
             Ok(slot) => slot,
             Err(_) => {
@@ -322,11 +332,15 @@ impl ConnectProxy {
                     "TLS interception is not initialized\n",
                 ));
             };
-            let upstream_address = match resolve_target(
+            let Some(remaining) = deadline_remaining(deadline) else {
+                self.record_attempt(ForwardOperation::Connect, metrics_name, "invalid_token");
+                return Ok(proxy_auth_required());
+            };
+            let upstream_addresses = match resolve_targets(
                 &upstream.origin.host,
                 upstream.origin.port,
-                self.config.allow_private_ips,
-                self.config.connect_timeout,
+                destination.permits_private_ips(self.config.allow_private_ips),
+                self.config.connect_timeout.min(remaining),
             )
             .await
             {
@@ -350,7 +364,7 @@ impl ConnectProxy {
                 upstream: upstream.clone(),
                 authority_host: upstream.origin.host.clone(),
                 authority_port: upstream.origin.port,
-                upstream_address,
+                upstream_addresses,
                 subject: verified.subject.clone(),
                 scopes: verified.scopes.clone(),
                 expires_at: verified.expires_at,
@@ -365,8 +379,7 @@ impl ConnectProxy {
                 let started = Instant::now();
                 match upgrade.await {
                     Ok(upgraded) => {
-                        if let Err(error) = mitm.intercept(upgraded, connection, max_duration).await
-                        {
+                        if let Err(error) = mitm.intercept(upgraded, connection, deadline).await {
                             log::warn!(
                                 "MITM CONNECT ended upstream={upstream_name} subject={subject:?}: {error}"
                             );
@@ -388,12 +401,16 @@ impl ConnectProxy {
             return Ok(response(StatusCode::OK, ""));
         }
 
+        let Some(remaining) = deadline_remaining(deadline) else {
+            self.record_attempt(ForwardOperation::Connect, metrics_name, "invalid_token");
+            return Ok(proxy_auth_required());
+        };
         let (target_host, target_port) = destination.target();
         let target = match connect_target(
             target_host,
             target_port,
-            self.config.allow_private_ips,
-            self.config.connect_timeout,
+            destination.permits_private_ips(self.config.allow_private_ips),
+            self.config.connect_timeout.min(remaining),
         )
         .await
         {
@@ -435,7 +452,7 @@ impl ConnectProxy {
                         TokioIo::new(upgraded),
                         target,
                         state.config.idle_timeout,
-                        max_duration,
+                        deadline,
                     )
                     .await
                 }
@@ -502,13 +519,37 @@ impl ConnectProxy {
             Err(response) => return Ok(*response),
         };
         let method = request.method().clone();
+        let Some(max_duration) = tunnel_duration(&verified, self.config.max_tunnel_duration) else {
+            self.record_attempt(ForwardOperation::Http, metrics_name, "invalid_token");
+            return Ok(proxy_auth_required());
+        };
+        let deadline = TokioInstant::now() + max_duration;
+        let tunnel_slot = match self.tunnel_slots.clone().try_acquire_owned() {
+            Ok(slot) => slot,
+            Err(_) => {
+                self.record_attempt(ForwardOperation::Http, metrics_name, "capacity_exceeded");
+                log::warn!(
+                    "HTTP rejected reason=capacity_exceeded upstream={metrics_name} \
+                     subject={:?} destination_host={host:?} destination_port={port}",
+                    verified.subject,
+                );
+                return Ok(response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "proxy tunnel capacity exceeded\n",
+                ));
+            }
+        };
+        let Some(remaining) = deadline_remaining(deadline) else {
+            self.record_attempt(ForwardOperation::Http, metrics_name, "invalid_token");
+            return Ok(proxy_auth_required());
+        };
 
         let (target_host, target_port) = destination.target();
         let target = match connect_target(
             target_host,
             target_port,
-            self.config.allow_private_ips,
-            self.config.connect_timeout,
+            destination.permits_private_ips(self.config.allow_private_ips),
+            self.config.connect_timeout.min(remaining),
         )
         .await
         {
@@ -557,22 +598,54 @@ impl ConnectProxy {
         strip_proxy_headers(request.headers_mut());
         request.headers_mut().insert(HOST, host_header);
 
-        let (mut sender, connection) = match client_http1::handshake(TokioIo::new(target)).await {
-            Ok(connection) => connection,
-            Err(error) => {
-                self.record_attempt(ForwardOperation::Http, metrics_name, "connect_failed");
-                log::warn!(
-                    "HTTP upstream handshake failed upstream={metrics_name} subject={:?} \
+        let (activity_tx, mut activity_rx) = mpsc::channel(1);
+        let (mut sender, connection) =
+            match client_http1::handshake(TokioIo::new(ActivityIo::new(target, activity_tx))).await
+            {
+                Ok(connection) => connection,
+                Err(error) => {
+                    self.record_attempt(ForwardOperation::Http, metrics_name, "connect_failed");
+                    log::warn!(
+                        "HTTP upstream handshake failed upstream={metrics_name} subject={:?} \
                      destination_host={host:?} destination_port={port}: {error}",
-                    verified.subject,
-                );
-                return Ok(response(StatusCode::BAD_GATEWAY, "connection failed\n"));
-            }
-        };
+                        verified.subject,
+                    );
+                    return Ok(response(StatusCode::BAD_GATEWAY, "connection failed\n"));
+                }
+            };
         let upstream_name = metrics_name.to_string();
+        let idle_timeout = self.config.idle_timeout;
         tokio::spawn(async move {
-            if let Err(error) = connection.await {
-                log::debug!("HTTP upstream connection ended upstream={upstream_name}: {error}");
+            let _tunnel_slot = tunnel_slot;
+            let mut connection = Box::pin(connection);
+            let idle = sleep_until(TokioInstant::now() + idle_timeout);
+            let maximum = sleep_until(deadline);
+            tokio::pin!(idle);
+            tokio::pin!(maximum);
+            let mut activity_open = true;
+            loop {
+                tokio::select! {
+                    result = &mut connection => {
+                        if let Err(error) = result {
+                            log::debug!("HTTP upstream connection ended upstream={upstream_name}: {error}");
+                        }
+                        break;
+                    }
+                    activity = activity_rx.recv(), if activity_open => {
+                        match activity {
+                            Some(()) => idle.as_mut().reset(TokioInstant::now() + idle_timeout),
+                            None => activity_open = false,
+                        }
+                    }
+                    _ = &mut idle => {
+                        log::debug!("HTTP forward-proxy connection reached idle timeout upstream={upstream_name}");
+                        break;
+                    }
+                    _ = &mut maximum => {
+                        log::debug!("HTTP forward-proxy connection reached maximum duration upstream={upstream_name}");
+                        break;
+                    }
+                }
             }
         });
         let upstream_response = match sender.send_request(request).await {
@@ -685,6 +758,11 @@ fn tunnel_duration(token: &VerifiedToken, configured_max: Duration) -> Option<Du
     (!duration.is_zero()).then_some(duration)
 }
 
+fn deadline_remaining(deadline: TokioInstant) -> Option<Duration> {
+    let remaining = deadline.saturating_duration_since(TokioInstant::now());
+    (!remaining.is_zero()).then_some(remaining)
+}
+
 async fn resolved_target_addresses(
     host: &str,
     port: u16,
@@ -703,24 +781,19 @@ async fn resolved_target_addresses(
     Ok(permitted)
 }
 
-async fn resolve_target(
+async fn resolve_targets(
     host: &str,
     port: u16,
     allow_private_ips: bool,
     connect_timeout: Duration,
-) -> io::Result<SocketAddr> {
+) -> io::Result<Vec<SocketAddr>> {
     let addresses = timeout(
         connect_timeout,
         resolved_target_addresses(host, port, allow_private_ips),
     )
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "CONNECT target timed out"))??;
-    addresses.into_iter().next().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "destination did not resolve to a permitted address",
-        )
-    })
+    Ok(addresses)
 }
 
 async fn connect_target(
@@ -750,26 +823,146 @@ fn is_public_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
             let octets = ip.octets();
-            !(ip.is_private()
+            !(octets[0] == 0
+                || ip.is_private()
                 || ip.is_loopback()
                 || ip.is_link_local()
-                || ip.is_broadcast()
                 || ip.is_documentation()
                 || ip.is_unspecified()
                 || ip.is_multicast()
-                || (octets[0] == 100 && (64..=127).contains(&octets[1])))
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                // IANA's benchmarking range 198.18.0.0/15.
+                || (octets[0] == 198 && (octets[1] & 0xfe) == 18)
+                // IETF protocol assignments at 192.0.0.0/24. The two
+                // documented globally reachable anycast addresses are the
+                // only exceptions.
+                || (octets[0] == 192
+                    && octets[1] == 0
+                    && octets[2] == 0
+                    && !matches!(octets[3], 9 | 10))
+                // Multicast, reserved, and limited-broadcast ranges.
+                || octets[0] >= 224)
         }
         IpAddr::V6(ip) => {
             if let Some(ipv4) = ip.to_ipv4_mapped() {
                 return is_public_ip(IpAddr::V4(ipv4));
             }
             let segments = ip.segments();
-            !(ip.is_loopback()
-                || ip.is_unspecified()
-                || ip.is_multicast()
-                || ip.is_unique_local()
-                || ip.is_unicast_link_local()
-                || (segments[0] == 0x2001 && segments[1] == 0x0db8))
+            // Permit only the currently assigned global-unicast range, then
+            // exclude IANA special-purpose blocks inside it. This mirrors the
+            // stable policy intent of the standard library's unstable
+            // `Ipv6Addr::is_global` API without allowing future special-use
+            // ranges by default.
+            let global_unicast = (segments[0] & 0xe000) == 0x2000;
+            let ietf_protocol_assignment = segments[0] == 0x2001 && segments[1] < 0x0200;
+            let ietf_global_exception = matches!(
+                segments,
+                [0x2001, 0x0001, 0, 0, 0, 0, 0, 1]
+                    | [0x2001, 0x0001, 0, 0, 0, 0, 0, 2]
+                    | [0x2001, 0x0003, _, _, _, _, _, _]
+                    | [0x2001, 0x0004, 0x0112, _, _, _, _, _]
+                    | [0x2001, 0x0020..=0x003f, _, _, _, _, _, _]
+            );
+            global_unicast
+                && !(ip.is_loopback()
+                    || ip.is_unspecified()
+                    || ip.is_multicast()
+                    || ip.is_unique_local()
+                    || ip.is_unicast_link_local()
+                    || (ietf_protocol_assignment && !ietf_global_exception)
+                    || segments[0] == 0x2002
+                    || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+                    || (segments[0] == 0x3fff && segments[1] <= 0x0fff))
+        }
+    }
+}
+
+/// A transparent IO adapter that reports completed byte transfers to the
+/// request lifecycle watchdog. The watchdog owns the actual idle/deadline
+/// timers so it can terminate a stalled HTTP request or response even when
+/// Hyper is not currently polling this transport.
+struct ActivityIo<T> {
+    inner: T,
+    activity: mpsc::Sender<()>,
+}
+
+impl<T> ActivityIo<T> {
+    fn new(inner: T, activity: mpsc::Sender<()>) -> Self {
+        ActivityIo { inner, activity }
+    }
+
+    fn record_activity(&self) {
+        let _ = self.activity.try_send(());
+    }
+}
+
+impl<T> AsyncRead for ActivityIo<T>
+where
+    T: AsyncRead + Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buffer.filled().len();
+        match Pin::new(&mut self.inner).poll_read(cx, buffer) {
+            Poll::Ready(Ok(())) => {
+                if buffer.filled().len() > before {
+                    self.record_activity();
+                }
+                Poll::Ready(Ok(()))
+            }
+            result => result,
+        }
+    }
+}
+
+impl<T> AsyncWrite for ActivityIo<T>
+where
+    T: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match Pin::new(&mut self.inner).poll_write(cx, buffer) {
+            Poll::Ready(Ok(written)) => {
+                if written > 0 {
+                    self.record_activity();
+                }
+                Poll::Ready(Ok(written))
+            }
+            result => result,
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffers: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        match Pin::new(&mut self.inner).poll_write_vectored(cx, buffers) {
+            Poll::Ready(Ok(written)) => {
+                if written > 0 {
+                    self.record_activity();
+                }
+                Poll::Ready(Ok(written))
+            }
+            result => result,
         }
     }
 }
@@ -801,7 +994,7 @@ async fn tunnel<D>(
     downstream: D,
     upstream: TcpStream,
     idle_timeout: Duration,
-    max_duration: Duration,
+    deadline: TokioInstant,
 ) -> (u64, u64)
 where
     D: AsyncRead + AsyncWrite + Unpin,
@@ -826,7 +1019,7 @@ where
     let mut upload_done = false;
     let mut download_done = false;
     let idle = sleep_until(TokioInstant::now() + idle_timeout);
-    let maximum = sleep_until(TokioInstant::now() + max_duration);
+    let maximum = sleep_until(deadline);
     tokio::pin!(idle);
     tokio::pin!(maximum);
 
@@ -929,11 +1122,24 @@ mod tests {
             "10.0.0.1",
             "169.254.169.254",
             "100.64.0.1",
+            "0.1.2.3",
+            "192.0.0.1",
+            "198.18.0.1",
+            "198.19.255.255",
+            "240.0.0.1",
+            "255.255.255.254",
             "::1",
             "fd00::1",
             "fe80::1",
             "::ffff:127.0.0.1",
             "::ffff:10.0.0.1",
+            "64:ff9b:1::1",
+            "100::1",
+            "2001:2::1",
+            "2001:db8::1",
+            "2002::1",
+            "3fff::1",
+            "5f00::1",
         ] {
             assert!(!is_public_ip(value.parse().unwrap()), "accepted {value}");
         }
@@ -942,8 +1148,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolved_intercept_target_rejects_private_addresses() {
-        let error = resolve_target("localhost", 443, false, Duration::from_secs(1))
+    async fn resolved_intercept_targets_reject_private_addresses() {
+        let error = resolve_targets("localhost", 443, false, Duration::from_secs(1))
             .await
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
@@ -1269,15 +1475,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn audit_unmatched_allows_scoped_destination_and_records_metrics() {
+    async fn audit_unmatched_rejects_private_destination_even_when_exact_routes_allow_them() {
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target_port = target.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            let (mut stream, _) = target.accept().await.unwrap();
-            let mut buffer = [0_u8; 64];
-            let read = stream.read(&mut buffer).await.unwrap();
-            stream.write_all(&buffer[..read]).await.unwrap();
-        });
+        drop(target);
 
         let keystore = Arc::new(Keystore::new());
         let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
@@ -1356,31 +1557,21 @@ mod tests {
         assert!(
             read_response_head(&mut tunnel)
                 .await
-                .starts_with("HTTP/1.1 200")
+                .starts_with("HTTP/1.1 502")
         );
-        tunnel.write_all(b"audit me").await.unwrap();
-        let mut echoed = [0_u8; 8];
-        tunnel.read_exact(&mut echoed).await.unwrap();
-        assert_eq!(&echoed, b"audit me");
-        drop(tunnel);
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
         assert!(rendered.contains(
             "trust_connect_attempts_total{result=\"forbidden_scope\",upstream=\"audit-unmatched\"} 1"
         ));
         assert!(rendered.contains(
-            "trust_connect_attempts_total{result=\"established\",upstream=\"audit-unmatched\"} 1"
-        ));
-        assert!(rendered.contains(
-            "trust_connect_bytes_total{direction=\"to_upstream\",upstream=\"audit-unmatched\"} 8"
+            "trust_connect_attempts_total{result=\"private_destination\",upstream=\"audit-unmatched\"} 1"
         ));
         server.abort();
     }
 
     #[tokio::test]
-    async fn audit_unmatched_forwards_absolute_http_requests_without_forwarding_proxy_credentials()
-    {
+    async fn configured_http_forwards_without_forwarding_proxy_credentials() {
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target_port = target.local_addr().unwrap().port();
         let (captured_tx, captured_rx) = tokio::sync::oneshot::channel();
@@ -1402,17 +1593,37 @@ mod tests {
         let token = issuer
             .mint(
                 &keys,
-                "sandbox-audit",
-                &ScopeSet::parse("outbound-audit").unwrap(),
+                "sandbox-docs",
+                &ScopeSet::parse("docs").unwrap(),
                 jsonwebtoken::get_current_timestamp(),
             )
             .unwrap();
+
+        let upstream = Arc::new(Upstream {
+            name: "docs".into(),
+            kind: UpstreamKind::Api,
+            listen_host: "docs.proxy.internal".into(),
+            origin: Origin {
+                host: "127.0.0.1".into(),
+                port: target_port,
+                tls: false,
+                sni: "".into(),
+            },
+            mode: UpstreamMode::Passthrough,
+            credential: None,
+            injection: None,
+            resource: None,
+            git: None,
+            allowed_methods: Vec::new(),
+            allow_connect: true,
+            intercept_connect: false,
+        });
 
         let metrics = Arc::new(ProxyMetrics::new());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = listener.local_addr().unwrap();
         let state = Arc::new(ConnectProxy::new(
-            Arc::new(Router::new(&[])),
+            Arc::new(Router::new(std::slice::from_ref(&upstream))),
             Arc::new(Verifier::new("trust".into(), "proxy".into())),
             keystore,
             metrics.clone(),
@@ -1424,9 +1635,7 @@ mod tests {
                 max_tunnel_duration: Duration::from_secs(30),
                 max_concurrent_tunnels: 10,
                 allow_private_ips: true,
-                audit_unmatched: Some(AuditUnmatchedConfig {
-                    scope: "outbound-audit".into(),
-                }),
+                audit_unmatched: None,
                 mitm: None,
             },
         ));
@@ -1461,9 +1670,10 @@ mod tests {
         assert!(!captured_lowercase.contains("proxy-connection"));
 
         let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
-        assert!(rendered.contains(
-            "trust_forward_proxy_requests_total{result=\"200\",upstream=\"audit-unmatched\"} 1"
-        ));
+        assert!(
+            rendered
+                .contains("trust_forward_proxy_requests_total{result=\"200\",upstream=\"docs\"} 1")
+        );
         server.abort();
     }
 }

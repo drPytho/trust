@@ -15,7 +15,7 @@ use pingora::server::{ShutdownWatch, configuration::ServerConf};
 use pingora::tls::ext;
 use pingora::tls::ssl::{AlpnError, NameType, SslAcceptor, SslMethod};
 use tokio::sync::watch;
-use tokio::time::timeout;
+use tokio::time::{Instant as TokioInstant, timeout, timeout_at};
 
 use crate::config::{ForwardProxyConfig, Upstream, canonical_intercept_dns_host};
 use crate::credentials::CredentialProvider;
@@ -150,7 +150,7 @@ impl MitmRuntime {
         &self,
         upgraded: Upgraded,
         context: Arc<MitmConnectionContext>,
-        max_duration: Duration,
+        deadline: TokioInstant,
     ) -> Result<(), MitmRuntimeError> {
         let started = Instant::now();
         let upstream_name = context.upstream.name.clone();
@@ -164,8 +164,12 @@ impl MitmRuntime {
             handshake_state: handshake_state.clone(),
         };
         let callbacks: pingora::listeners::TlsAcceptCallbacks = Box::new(callbacks);
+        let remaining = deadline.saturating_duration_since(TokioInstant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
         let tls = match timeout(
-            self.handshake_timeout.min(max_duration),
+            self.handshake_timeout.min(remaining),
             handshake_with_callback(&self.acceptor, MitmIo::new(upgraded), &callbacks),
         )
         .await
@@ -191,8 +195,10 @@ impl MitmRuntime {
             return Err(MitmRuntimeError::HandshakeRejected(reason));
         }
         self.metrics.mitm_handshake(&upstream_name, "established");
-        let remaining = max_duration.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
+        if deadline
+            .saturating_duration_since(TokioInstant::now())
+            .is_zero()
+        {
             log::warn!(
                 "MITM connection reached CONNECT lifetime during TLS handshake upstream={upstream_name}"
             );
@@ -203,7 +209,7 @@ impl MitmRuntime {
         let proxy = self.proxy.clone();
         let shutdown = self.shutdown.clone();
         let idle_timeout = self.idle_timeout;
-        let result = timeout(remaining, async move {
+        let result = timeout_at(deadline, async move {
             let mut next = Some(Box::new(tls) as pingora::protocols::Stream);
             while let Some(stream) = next.take() {
                 let mut session = ServerSession::new_http1(stream);
@@ -547,7 +553,7 @@ mod tests {
                     upstream,
                     authority_host: "api.example.com".to_string(),
                     authority_port: 443,
-                    upstream_address: "127.0.0.1:443".parse().unwrap(),
+                    upstream_addresses: vec!["127.0.0.1:443".parse().unwrap()],
                     subject: "sandbox".to_string(),
                     scopes: ScopeSet::parse("provider").unwrap(),
                     expires_at: u64::MAX,

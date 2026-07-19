@@ -17,7 +17,8 @@ use crate::secrets::Secret;
 
 pub struct MitmRequestCtx {
     upstream: Option<Arc<Upstream>>,
-    upstream_address: Option<SocketAddr>,
+    upstream_addresses: Vec<SocketAddr>,
+    next_upstream_address: usize,
     secret: Option<Secret>,
     credential_cache_key: Option<String>,
     started_at: Instant,
@@ -30,7 +31,8 @@ impl MitmRequestCtx {
         metrics.request_started();
         MitmRequestCtx {
             upstream: None,
-            upstream_address: None,
+            upstream_addresses: Vec::new(),
+            next_upstream_address: 0,
             secret: None,
             credential_cache_key: None,
             started_at: Instant::now(),
@@ -46,6 +48,19 @@ impl MitmRequestCtx {
         self.metrics
             .request_finished(upstream, status, self.started_at.elapsed().as_secs_f64());
         self.metrics_finished = true;
+    }
+
+    fn next_upstream_address(&mut self) -> Option<SocketAddr> {
+        let address = self
+            .upstream_addresses
+            .get(self.next_upstream_address)
+            .copied()?;
+        self.next_upstream_address += 1;
+        Some(address)
+    }
+
+    fn has_untried_upstream_address(&self) -> bool {
+        self.next_upstream_address < self.upstream_addresses.len()
     }
 }
 
@@ -136,7 +151,8 @@ impl ProxyHttp for MitmProxyService {
         };
         let upstream = connection.upstream.clone();
         ctx.upstream = Some(upstream.clone());
-        ctx.upstream_address = Some(connection.upstream_address);
+        ctx.upstream_addresses = connection.upstream_addresses.clone();
+        ctx.next_upstream_address = 0;
 
         if !upstream.intercept_connect
             || upstream.kind != UpstreamKind::Api
@@ -224,17 +240,33 @@ impl ProxyHttp for MitmProxyService {
     ) -> Result<Box<HttpPeer>> {
         let upstream = ctx
             .upstream
-            .as_ref()
+            .clone()
             .ok_or_else(|| Error::new_str("intercept upstream missing in context"))?;
         let address = ctx
-            .upstream_address
+            .next_upstream_address()
             .ok_or_else(|| Error::new_str("intercept upstream address missing in context"))?;
         Ok(Box::new(configured_upstream_peer(
-            upstream,
+            &upstream,
             address,
             self.connect_timeout,
             self.idle_timeout,
         )))
+    }
+
+    fn fail_to_connect(
+        &self,
+        _session: &mut Session,
+        _peer: &HttpPeer,
+        ctx: &mut Self::CTX,
+        mut error: Box<Error>,
+    ) -> Box<Error> {
+        // Pingora calls upstream_peer again for retryable connect failures.
+        // Advance only through the DNS answers checked at CONNECT time; never
+        // ask the resolver again after the client has entered the tunnel.
+        if ctx.has_untried_upstream_address() {
+            error.set_retry(true);
+        }
+        error
     }
 
     async fn upstream_request_filter(
@@ -397,7 +429,7 @@ mod tests {
             }),
             authority_host: host.into(),
             authority_port: port,
-            upstream_address: "127.0.0.1:443".parse().unwrap(),
+            upstream_addresses: vec!["127.0.0.1:443".parse().unwrap()],
             subject: "sandbox".into(),
             scopes: ScopeSet::parse("provider").unwrap(),
             expires_at: u64::MAX,
@@ -465,5 +497,26 @@ mod tests {
         assert_eq!(peer.options.idle_timeout, Some(Duration::from_secs(7)));
         assert!(peer.options.verify_cert);
         assert!(peer.options.verify_hostname);
+    }
+
+    #[test]
+    fn retries_only_the_policy_checked_addresses() {
+        let mut ctx = MitmRequestCtx::new(Arc::new(ProxyMetrics::new()));
+        ctx.upstream_addresses = vec![
+            "[2001:db8::1]:443".parse().unwrap(),
+            "203.0.113.10:443".parse().unwrap(),
+        ];
+
+        assert_eq!(
+            ctx.next_upstream_address(),
+            Some("[2001:db8::1]:443".parse().unwrap())
+        );
+        assert!(ctx.has_untried_upstream_address());
+        assert_eq!(
+            ctx.next_upstream_address(),
+            Some("203.0.113.10:443".parse().unwrap())
+        );
+        assert!(!ctx.has_untried_upstream_address());
+        assert_eq!(ctx.next_upstream_address(), None);
     }
 }
