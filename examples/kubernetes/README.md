@@ -30,7 +30,7 @@ The Service exposes these listeners inside the cluster:
 | Service port | Listener | Client authentication |
 |---|---|---|
 | `6443` | TLS reverse proxy | Bearer JWT; passthrough uses `Proxy-Authorization` |
-| `6180` | TLS CONNECT proxy | `Proxy-Authorization` Bearer or Basic `jwt:<JWT>` |
+| `6180` | internal HTTP(S) forward proxy | `Proxy-Authorization` Bearer or Basic `jwt:<JWT>` |
 | `8443` | mTLS token endpoint | client certificate with authorized SPIFFE URI |
 | `8080` | management | restricted by NetworkPolicy in this example |
 
@@ -204,14 +204,16 @@ remain denied.
 
 ## Using trust as the sandbox egress proxy
 
-The example enables a TLS HTTP CONNECT listener on port `6180`. A destination
-is available through that listener only when its upstream is configured as
-passthrough and explicitly opts in:
+The example enables an internal plaintext HTTP(S) forward-proxy listener on
+port `6180`. NetworkPolicy confines it to selected sandbox Pods. It accepts
+absolute-form HTTP and HTTPS CONNECT traffic. A CONNECT destination is
+available only when its upstream is configured as passthrough and explicitly
+opts in:
 
 ```toml
 [forward_proxy]
 addr = "0.0.0.0:6180"
-tls = true
+tls = false
 connect_timeout = "10s"
 idle_timeout = "5m"
 max_tunnel_duration = "1h"
@@ -233,13 +235,14 @@ listener uses the same verifier, scopes, upstream configuration, signing keys,
 rejection logs, and metrics as the reverse proxy. It does not create a second
 trust domain.
 
-For a temporary discovery rollout, enable the unmatched audit fallback and
-grant its dedicated scope only to the sandbox identities being inventoried:
+For an audit rollout, enable the unmatched fallback and grant its dedicated
+scope to the sandbox identities that should be allowed to reach otherwise-
+unmatched public destinations:
 
 ```toml
 [forward_proxy]
 addr = "0.0.0.0:6180"
-tls = true
+tls = false
 allow_private_ips = false
 audit_unmatched = { scope = "outbound-audit" }
 
@@ -248,14 +251,13 @@ spiffe = "spiffe://example/workloads/sandbox-*"
 allowed_scopes = ["public-api", "outbound-audit"]
 ```
 
-Every otherwise-unmatched CONNECT request emits a WARN log containing its
-hostname and port. Aggregate outcomes use the bounded Prometheus label
-`upstream="audit-unmatched"`; destinations are deliberately not metric labels.
-Exact configured destinations still require their own scopes, and private IP
-ranges remain blocked while `allow_private_ips = false`. After observing the
-workload, add explicit passthrough upstreams for approved destinations and
-remove both `audit_unmatched` and the `outbound-audit` grant. This mode covers
-HTTPS-style CONNECT traffic only, not plain HTTP absolute-form proxy requests.
+Every otherwise-unmatched CONNECT or absolute-form HTTP request emits a WARN
+log containing its hostname and port. Aggregate outcomes use the bounded
+Prometheus label `upstream="audit-unmatched"`; destinations are deliberately
+not metric labels. Exact configured destinations still require their own
+scopes, and private IP ranges remain blocked while `allow_private_ips = false`.
+After observing the workload, add explicit passthrough upstreams for approved
+destinations and remove both `audit_unmatched` and the `outbound-audit` grant.
 
 CONNECT carries an opaque TLS stream, so it cannot inject credentials or
 enforce HTTP paths or methods. Keep credential-injected endpoints on the
@@ -270,22 +272,20 @@ ways:
 
 ```bash
 # Preferred when the client supports explicit proxy headers.
-curl --proxy https://trust.trust-system.svc:6180 \
-  --proxy-cacert /var/run/trust/server/ca.crt \
+curl --proxy http://trust.trust-system.svc:6180 \
   --proxy-header "Proxy-Authorization: Bearer $TRUST_TOKEN" \
   https://api.example.com/resource
 
-# Compatibility mode for clients that only support credentials in HTTPS_PROXY.
-# trust accepts Basic username `jwt` with the JWT as its password.
-export HTTPS_PROXY="https://jwt:${TRUST_TOKEN}@trust.trust-system.svc:6180"
+# Compatibility mode for clients that only support an http:// proxy URL.
+# Trust validates the Basic jwt:<JWT> credentials itself.
+export HTTP_PROXY="http://jwt:$TRUST_TOKEN@trust.trust-system.svc:6180"
+export HTTPS_PROXY="$HTTP_PROXY"
 export NO_PROXY="metadata.google.internal,169.254.169.254,169.254.169.252,trust.trust-system.svc,.proxy.internal"
 ```
 
-The server certificate must include `trust.trust-system.svc` as a DNS SAN, and
-the client must trust its issuing CA. Support for TLS-to-proxy (`https://` in
-`HTTPS_PROXY`) varies by client. A plaintext `http://` listener is more broadly
-compatible but exposes the JWT on the Pod-to-proxy network path and should be
-used only with compensating network controls.
+The forward-proxy listener is intentionally plaintext in this example; its
+ClusterIP Service must remain restricted by NetworkPolicy. The mTLS token
+endpoint and TLS reverse-proxy listener still use the Trust server certificate.
 
 Apply `sandbox-egress-network-policy.yaml` to select sandbox Pods labeled
 `trust.example.com/restricted-egress: "true"`. It allows egress only to the
@@ -315,7 +315,7 @@ permissive Storage role only when overwrite, read, or delete is required.
 
 `cargo test --all --locked` includes integration tests that verify:
 
-- the CONNECT listener consumes the trust JWT without forwarding it;
+- the HTTP(S) forward proxy consumes the trust JWT without forwarding it;
 - a separate Google OAuth bearer token is preserved inside the tunnel;
 - all Kubernetes examples parse as YAML and the embedded trust TOML is valid;
 - the example allowlists only the exact Pub/Sub and Storage CONNECT endpoints;

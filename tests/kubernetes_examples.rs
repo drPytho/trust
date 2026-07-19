@@ -71,10 +71,10 @@ fn deployment_config_allowlists_google_api_connect_endpoints() {
 
     let forward_proxy = config
         .forward_proxy
-        .expect("example must enable the CONNECT listener");
+        .expect("example must enable the forward-proxy listener");
     assert!(
-        forward_proxy.tls,
-        "example must protect proxy JWTs with TLS"
+        !forward_proxy.tls,
+        "example confines the plaintext proxy listener with NetworkPolicy"
     );
     assert!(
         forward_proxy.audit_unmatched.is_none(),
@@ -197,10 +197,13 @@ fn restricted_sandbox_can_reach_only_trust_dns_and_gke_metadata() {
 }
 
 #[test]
-fn workload_bypasses_proxy_only_for_metadata_and_internal_trust_hosts() {
+fn workload_uses_the_internal_proxy_without_a_relay_sidecar() {
     let documents = yaml_documents("client-workload.yaml");
     let deployment = document(&documents, "Deployment", "my-service");
-    let env = deployment["spec"]["template"]["spec"]["containers"][0]["env"]
+    let containers = deployment["spec"]["template"]["spec"]["containers"]
+        .as_sequence()
+        .expect("workload must define containers");
+    let env = containers[0]["env"]
         .as_sequence()
         .expect("client container must define env");
     let no_proxy = env
@@ -220,6 +223,11 @@ fn workload_bypasses_proxy_only_for_metadata_and_internal_trust_hosts() {
         assert!(entries.contains(required), "NO_PROXY is missing {required}");
     }
     assert!(!entries.contains(".googleapis.com"));
+    assert_eq!(containers.len(), 1, "workload must not run a relay sidecar");
+    assert!(env.iter().any(
+        |entry| entry["name"].as_str() == Some("TRUST_FORWARD_PROXY")
+            && entry["value"].as_str() == Some("http://trust.trust-system.svc:6180")
+    ));
 }
 
 #[test]
@@ -252,7 +260,7 @@ fn live_gke_smoke_job_exercises_metadata_pubsub_and_storage() {
         .expect("smoke command must contain a script");
     for required in [
         "metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
-        "https://trust.trust-system.svc:6180",
+        "http://trust.trust-system.svc:6180",
         "Proxy-Authorization: Bearer ${TRUST_TOKEN}",
         "https://pubsub.googleapis.com/",
         "https://storage.googleapis.com/",

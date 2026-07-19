@@ -7,9 +7,13 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use bytes::Bytes;
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::Incoming;
-use hyper::header::{HeaderValue, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION};
+use hyper::client::conn::http1 as client_http1;
+use hyper::header::{
+    CONNECTION, HOST, HeaderName, HeaderValue, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE,
+    TRAILER, TRANSFER_ENCODING, UPGRADE,
+};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -27,7 +31,24 @@ use crate::keystore::Keystore;
 use crate::metrics::ProxyMetrics;
 use crate::router::Router;
 
-type ResponseBody = Full<Bytes>;
+type ResponseBody = BoxBody<Bytes, hyper::Error>;
+type ProxyResponse = Response<ResponseBody>;
+type ProxyResult<T> = Result<T, Box<ProxyResponse>>;
+
+#[derive(Clone, Copy)]
+enum ForwardOperation {
+    Connect,
+    Http,
+}
+
+impl ForwardOperation {
+    fn label(self) -> &'static str {
+        match self {
+            ForwardOperation::Connect => "CONNECT",
+            ForwardOperation::Http => "HTTP",
+        }
+    }
+}
 
 enum ConnectDestination {
     Configured(Arc<crate::config::Upstream>),
@@ -95,107 +116,150 @@ impl ConnectProxy {
         }
     }
 
+    fn record_attempt(&self, operation: ForwardOperation, upstream: &str, result: &str) {
+        match operation {
+            ForwardOperation::Connect => self.metrics.connect_attempt(upstream, result),
+            ForwardOperation::Http => self.metrics.forward_proxy_request(upstream, result),
+        }
+    }
+
+    fn resolve_destination(
+        &self,
+        host: &str,
+        port: u16,
+        operation: ForwardOperation,
+    ) -> ProxyResult<ConnectDestination> {
+        match self.router.resolve_connect(host, port) {
+            Some(upstream) => Ok(ConnectDestination::Configured(upstream)),
+            None => match &self.config.audit_unmatched {
+                Some(audit) => {
+                    log::warn!(
+                        "{} unmatched destination observed action=audit_allow_pending_auth \
+                         destination_host={host:?} destination_port={port} required_scope={:?}",
+                        operation.label(),
+                        audit.scope
+                    );
+                    Ok(ConnectDestination::Audit {
+                        host: host.to_string(),
+                        port,
+                        scope: audit.scope.clone(),
+                    })
+                }
+                None => {
+                    self.record_attempt(operation, "unrouted", "unknown_destination");
+                    log::warn!(
+                        "{} rejected reason=unknown_destination destination_host={host:?} \
+                         destination_port={port}",
+                        operation.label(),
+                    );
+                    Err(Box::new(response(
+                        StatusCode::FORBIDDEN,
+                        "destination not allowed\n",
+                    )))
+                }
+            },
+        }
+    }
+
+    fn authorize(
+        &self,
+        headers: &hyper::HeaderMap,
+        destination: &ConnectDestination,
+        host: &str,
+        port: u16,
+        operation: ForwardOperation,
+    ) -> ProxyResult<VerifiedToken> {
+        let metrics_name = destination.metrics_name();
+        let token = match proxy_token(headers.get(PROXY_AUTHORIZATION)) {
+            Ok(token) => token,
+            Err(reason) => {
+                self.record_attempt(operation, metrics_name, reason);
+                log::warn!(
+                    "{} rejected reason={reason} upstream={metrics_name} \
+                     destination_host={host:?} destination_port={port}",
+                    operation.label(),
+                );
+                return Err(Box::new(proxy_auth_required()));
+            }
+        };
+        let Some(keys) = self.keystore.load() else {
+            self.record_attempt(operation, metrics_name, "signing_keys_unavailable");
+            return Err(Box::new(response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "signing keys unavailable\n",
+            )));
+        };
+        let verified = match self.verifier.verify_token(&keys, &token) {
+            Ok(verified) => verified,
+            Err(_) => {
+                self.record_attempt(operation, metrics_name, "invalid_token");
+                return Err(Box::new(proxy_auth_required()));
+            }
+        };
+        if !verified.scopes.permits(destination.required_scope(), None) {
+            self.record_attempt(operation, metrics_name, "forbidden_scope");
+            log::warn!(
+                "{} rejected reason=forbidden_scope upstream={metrics_name} subject={:?} \
+                 destination_host={host:?} destination_port={port}",
+                operation.label(),
+                verified.subject,
+            );
+            return Err(Box::new(response(StatusCode::FORBIDDEN, "not allowed\n")));
+        }
+        Ok(verified)
+    }
+
     async fn handle(
+        self: Arc<Self>,
+        request: Request<Incoming>,
+    ) -> Result<Response<ResponseBody>, Infallible> {
+        if request.method() == Method::CONNECT {
+            self.handle_connect(request).await
+        } else {
+            self.handle_http(request).await
+        }
+    }
+
+    async fn handle_connect(
         self: Arc<Self>,
         mut request: Request<Incoming>,
     ) -> Result<Response<ResponseBody>, Infallible> {
-        if request.method() != Method::CONNECT {
-            self.metrics
-                .connect_attempt("unrouted", "method_not_allowed");
-            return Ok(response(
-                StatusCode::METHOD_NOT_ALLOWED,
-                "CONNECT required\n",
-            ));
-        }
-
         let Some(authority) = request.uri().authority() else {
-            self.metrics
-                .connect_attempt("unrouted", "invalid_authority");
+            self.record_attempt(ForwardOperation::Connect, "unrouted", "invalid_authority");
             return Ok(response(
                 StatusCode::BAD_REQUEST,
                 "invalid CONNECT authority\n",
             ));
         };
         let Some(port) = authority.port_u16() else {
-            self.metrics
-                .connect_attempt("unrouted", "invalid_authority");
+            self.record_attempt(ForwardOperation::Connect, "unrouted", "invalid_authority");
             return Ok(response(StatusCode::BAD_REQUEST, "CONNECT port required\n"));
         };
         let host = authority.host().to_string();
-        let destination = match self.router.resolve_connect(&host, port) {
-            Some(upstream) => ConnectDestination::Configured(upstream),
-            None => match &self.config.audit_unmatched {
-                Some(audit) => {
-                    log::warn!(
-                        "CONNECT unmatched destination observed action=audit_allow_pending_auth \
-                         destination_host={host:?} destination_port={port} required_scope={:?}",
-                        audit.scope
-                    );
-                    ConnectDestination::Audit {
-                        host: host.clone(),
-                        port,
-                        scope: audit.scope.clone(),
-                    }
-                }
-                None => {
-                    self.metrics
-                        .connect_attempt("unrouted", "unknown_destination");
-                    log::warn!(
-                        "CONNECT rejected reason=unknown_destination destination_host={host:?} \
-                         destination_port={port}"
-                    );
-                    return Ok(response(StatusCode::FORBIDDEN, "destination not allowed\n"));
-                }
-            },
+        let destination = match self.resolve_destination(&host, port, ForwardOperation::Connect) {
+            Ok(destination) => destination,
+            Err(response) => return Ok(*response),
         };
         let metrics_name = destination.metrics_name();
-
-        let token = match proxy_token(request.headers().get(PROXY_AUTHORIZATION)) {
-            Ok(token) => token,
-            Err(reason) => {
-                self.metrics.connect_attempt(metrics_name, reason);
-                log::warn!(
-                    "CONNECT rejected reason={reason} upstream={metrics_name} \
-                     destination_host={host:?} destination_port={port}"
-                );
-                return Ok(proxy_auth_required());
-            }
-        };
-        let Some(keys) = self.keystore.load() else {
-            self.metrics
-                .connect_attempt(metrics_name, "signing_keys_unavailable");
-            return Ok(response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "signing keys unavailable\n",
-            ));
-        };
-        let verified = match self.verifier.verify_token(&keys, &token) {
+        let verified = match self.authorize(
+            request.headers(),
+            &destination,
+            &host,
+            port,
+            ForwardOperation::Connect,
+        ) {
             Ok(verified) => verified,
-            Err(_) => {
-                self.metrics.connect_attempt(metrics_name, "invalid_token");
-                return Ok(proxy_auth_required());
-            }
+            Err(response) => return Ok(*response),
         };
-        if !verified.scopes.permits(destination.required_scope(), None) {
-            self.metrics
-                .connect_attempt(metrics_name, "forbidden_scope");
-            log::warn!(
-                "CONNECT rejected reason=forbidden_scope upstream={metrics_name} subject={:?} \
-                 destination_host={host:?} destination_port={port}",
-                verified.subject,
-            );
-            return Ok(response(StatusCode::FORBIDDEN, "not allowed\n"));
-        }
 
         let Some(max_duration) = tunnel_duration(&verified, self.config.max_tunnel_duration) else {
-            self.metrics.connect_attempt(metrics_name, "invalid_token");
+            self.record_attempt(ForwardOperation::Connect, metrics_name, "invalid_token");
             return Ok(proxy_auth_required());
         };
         let tunnel_slot = match self.tunnel_slots.clone().try_acquire_owned() {
             Ok(slot) => slot,
             Err(_) => {
-                self.metrics
-                    .connect_attempt(metrics_name, "capacity_exceeded");
+                self.record_attempt(ForwardOperation::Connect, metrics_name, "capacity_exceeded");
                 log::warn!(
                     "CONNECT rejected reason=capacity_exceeded upstream={metrics_name} \
                      subject={:?} destination_host={host:?} destination_port={port}",
@@ -224,7 +288,7 @@ impl ConnectProxy {
                 } else {
                     "connect_failed"
                 };
-                self.metrics.connect_attempt(metrics_name, reason);
+                self.record_attempt(ForwardOperation::Connect, metrics_name, reason);
                 log::warn!(
                     "CONNECT target failed reason={reason} upstream={metrics_name} subject={:?} \
                      destination_host={host:?} destination_port={port}: {error}",
@@ -276,13 +340,187 @@ impl ConnectProxy {
 
         Ok(response(StatusCode::OK, ""))
     }
+
+    async fn handle_http(
+        self: Arc<Self>,
+        mut request: Request<Incoming>,
+    ) -> Result<Response<ResponseBody>, Infallible> {
+        if request.uri().scheme_str() != Some("http") {
+            self.record_attempt(ForwardOperation::Http, "unrouted", "invalid_request_target");
+            return Ok(response(
+                StatusCode::BAD_REQUEST,
+                "absolute http URI required; use CONNECT for HTTPS\n",
+            ));
+        }
+        let Some(host) = request.uri().host().map(ToOwned::to_owned) else {
+            self.record_attempt(ForwardOperation::Http, "unrouted", "invalid_authority");
+            return Ok(response(
+                StatusCode::BAD_REQUEST,
+                "invalid proxy authority\n",
+            ));
+        };
+        let port = request.uri().port_u16().unwrap_or(80);
+        let authority = request
+            .uri()
+            .authority()
+            .map(ToOwned::to_owned)
+            .expect("absolute HTTP URI has an authority");
+        let path_and_query = request
+            .uri()
+            .path_and_query()
+            .map(|value| value.as_str())
+            .unwrap_or("/");
+        let destination = match self.resolve_destination(&host, port, ForwardOperation::Http) {
+            Ok(destination) => destination,
+            Err(response) => return Ok(*response),
+        };
+        let metrics_name = destination.metrics_name();
+        let verified = match self.authorize(
+            request.headers(),
+            &destination,
+            &host,
+            port,
+            ForwardOperation::Http,
+        ) {
+            Ok(verified) => verified,
+            Err(response) => return Ok(*response),
+        };
+        let method = request.method().clone();
+
+        let (target_host, target_port) = destination.target();
+        let target = match connect_target(
+            target_host,
+            target_port,
+            self.config.allow_private_ips,
+            self.config.connect_timeout,
+        )
+        .await
+        {
+            Ok(stream) => stream,
+            Err(error) => {
+                let reason = if error.kind() == io::ErrorKind::PermissionDenied {
+                    "private_destination"
+                } else {
+                    "connect_failed"
+                };
+                self.record_attempt(ForwardOperation::Http, metrics_name, reason);
+                log::warn!(
+                    "HTTP target failed reason={reason} upstream={metrics_name} subject={:?} \
+                     destination_host={host:?} destination_port={port}: {error}",
+                    verified.subject,
+                );
+                return Ok(response(StatusCode::BAD_GATEWAY, "connection failed\n"));
+            }
+        };
+
+        let origin_uri = match path_and_query.parse() {
+            Ok(uri) => uri,
+            Err(_) => {
+                self.record_attempt(
+                    ForwardOperation::Http,
+                    metrics_name,
+                    "invalid_request_target",
+                );
+                return Ok(response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid request target\n",
+                ));
+            }
+        };
+        let host_header = match HeaderValue::from_str(authority.as_str()) {
+            Ok(value) => value,
+            Err(_) => {
+                self.record_attempt(ForwardOperation::Http, metrics_name, "invalid_authority");
+                return Ok(response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid proxy authority\n",
+                ));
+            }
+        };
+        *request.uri_mut() = origin_uri;
+        strip_proxy_headers(request.headers_mut());
+        request.headers_mut().insert(HOST, host_header);
+
+        let (mut sender, connection) = match client_http1::handshake(TokioIo::new(target)).await {
+            Ok(connection) => connection,
+            Err(error) => {
+                self.record_attempt(ForwardOperation::Http, metrics_name, "connect_failed");
+                log::warn!(
+                    "HTTP upstream handshake failed upstream={metrics_name} subject={:?} \
+                     destination_host={host:?} destination_port={port}: {error}",
+                    verified.subject,
+                );
+                return Ok(response(StatusCode::BAD_GATEWAY, "connection failed\n"));
+            }
+        };
+        let upstream_name = metrics_name.to_string();
+        tokio::spawn(async move {
+            if let Err(error) = connection.await {
+                log::debug!("HTTP upstream connection ended upstream={upstream_name}: {error}");
+            }
+        });
+        let upstream_response = match sender.send_request(request).await {
+            Ok(response) => response,
+            Err(error) => {
+                self.record_attempt(ForwardOperation::Http, metrics_name, "request_failed");
+                log::warn!(
+                    "HTTP upstream request failed upstream={metrics_name} subject={:?} \
+                     destination_host={host:?} destination_port={port}: {error}",
+                    verified.subject,
+                );
+                return Ok(response(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream request failed\n",
+                ));
+            }
+        };
+        self.record_attempt(
+            ForwardOperation::Http,
+            metrics_name,
+            upstream_response.status().as_str(),
+        );
+        if destination.is_audit() {
+            log::warn!(
+                "HTTP unmatched destination allowed action=audit_allow result=forwarded \
+                 destination_host={host:?} destination_port={port} method={method:?} subject={:?}",
+                verified.subject,
+            );
+        }
+        Ok(upstream_response.map(|body| body.boxed()))
+    }
 }
 
 fn response(status: StatusCode, body: &'static str) -> Response<ResponseBody> {
     Response::builder()
         .status(status)
-        .body(Full::new(Bytes::from_static(body.as_bytes())))
-        .expect("static CONNECT response")
+        .body(
+            Full::new(Bytes::from_static(body.as_bytes()))
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+        .expect("static proxy response")
+}
+
+fn strip_proxy_headers(headers: &mut hyper::HeaderMap) {
+    let connection_headers = headers
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|name| HeaderName::from_bytes(name.trim().as_bytes()).ok())
+        .collect::<Vec<_>>();
+    headers.remove(CONNECTION);
+    headers.remove(HeaderName::from_static("keep-alive"));
+    headers.remove(PROXY_AUTHENTICATE);
+    headers.remove(PROXY_AUTHORIZATION);
+    headers.remove(TE);
+    headers.remove(TRAILER);
+    headers.remove(TRANSFER_ENCODING);
+    headers.remove(UPGRADE);
+    headers.remove(HeaderName::from_static("proxy-connection"));
+    for name in connection_headers {
+        headers.remove(name);
+    }
 }
 
 fn proxy_auth_required() -> Response<ResponseBody> {
@@ -495,7 +733,7 @@ where
         .with_upgrades()
         .await
     {
-        log::debug!("CONNECT client connection ended: {error}");
+        log::debug!("forward-proxy client connection ended: {error}");
     }
 }
 
@@ -568,6 +806,56 @@ mod tests {
         let basic = base64::engine::general_purpose::STANDARD.encode("jwt:abc.def");
         let header = HeaderValue::from_str(&format!("Basic {basic}")).unwrap();
         assert_eq!(proxy_token(Some(&header)).unwrap(), "abc.def");
+    }
+
+    #[test]
+    fn strips_hop_by_hop_proxy_headers_without_touching_origin_authorization() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(CONNECTION, HeaderValue::from_static("x-connection-header"));
+        headers.insert(
+            HeaderName::from_static("keep-alive"),
+            HeaderValue::from_static("timeout=5"),
+        );
+        headers.insert(
+            PROXY_AUTHORIZATION,
+            HeaderValue::from_static("Bearer trust-jwt"),
+        );
+        headers.insert(TE, HeaderValue::from_static("trailers"));
+        headers.insert(TRAILER, HeaderValue::from_static("x-trailer"));
+        headers.insert(TRANSFER_ENCODING, HeaderValue::from_static("chunked"));
+        headers.insert(UPGRADE, HeaderValue::from_static("websocket"));
+        headers.insert(
+            HeaderName::from_static("proxy-connection"),
+            HeaderValue::from_static("keep-alive"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-connection-header"),
+            HeaderValue::from_static("remove-me"),
+        );
+        headers.insert(
+            HeaderName::from_static("authorization"),
+            HeaderValue::from_static("Bearer origin-token"),
+        );
+
+        strip_proxy_headers(&mut headers);
+
+        for name in [
+            "connection",
+            "keep-alive",
+            "proxy-authorization",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+            "proxy-connection",
+            "x-connection-header",
+        ] {
+            assert!(headers.get(name).is_none(), "{name} was forwarded");
+        }
+        assert_eq!(
+            headers.get("authorization"),
+            Some(&HeaderValue::from_static("Bearer origin-token"))
+        );
     }
 
     #[tokio::test]
@@ -825,6 +1113,94 @@ mod tests {
         ));
         assert!(rendered.contains(
             "trust_connect_bytes_total{direction=\"to_upstream\",upstream=\"audit-unmatched\"} 8"
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn audit_unmatched_forwards_absolute_http_requests_without_forwarding_proxy_credentials()
+    {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = target.local_addr().unwrap().port();
+        let (captured_tx, captured_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = target.accept().await.unwrap();
+            let request = read_response_head(&mut stream).await;
+            captured_tx.send(request).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+
+        let keystore = Arc::new(Keystore::new());
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        keystore.store(build_key_material(&key.serialize_pem(), None).unwrap());
+        let keys = keystore.load().unwrap();
+        let issuer = Issuer::new("trust".into(), "proxy".into(), Duration::from_secs(60));
+        let token = issuer
+            .mint(
+                &keys,
+                "sandbox-audit",
+                &ScopeSet::parse("outbound-audit").unwrap(),
+                jsonwebtoken::get_current_timestamp(),
+            )
+            .unwrap();
+
+        let metrics = Arc::new(ProxyMetrics::new());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let state = Arc::new(ConnectProxy::new(
+            Arc::new(Router::new(&[])),
+            Arc::new(Verifier::new("trust".into(), "proxy".into())),
+            keystore,
+            metrics.clone(),
+            ForwardProxyConfig {
+                addr: proxy_addr.to_string(),
+                tls: false,
+                connect_timeout: Duration::from_secs(1),
+                idle_timeout: Duration::from_secs(5),
+                max_tunnel_duration: Duration::from_secs(30),
+                max_concurrent_tunnels: 10,
+                allow_private_ips: true,
+                audit_unmatched: Some(AuditUnmatchedConfig {
+                    scope: "outbound-audit".into(),
+                }),
+            },
+        ));
+        let server = tokio::spawn(serve_connect(listener, None, state));
+        let authority = format!("127.0.0.1:{target_port}");
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        client
+            .write_all(
+                format!(
+                    "GET http://{authority}/resource?x=1 HTTP/1.1\r\nHost: {authority}\r\nProxy-Authorization: Bearer {token}\r\nProxy-Connection: keep-alive\r\nAuthorization: Bearer origin-token\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            read_response_head(&mut client)
+                .await
+                .starts_with("HTTP/1.1 200")
+        );
+        let mut body = [0_u8; 2];
+        client.read_exact(&mut body).await.unwrap();
+        assert_eq!(&body, b"ok");
+
+        let captured = captured_rx.await.unwrap();
+        assert!(captured.starts_with("GET /resource?x=1 HTTP/1.1\r\n"));
+        let captured_lowercase = captured.to_ascii_lowercase();
+        assert!(captured_lowercase.contains(&format!("host: {authority}\r\n")));
+        assert!(captured_lowercase.contains("authorization: bearer origin-token\r\n"));
+        assert!(!captured_lowercase.contains("proxy-authorization"));
+        assert!(!captured_lowercase.contains("proxy-connection"));
+
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(rendered.contains(
+            "trust_forward_proxy_requests_total{result=\"200\",upstream=\"audit-unmatched\"} 1"
         ));
         server.abort();
     }

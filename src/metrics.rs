@@ -15,6 +15,7 @@ pub struct ProxyMetrics {
     connect_active: IntGaugeVec,
     connect_duration: HistogramVec,
     connect_bytes: IntCounterVec,
+    forward_proxy_requests: IntCounterVec,
 }
 
 impl ProxyMetrics {
@@ -97,6 +98,14 @@ impl ProxyMetrics {
             &["upstream", "direction"],
         )
         .expect("valid CONNECT bytes metric");
+        let forward_proxy_requests = IntCounterVec::new(
+            Opts::new(
+                "trust_forward_proxy_requests_total",
+                "HTTP forward-proxy requests by configured upstream or audit fallback and bounded result.",
+            ),
+            &["upstream", "result"],
+        )
+        .expect("valid HTTP forward-proxy requests metric");
 
         registry
             .register(Box::new(requests.clone()))
@@ -128,6 +137,9 @@ impl ProxyMetrics {
         registry
             .register(Box::new(connect_bytes.clone()))
             .expect("register CONNECT bytes metric");
+        registry
+            .register(Box::new(forward_proxy_requests.clone()))
+            .expect("register HTTP forward-proxy requests metric");
 
         ProxyMetrics {
             registry,
@@ -141,6 +153,7 @@ impl ProxyMetrics {
             connect_active,
             connect_duration,
             connect_bytes,
+            forward_proxy_requests,
         }
     }
 
@@ -211,6 +224,12 @@ impl ProxyMetrics {
         self.connect_bytes
             .with_label_values(&[upstream, "to_client"])
             .inc_by(bytes_to_client);
+    }
+
+    pub fn forward_proxy_request(&self, upstream: &str, result: &str) {
+        self.forward_proxy_requests
+            .with_label_values(&[upstream, result])
+            .inc();
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, prometheus::Error> {

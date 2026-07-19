@@ -2,7 +2,7 @@
 
 How to build, configure, run, and use `trust`, the policy-enforcing egress
 proxy. Covers a local-dev quickstart and production notes, including mTLS token
-issuance, credential injection, authenticated passthrough, and HTTP CONNECT.
+issuance, credential injection, authenticated passthrough, and HTTP(S) forwarding.
 
 ## What you're running
 
@@ -12,7 +12,7 @@ trust exposes up to five listeners:
 |---|---|---|
 | `6191` | reverse proxy (plain HTTP) | optional development listener; avoid for JWT-bearing production traffic |
 | `6443` | reverse proxy (TLS) | credential injection and authenticated passthrough |
-| `6180` | CONNECT proxy (TLS by default) | authenticated tunnels to exact allowlisted `host:port` origins |
+| `6180` | HTTP(S) forward proxy (TLS by default) | absolute-form HTTP and authenticated HTTPS CONNECT forwarding |
 | `8443` | issuance (**mTLS**) | `POST /token` — OAuth2 `client_credentials`, mints scoped JWTs |
 | `8080` | management (plain HTTP) | JWKS, `/healthz`, `/readyz`, and `/metrics` |
 
@@ -21,7 +21,7 @@ A client authenticates to the **issuance** endpoint with an mTLS client cert
 the proxy. trust verifies the JWT and authorizes by scope. A reverse-proxy
 upstream can inject a server-side credential or pass the caller's credential
 through; a CONNECT upstream opens an opaque tunnel only to an exact configured
-destination.
+destination unless the audited fallback is enabled.
 
 ## Prerequisites
 
@@ -90,7 +90,7 @@ addr = "0.0.0.0:6443"
 cert_path = "/etc/trust/certs/server.crt"
 key_path  = "/etc/trust/certs/server.key"
 
-[forward_proxy]                         # optional CONNECT-only listener
+[forward_proxy]                         # optional HTTP(S) forward-proxy listener
 addr = "0.0.0.0:6180"
 tls = true                              # reuses the [tls] certificate/key
 connect_timeout = "10s"
@@ -228,7 +228,8 @@ Linear personal API key; `accessToken` makes the SDK send the JWT as a Bearer
 credential, which trust replaces with the raw Linear key. See
 [`examples/linear-js`](../examples/linear-js/README.md) for a runnable example.
 
-**CONNECT forward proxy** (the JWT needs the `public-api` scope):
+**HTTP(S) forward proxy** (the JWT needs the `public-api` scope for this
+CONNECT example):
 
 ```bash
 JWT=$(./scripts/mint-jwt.sh "public-api")
@@ -240,8 +241,11 @@ curl --proxy https://localhost:6180 \
 
 For clients limited to proxy URL authentication, use Basic username `jwt` and
 the JWT as password: `HTTPS_PROXY=https://jwt:${JWT}@localhost:6180`. The
-listener accepts CONNECT only, so plain HTTP sent through `HTTP_PROXY` receives
-`405 Method Not Allowed`. Unknown destinations or ports receive `403`.
+listener also accepts absolute-form HTTP sent through `HTTP_PROXY`. For a
+NetworkPolicy-restricted internal listener configured with `tls = false`, use
+`HTTP_PROXY=http://jwt:${JWT}@trust.internal:6180` and set `HTTPS_PROXY` to the
+same URL. Unknown destinations or ports receive `403` unless `audit_unmatched`
+is configured.
 
 **git smart-HTTP cache:**
 
@@ -283,10 +287,12 @@ curl -sS https://anthropic.proxy.internal:6443/v1/models \
   proxy DNS names in its SANs. JWKS (`8080`) is safe to expose to verifiers, but
   `/metrics` may reveal operational metadata. The issuance endpoint (`8443`)
   must stay mTLS-only.
-- **CONNECT:** only passthrough API upstreams with `allow_connect = true` are
-  reachable, matched by exact origin `host:port`. Private, loopback, link-local,
-  and other non-public targets are rejected unless explicitly enabled. Tunnels
-  end at JWT expiry, idle timeout, maximum duration, or process shutdown.
+- **HTTP(S) forwarding:** only passthrough API upstreams with `allow_connect = true`
+  are reachable by CONNECT, matched by exact origin `host:port`. The optional
+  `audit_unmatched` fallback allows public destinations with its own scope and
+  logs every unmatched destination. Private, loopback, link-local, and other
+  non-public targets are rejected unless explicitly enabled. Tunnels end at JWT
+  expiry, idle timeout, maximum duration, or process shutdown.
 - **Token TTL:** `token_ttl` (configured as 7d in this local example) trades
   revocation latency for fewer mints. Shorten it in production if you need
   tighter revocation.
@@ -305,6 +311,6 @@ curl -sS https://anthropic.proxy.internal:6443/v1/models \
 | proxy → 502 | upstream secret fetch failed (GCP) or upstream unreachable |
 | CONNECT → 407 | missing, expired, or invalid `Proxy-Authorization` JWT |
 | CONNECT → 403 | destination is not allowlisted or JWT scope does not cover it |
-| CONNECT → 405 | client sent a non-CONNECT method (commonly plain `HTTP_PROXY` traffic) |
+| forward proxy → 400 | request was not absolute-form HTTP and was not HTTPS CONNECT |
 | CONNECT → 502 | DNS resolution, private-address policy, or target connection failed |
 | CONNECT → 503 | signing keys unavailable or concurrent tunnel capacity exhausted |

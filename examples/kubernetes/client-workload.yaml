@@ -52,12 +52,12 @@ spec:
               value: /var/run/trust/client/tls.key
             - name: TRUST_SERVER_CA
               value: /var/run/trust/server/ca.crt
-            # Application-specific proxy address. After minting a short-lived
-            # JWT, the application supplies Proxy-Authorization: Bearer <JWT>.
-            # Clients limited to proxy URL credentials use Basic username `jwt`
-            # and the JWT as password in HTTPS_PROXY.
+            # Application-specific proxy address. The NetworkPolicy permits
+            # this plaintext in-cluster listener but no direct public egress.
+            # After minting a short-lived JWT, the application sends
+            # Proxy-Authorization: Bearer <JWT> (or Basic jwt:<JWT>) here.
             - name: TRUST_FORWARD_PROXY
-              value: https://trust.trust-system.svc:6180
+              value: http://trust.trust-system.svc:6180
             - name: NO_PROXY
               value: >-
                 metadata.google.internal,

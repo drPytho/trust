@@ -6,11 +6,11 @@ Hyper.
 Clients authenticate to `trust` with a **short-lived JWT** they mint against their own mTLS identity.
 `trust` validates the JWT, checks the client is authorized for the requested upstream, fetches the
 **real** upstream secret from a secret manager, injects it, and forwards the request. Explicit
-destinations can instead pass caller credentials through or accept authenticated HTTP CONNECT
-tunnels. The upstream credential is never handed to clients, and the client's JWT is never
-forwarded upstream.
+destinations can instead pass caller credentials through or accept authenticated HTTP(S)
+forward-proxy traffic. The upstream credential is never handed to clients, and the client's JWT
+is never forwarded upstream.
 
-> **Status:** credential-injected API proxying, authenticated passthrough, HTTP CONNECT forwarding,
+> **Status:** credential-injected API proxying, authenticated passthrough, HTTP(S) forward proxying,
 > and git smart-HTTP caching are implemented. API credentials may be static Secret Manager values,
 > repository-scoped GitHub App installation tokens, or Google ADC access tokens for services such
 > as Artifact Registry.
@@ -67,10 +67,11 @@ key to be loaded. The exported proxy metrics are:
 - `trust_connect_active_tunnels{upstream}`
 - `trust_connect_duration_seconds{upstream}`
 - `trust_connect_bytes_total{upstream,direction}`
+- `trust_forward_proxy_requests_total{upstream,result}`
 
-Rejected reverse-proxy and CONNECT calls are also logged at `WARN` with bounded reason labels and
-safe request metadata. CONNECT distinguishes invalid authorities, unknown destinations, missing or
-invalid tokens, forbidden scopes, private destinations, connection failures, and tunnel-capacity
+Rejected reverse-proxy and forward-proxy calls are also logged at `WARN` with bounded reason labels
+and safe request metadata. CONNECT distinguishes invalid authorities, unknown destinations, missing
+or invalid tokens, forbidden scopes, private destinations, connection failures, and tunnel-capacity
 exhaustion. Credentials and authorization headers are never logged.
 
 ### Proxying a request
@@ -125,7 +126,7 @@ Rules:
   uncovered scopes → 403.
 - **Key rotation** — current + previous ES256 keys loaded from GCP Secret Manager, refreshed
   in the background every 10 minutes; JWKS served for external verification.
-- **Pingora reverse proxy plus optional Hyper CONNECT listener** — both reuse the same upstream
+- **Pingora reverse proxy plus optional Hyper HTTP(S) forward-proxy listener** — both reuse the same upstream
   configuration, JWT verifier, signing keys, scopes, metrics registry, and process lifecycle.
 - **Per-upstream host routing** via the `Host` header.
 - **GCP Secret Manager** backend behind a swappable `SecretProvider` trait, with an
@@ -138,9 +139,9 @@ Rules:
 - **Configurable injection** per upstream: header name + scheme (`bearer` / `basic` / `raw`).
 - **Authenticated passthrough** — explicitly allowlisted hosts can proxy without credential
   injection while retaining scoped JWT authorization and preserving the caller's headers.
-- **Authenticated CONNECT forwarding** — an optional forward-proxy listener supports standard
-  `HTTPS_PROXY` clients. Only explicitly enabled `host:port` destinations are reachable, and every
-  tunnel requires a scoped JWT.
+- **Authenticated HTTP(S) forwarding** — an optional forward-proxy listener accepts absolute-form
+  HTTP and HTTPS CONNECT requests. Explicit destinations retain their named scope; an opt-in audit
+  fallback allows all public destinations with the dedicated `outbound-audit` scope.
 - **Repo-scoped authz** for `github-repo` upstreams — the request path is parsed for
   `owner/repo`; the JWT scope must cover it. `github-cli-repo` additionally supports the
   GitHub Enterprise-style REST and repository-rooted GraphQL requests emitted by `gh`.
@@ -168,8 +169,10 @@ addr = "0.0.0.0:6443"
 cert_path = "/etc/trust/server.crt"
 key_path  = "/etc/trust/server.key"
 
-# Optional HTTP CONNECT forward proxy. TLS protects the JWT on the client-to-proxy hop.
-# The [tls] certificate/key above are reused and must cover this listener's DNS name.
+# Optional HTTP(S) forward proxy. It accepts absolute-form HTTP requests and
+# HTTPS CONNECT tunnels. TLS protects the JWT on the client-to-proxy hop when
+# enabled; the [tls] certificate/key above are reused and must cover this
+# listener's DNS name.
 [forward_proxy]
 addr = "0.0.0.0:6180"
 tls = true
@@ -178,7 +181,7 @@ idle_timeout = "5m"
 max_tunnel_duration = "1h"
 max_concurrent_tunnels = 1024
 allow_private_ips = false
-# Temporary discovery mode for otherwise-unmatched CONNECT destinations:
+# Audit fallback for otherwise-unmatched public HTTP(S) destinations:
 # audit_unmatched = { scope = "outbound-audit" }
 
 # JWT auth: issuer/audience embedded in minted tokens and verified on every request.
@@ -325,14 +328,13 @@ with `replace-registry-host=always`, so previously stored direct `*.pkg.dev` URL
 Publishing should use a separate upstream, workload identity, and method policy with Artifact
 Registry Writer access.
 
-### Using the CONNECT forward proxy
+### Using the HTTP(S) forward proxy
 
-CONNECT is for clients that expect a conventional forward proxy, especially HTTPS clients. The
-request target must exactly match the configured upstream origin's `host:port`, the upstream must
-use `mode = "passthrough"` and `allow_connect = true`, and the JWT must include that upstream's
-scope. Unknown destinations are denied. Because the tunneled TLS is opaque to `trust`, CONNECT
-cannot inject credentials or enforce HTTP paths or methods; use the reverse-proxy host for those
-policies.
+The listener accepts absolute-form `http://` requests and HTTPS CONNECT tunnels. Explicit CONNECT
+destinations must exactly match a configured passthrough upstream's `host:port` and require that
+upstream's scope. When `audit_unmatched` is configured, any public destination instead requires
+the audit scope and is logged for review. Because CONNECT is opaque to `trust`, it cannot inject
+credentials or enforce HTTP paths or methods; use a reverse-proxy host for those policies.
 
 Clients that can set proxy headers directly should use Bearer authentication:
 
@@ -356,10 +358,18 @@ Setting `tls = false` and using `http://` is more widely compatible, but exposes
 who can observe that network hop. Keep the listener private if plaintext is unavoidable. Avoid
 putting long-lived secrets in proxy URLs; these JWTs should be short-lived and scoped.
 
-The forward listener accepts CONNECT only. It works for `HTTPS_PROXY` clients that tunnel HTTPS,
-but it is not a general absolute-form HTTP proxy: a client using `HTTP_PROXY` for plain HTTP will
-receive `405 Method Not Allowed`. Route plain HTTP through an explicit reverse-proxy upstream or add
-absolute-form forwarding as a separate, policy-aware feature.
+For a private cluster-internal path where plaintext transport is an accepted
+boundary, set `tls = false` and point standard proxy variables directly at the
+ClusterIP listener:
+
+```bash
+export HTTP_PROXY="http://jwt:${JWT}@trust.example.internal:6180"
+export HTTPS_PROXY="$HTTP_PROXY"
+```
+
+Keep that listener private and restrict its sources with NetworkPolicy. Trust
+remains responsible for proxy authentication, scope checks, destination policy,
+and audit logs.
 
 The proxy resolves DNS server-side and rejects loopback, link-local, private, unique-local,
 multicast, documentation, and carrier-grade NAT addresses by default. Set `allow_private_ips =
@@ -368,8 +378,8 @@ the idle timeout, or `max_tunnel_duration`, whichever comes first.
 
 #### Auditing unmatched outbound destinations
 
-During migration, the CONNECT listener can temporarily allow otherwise-unmatched destinations
-while inventorying them. This is opt-in and still requires a valid JWT with a dedicated bare scope:
+During migration, the forward proxy can allow otherwise-unmatched public destinations while
+inventorying them. This is opt-in and still requires a valid JWT with a dedicated bare scope:
 
 ```toml
 [forward_proxy]
@@ -383,20 +393,19 @@ spiffe = "spiffe://example/sandboxes/*"
 allowed_scopes = ["outbound-audit"]
 ```
 
-For an unknown CONNECT authority, trust logs the requested hostname and port at `WARN`, verifies
-the JWT and `outbound-audit` scope, applies the normal DNS/private-IP checks and tunnel limits, and
-then records the result under
-`trust_connect_attempts_total{upstream="audit-unmatched",result="..."}`. Successful tunnels also
-use `audit-unmatched` in the active, duration, and byte metrics. Destination names are kept in logs
-rather than Prometheus labels to avoid unbounded metric cardinality. Authorization headers and
-tokens are never logged.
+For an unknown CONNECT authority or absolute-form HTTP request, trust logs the requested hostname
+and port at `WARN`, verifies the JWT and `outbound-audit` scope, and applies the normal
+DNS/private-IP checks. CONNECT results are recorded under
+`trust_connect_attempts_total{upstream="audit-unmatched",result="..."}`; plain HTTP results use
+`trust_forward_proxy_requests_total{upstream="audit-unmatched",result="..."}`. Destination names
+stay in logs rather than Prometheus labels to avoid unbounded metric cardinality. Authorization
+headers and tokens are never logged.
 
 Exact configured CONNECT destinations always take precedence and continue to require their named
 upstream scopes. Give a sandbox its intended named scopes plus `outbound-audit` during discovery,
 then convert observed destinations into explicit passthrough upstreams and remove the audit scope
 and setting to return to deny-by-default behavior. The audit fallback does not apply to reverse
-proxy hosts, private destinations when `allow_private_ips = false`, or plain HTTP requests sent via
-`HTTP_PROXY`; the forward listener remains CONNECT-only.
+proxy hosts or private destinations when `allow_private_ips = false`.
 
 ## Running
 
@@ -535,7 +544,8 @@ These inherited Git settings avoid CONNECT and ensure the git subprocess also st
 - Unknown hosts are denied, and passthrough must be enabled explicitly per configured upstream.
 - CONNECT destinations are denied unless their exact origin `host:port` has `allow_connect = true`.
   CONNECT reuses the same JWT verifier, scope names, upstream allowlist, logs, and metrics as the
-  reverse proxy, but cannot inspect or inject into the encrypted tunnel.
+  reverse proxy, but cannot inspect or inject into the encrypted tunnel. The optional audit fallback
+  is the only policy that permits otherwise-unmatched public destinations.
 - The issuance server is mTLS-only — unauthenticated clients cannot reach the `/token` endpoint.
 - Scopes are capped at issuance to the per-identity policy; clients cannot self-escalate.
 - The config file contains no plaintext secrets — only secret-manager references. Keep your

@@ -69,9 +69,9 @@ TRUST_JWT="$(./scripts/mint-jwt.sh mistral)" node examples/anthropic-js/query.mj
 - Uses trust's plain `tcp` listener (`http://localhost:6191`) so the Node client
   needs no TLS trust config. In production, front the proxy with TLS (`[tls]`)
   and point `TRUST_URL` at `https://…`.
-- The example does not enable `[forward_proxy]`. Use that CONNECT-only listener
-  for explicitly allowlisted passthrough destinations, not for Anthropic key
-  injection.
+- The example does not enable `[forward_proxy]`. Use that HTTP(S) listener for
+  explicitly allowlisted passthrough or audited generic destinations, not for
+  Anthropic key injection.
 - `listen_host = "localhost"` in the config is what makes the SDK's default
   `Host: localhost` route to the `anthropic` upstream.
 - The scripts referenced here (`dev-certs.sh`, `gen-signing-key.sh`,

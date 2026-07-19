@@ -21,14 +21,15 @@ data:
 
     [forward_proxy]
     addr = "0.0.0.0:6180"
-    tls = true
+    # This example confines the plaintext listener with NetworkPolicy.
+    tls = false
     connect_timeout = "10s"
     idle_timeout = "5m"
     max_tunnel_duration = "1h"
     max_concurrent_tunnels = 1024
     allow_private_ips = false
-    # Temporary rollout inventory mode. If enabled, also grant only selected
-    # sandbox identities the dedicated scope in issuance.clients.
+    # Audit fallback. Grant the dedicated scope to each sandbox identity that
+    # should reach otherwise-unmatched public HTTP(S) destinations.
     # audit_unmatched = { scope = "outbound-audit" }
 
     [auth]
