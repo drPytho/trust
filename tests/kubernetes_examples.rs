@@ -204,9 +204,9 @@ fn kubernetes_examples_keep_mitm_signer_and_workload_ca_separate() {
         .as_mapping()
         .expect("egress CA ConfigMap must have data");
     assert_eq!(ca_data.len(), 1, "workload receives only the public CA");
-    let ca = workload_ca["data"]["ca.crt"]
+    let ca = workload_ca["data"]["ca-bundle.crt"]
         .as_str()
-        .expect("egress CA ConfigMap must provide ca.crt");
+        .expect("egress CA ConfigMap must provide ca-bundle.crt");
     assert!(ca.contains("BEGIN CERTIFICATE"));
     assert!(!ca.contains("PRIVATE KEY"));
 
@@ -322,13 +322,17 @@ fn workload_uses_the_internal_proxy_without_a_relay_sidecar() {
         assert!(
             env.iter()
                 .any(|entry| entry["name"].as_str() == Some(proxy_variable)
-                    && entry["value"].as_str() == Some("http://trust.trust-system.svc:6180"))
+                    && entry["value"].as_str()
+                        == Some(
+                            "http://jwt:REPLACE_WITH_SHORT_LIVED_TRUST_JWT@trust.trust-system.svc:6180"
+                        ))
         );
     }
-    assert!(env.iter().any(
-        |entry| entry["name"].as_str() == Some("TRUST_EGRESS_MITM_CA")
-            && entry["value"].as_str() == Some("/var/run/trust/egress-mitm/ca.crt")
-    ));
+    assert!(
+        env.iter()
+            .any(|entry| entry["name"].as_str() == Some("SSL_CERT_FILE")
+                && entry["value"].as_str() == Some("/var/run/trust/egress-mitm/ca-bundle.crt"))
+    );
 }
 
 #[test]

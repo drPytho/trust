@@ -1,5 +1,6 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -16,6 +17,7 @@ use crate::secrets::Secret;
 
 pub struct MitmRequestCtx {
     upstream: Option<Arc<Upstream>>,
+    upstream_address: Option<SocketAddr>,
     secret: Option<Secret>,
     credential_cache_key: Option<String>,
     started_at: Instant,
@@ -28,6 +30,7 @@ impl MitmRequestCtx {
         metrics.request_started();
         MitmRequestCtx {
             upstream: None,
+            upstream_address: None,
             secret: None,
             credential_cache_key: None,
             started_at: Instant::now(),
@@ -60,13 +63,22 @@ impl Drop for MitmRequestCtx {
 pub struct MitmProxyService {
     credentials: Arc<dyn CredentialProvider>,
     metrics: Arc<ProxyMetrics>,
+    connect_timeout: Duration,
+    idle_timeout: Duration,
 }
 
 impl MitmProxyService {
-    pub fn new(credentials: Arc<dyn CredentialProvider>, metrics: Arc<ProxyMetrics>) -> Self {
+    pub fn new(
+        credentials: Arc<dyn CredentialProvider>,
+        metrics: Arc<ProxyMetrics>,
+        connect_timeout: Duration,
+        idle_timeout: Duration,
+    ) -> Self {
         MitmProxyService {
             credentials,
             metrics,
+            connect_timeout,
+            idle_timeout,
         }
     }
 
@@ -124,6 +136,7 @@ impl ProxyHttp for MitmProxyService {
         };
         let upstream = connection.upstream.clone();
         ctx.upstream = Some(upstream.clone());
+        ctx.upstream_address = Some(connection.upstream_address);
 
         if !upstream.intercept_connect
             || upstream.kind != UpstreamKind::Api
@@ -213,12 +226,14 @@ impl ProxyHttp for MitmProxyService {
             .upstream
             .as_ref()
             .ok_or_else(|| Error::new_str("intercept upstream missing in context"))?;
-        let origin = &upstream.origin;
-        // HttpPeer's defaults retain both certificate and hostname verification.
-        Ok(Box::new(HttpPeer::new(
-            (origin.host.as_str(), origin.port),
-            origin.tls,
-            origin.sni.clone(),
+        let address = ctx
+            .upstream_address
+            .ok_or_else(|| Error::new_str("intercept upstream address missing in context"))?;
+        Ok(Box::new(configured_upstream_peer(
+            upstream,
+            address,
+            self.connect_timeout,
+            self.idle_timeout,
         )))
     }
 
@@ -250,8 +265,9 @@ impl ProxyHttp for MitmProxyService {
         if matches!(upstream.credential, Some(CredentialSource::GcpAdc { .. })) {
             upstream_request.remove_header("accept-encoding");
         }
+        let origin_authority = origin_authority(upstream);
         upstream_request
-            .insert_header("host", upstream.origin.host.as_str())
+            .insert_header("host", origin_authority.as_str())
             .map_err(|_| Error::new_str("failed to set intercept upstream host"))?;
         Ok(())
     }
@@ -282,6 +298,33 @@ impl ProxyHttp for MitmProxyService {
             .unwrap_or_else(|| "unrouted".to_string());
         ctx.finish_metrics(&upstream, status);
     }
+}
+
+fn origin_authority(upstream: &Upstream) -> String {
+    let origin = &upstream.origin;
+    if (origin.tls && origin.port == 443) || (!origin.tls && origin.port == 80) {
+        origin.host.clone()
+    } else {
+        format!("{}:{}", origin.host, origin.port)
+    }
+}
+
+fn configured_upstream_peer(
+    upstream: &Upstream,
+    address: SocketAddr,
+    connect_timeout: Duration,
+    idle_timeout: Duration,
+) -> HttpPeer {
+    let mut peer = HttpPeer::new(address, upstream.origin.tls, upstream.origin.sni.clone());
+    // Preserve the forward proxy's egress timeouts. The address was resolved
+    // and checked before CONNECT succeeded, so constructing the peer from it
+    // also prevents DNS rebinding from bypassing that policy.
+    peer.options.connection_timeout = Some(connect_timeout);
+    peer.options.total_connection_timeout = Some(connect_timeout);
+    peer.options.read_timeout = Some(idle_timeout);
+    peer.options.write_timeout = Some(idle_timeout);
+    peer.options.idle_timeout = Some(idle_timeout);
+    peer
 }
 
 fn host_matches_context(value: Option<&str>, context: &MitmConnectionContext) -> bool {
@@ -354,6 +397,7 @@ mod tests {
             }),
             authority_host: host.into(),
             authority_port: port,
+            upstream_address: "127.0.0.1:443".parse().unwrap(),
             subject: "sandbox".into(),
             scopes: ScopeSet::parse("provider").unwrap(),
             expires_at: u64::MAX,
@@ -382,5 +426,44 @@ mod tests {
 
         request.append_header("host", "api.example.com").unwrap();
         assert!(!request_authority_matches_context(&request, &context));
+    }
+
+    #[test]
+    fn preserves_non_default_origin_port_in_upstream_host() {
+        let non_default_context = context("api.example.com", 8443);
+        assert_eq!(
+            origin_authority(&non_default_context.upstream),
+            "api.example.com:8443"
+        );
+        assert_eq!(
+            origin_authority(&context("api.example.com", 443).upstream),
+            "api.example.com"
+        );
+    }
+
+    #[test]
+    fn uses_the_policy_checked_address_and_forward_proxy_timeouts() {
+        let context = context("api.example.com", 443);
+        let peer = configured_upstream_peer(
+            &context.upstream,
+            "203.0.113.10:443".parse().unwrap(),
+            Duration::from_secs(3),
+            Duration::from_secs(7),
+        );
+
+        assert_eq!(peer.sni, "api.example.com");
+        assert_eq!(
+            peer.options.connection_timeout,
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(
+            peer.options.total_connection_timeout,
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(peer.options.read_timeout, Some(Duration::from_secs(7)));
+        assert_eq!(peer.options.write_timeout, Some(Duration::from_secs(7)));
+        assert_eq!(peer.options.idle_timeout, Some(Duration::from_secs(7)));
+        assert!(peer.options.verify_cert);
+        assert!(peer.options.verify_hostname);
     }
 }

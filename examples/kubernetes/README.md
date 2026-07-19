@@ -31,11 +31,12 @@ kubectl -n trust-system create secret generic trust-egress-mitm-intermediate \
 ```
 
 Never add the root private key to this Secret. The separate
-`trust-egress-mitm-ca` ConfigMap in `client-workload.yaml` contains only the
-public egress root and is intended solely for a tenant explicitly enabled for
-interception. Replace its placeholder with `egress-root-ca.pem` (or create the
-ConfigMap from that file). Do not mount the intermediate, any private key, or a
-cluster-wide extra root into ordinary workloads.
+`trust-egress-mitm-ca` ConfigMap in `client-workload.yaml` is intended solely
+for a tenant explicitly enabled for interception. Its `ca-bundle.crt` must be
+a combined public bundle: the workload's ordinary roots, the Trust server CA,
+and `egress-root-ca.pem`. The workload sets `SSL_CERT_FILE` to that bundle, so
+mounting only the egress root would break ordinary public TLS validation. Do
+not mount the intermediate or any private key into any workload.
 
 Apply the example:
 
@@ -99,13 +100,13 @@ trust JWT as `accessToken` and the complete proxy GraphQL URL as `apiUrl`.
 
 The `anthropic` upstream additionally sets `intercept_connect = true`. A
 selected Sandbox may call `https://api.anthropic.com` through `HTTPS_PROXY`
-with its short-lived `anthropic` scope and the public egress root in its TLS
-trust bundle. Trust requires exact CONNECT authority, TLS SNI, and inner HTTP
-Host agreement, then injects the configured `x-api-key`; an `outbound-audit`
-token cannot reach this path. The existing `anthropic.proxy.internal` reverse
-proxy remains a compatibility path. HTTP/2, HTTP/3/QUIC, certificate-pinned,
-and non-reviewed provider traffic should remain opaque or use a separately
-reviewed exception.
+with its short-lived `anthropic` scope and the combined public CA bundle
+described above. Trust requires exact CONNECT authority, TLS SNI, and inner
+HTTP Host agreement, then injects the configured `x-api-key`; an
+`outbound-audit` token cannot reach this path. The existing
+`anthropic.proxy.internal` reverse proxy remains a compatibility path. HTTP/2,
+HTTP/3/QUIC, certificate-pinned, and non-reviewed provider traffic should
+remain opaque or use a separately reviewed exception.
 
 Mint a JWT with both exact repository scopes, then configure the sandbox:
 
@@ -297,9 +298,11 @@ equivalent stable internal DNS names in `listen_host`.
 
 The `sandbox-egress-network-policy.yaml` allowlists Trust, DNS, and the GKE
 metadata exception only. It intentionally has no UDP/443 rule, so QUIC cannot
-bypass the HTTP proxy. The Sandbox operator is responsible for injecting
-`HTTP_PROXY`/`HTTPS_PROXY`, the public egress root only into opt-in tenants,
-and enforcing any direct-egress exceptions through a separate review.
+bypass the HTTP proxy. The Sandbox operator is responsible for injecting a
+current, scoped Basic `jwt:<JWT>` proxy URL into `HTTP_PROXY`/`HTTPS_PROXY`, the
+combined public CA bundle only into opt-in tenants, and enforcing any
+direct-egress exceptions through a separate review. It must rotate or reinject
+the proxy URL before the JWT expires; a bare proxy URL receives `407`.
 
 An orchestrator can mint a narrowly scoped JWT over mTLS, pass the short-lived
 token and proxy URL into the sandbox, and configure clients in either of these

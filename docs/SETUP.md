@@ -80,8 +80,10 @@ your callers' certs.
 
 TLS interception uses a separate CA hierarchy. The root stays offline; Trust
 receives only a scoped intermediate and explicitly opted-in Sandbox workloads
-receive only the public root. Do not reuse `[tls]`, the workload mTLS CA, or the
-JWT signing key.
+add only the public root to their combined TLS trust bundle. That bundle must
+retain normal public roots (and the Trust server CA when the workload uses it),
+not replace them with the egress root. Do not reuse `[tls]`, the workload mTLS
+CA, or the JWT signing key.
 
 For development:
 

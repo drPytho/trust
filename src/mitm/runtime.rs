@@ -94,7 +94,12 @@ impl MitmRuntime {
         let acceptor = Arc::new(builder.build());
         let proxy = Arc::new(http_proxy(
             server_conf,
-            MitmProxyService::new(credentials, metrics.clone()),
+            MitmProxyService::new(
+                credentials,
+                metrics.clone(),
+                forward.connect_timeout,
+                forward.idle_timeout,
+            ),
         ));
         let (shutdown_tx, shutdown) = watch::channel(false);
 
@@ -542,6 +547,7 @@ mod tests {
                     upstream,
                     authority_host: "api.example.com".to_string(),
                     authority_port: 443,
+                    upstream_address: "127.0.0.1:443".parse().unwrap(),
                     subject: "sandbox".to_string(),
                     scopes: ScopeSet::parse("provider").unwrap(),
                     expires_at: u64::MAX,
@@ -840,7 +846,7 @@ mod tests {
             .unwrap();
         let origin_request = origin_request.to_ascii_lowercase();
         assert!(origin_request.contains("x-api-key: trust-injected-key\r\n"));
-        assert!(origin_request.contains("host: localhost\r\n"));
+        assert!(origin_request.contains(&format!("host: localhost:{origin_port}\r\n")));
         assert!(!origin_request.contains("authorization: bearer sandbox-provider-key"));
         assert!(!origin_request.contains("proxy-authorization"));
 

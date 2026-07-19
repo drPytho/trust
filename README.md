@@ -401,9 +401,11 @@ remains responsible for proxy authentication, scope checks, destination policy,
 and audit logs.
 
 The proxy resolves DNS server-side and rejects loopback, link-local, private, unique-local,
-multicast, documentation, and carrier-grade NAT addresses by default. Set `allow_private_ips =
-true` only when explicitly configured internal upstreams are required. Tunnels end at JWT expiry,
-the idle timeout, or `max_tunnel_duration`, whichever comes first.
+multicast, documentation, and carrier-grade NAT addresses by default. For intercepted routes, the
+approved address is resolved and frozen at CONNECT time before Trust returns `200`; the decrypted
+upstream connection uses that address rather than performing a second DNS lookup. Set
+`allow_private_ips = true` only when explicitly configured internal upstreams are required.
+Tunnels end at JWT expiry, the idle timeout, or `max_tunnel_duration`, whichever comes first.
 
 #### Selective TLS interception
 
@@ -418,11 +420,12 @@ mTLS CA, or JWT signing key. For development, the helper creates the three mater
 # Keep dev-egress-mitm-ca/root/egress-root-ca.key offline.
 ```
 
-Mount only the intermediate chain/key read-only in the Trust Pod and install only the public root
-in the opted-in Sandbox CA bundle. `trust` synchronously prewarms a bounded in-memory leaf cache at
-startup and refreshes it locally; TLS handshakes never call Secret Manager or KMS. Each leaf has one
-exact DNS SAN, the response chain omits the root, and upstream certificate/hostname verification
-stays enabled.
+Mount only the intermediate chain/key read-only in the Trust Pod and add only the public root to a
+combined CA bundle in opted-in Sandboxes. That bundle must retain the workload's regular public
+roots (and the Trust server CA when needed); replacing it with the egress root alone breaks ordinary
+TLS. `trust` synchronously prewarms a bounded in-memory leaf cache at startup and refreshes it
+locally; TLS handshakes never call Secret Manager or KMS. Each leaf has one exact DNS SAN, the
+response chain omits the root, and upstream certificate/hostname verification stays enabled.
 
 For an intercepted origin, the CONNECT authority, TLS SNI, and decrypted HTTP/1 `Host` must all
 match the canonical configured host and port. A mismatch, missing SNI, absent/duplicate `Host`,
@@ -430,8 +433,8 @@ expired CONNECT JWT, cache miss, or unsupported ALPN fails before an upstream re
 `Proxy-Authorization` and client `Authorization` are stripped; the stored provider credential is
 the only credential injected upstream.
 
-With a plaintext in-cluster proxy listener, a client that trusts the egress root can make a normal
-provider request without changing its destination hostname:
+With a plaintext in-cluster proxy listener, a client whose combined CA bundle trusts the egress
+root can make a normal provider request without changing its destination hostname:
 
 ```bash
 curl --proxy http://trust.example.internal:6180 \

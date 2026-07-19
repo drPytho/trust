@@ -1,6 +1,6 @@
 use std::convert::Infallible;
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -322,10 +322,35 @@ impl ConnectProxy {
                     "TLS interception is not initialized\n",
                 ));
             };
+            let upstream_address = match resolve_target(
+                &upstream.origin.host,
+                upstream.origin.port,
+                self.config.allow_private_ips,
+                self.config.connect_timeout,
+            )
+            .await
+            {
+                Ok(address) => address,
+                Err(error) => {
+                    let reason = if error.kind() == io::ErrorKind::PermissionDenied {
+                        "private_destination"
+                    } else {
+                        "connect_failed"
+                    };
+                    self.record_attempt(ForwardOperation::Connect, metrics_name, reason);
+                    log::warn!(
+                        "CONNECT interception target failed reason={reason} upstream={metrics_name} \
+                         subject={:?} destination_host={host:?} destination_port={port}: {error}",
+                        verified.subject,
+                    );
+                    return Ok(response(StatusCode::BAD_GATEWAY, "connection failed\n"));
+                }
+            };
             let connection = Arc::new(MitmConnectionContext {
                 upstream: upstream.clone(),
                 authority_host: upstream.origin.host.clone(),
                 authority_port: upstream.origin.port,
+                upstream_address,
                 subject: verified.subject.clone(),
                 scopes: verified.scopes.clone(),
                 expires_at: verified.expires_at,
@@ -660,6 +685,44 @@ fn tunnel_duration(token: &VerifiedToken, configured_max: Duration) -> Option<Du
     (!duration.is_zero()).then_some(duration)
 }
 
+async fn resolved_target_addresses(
+    host: &str,
+    port: u16,
+    allow_private_ips: bool,
+) -> io::Result<Vec<SocketAddr>> {
+    let addresses = tokio::net::lookup_host((host, port)).await?;
+    let permitted = addresses
+        .filter(|address| allow_private_ips || is_public_ip(address.ip()))
+        .collect::<Vec<_>>();
+    if permitted.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "destination resolved only to non-public addresses",
+        ));
+    }
+    Ok(permitted)
+}
+
+async fn resolve_target(
+    host: &str,
+    port: u16,
+    allow_private_ips: bool,
+    connect_timeout: Duration,
+) -> io::Result<SocketAddr> {
+    let addresses = timeout(
+        connect_timeout,
+        resolved_target_addresses(host, port, allow_private_ips),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "CONNECT target timed out"))??;
+    addresses.into_iter().next().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "destination did not resolve to a permitted address",
+        )
+    })
+}
+
 async fn connect_target(
     host: &str,
     port: u16,
@@ -667,24 +730,13 @@ async fn connect_target(
     connect_timeout: Duration,
 ) -> io::Result<TcpStream> {
     timeout(connect_timeout, async {
-        let addresses = tokio::net::lookup_host((host, port)).await?;
+        let addresses = resolved_target_addresses(host, port, allow_private_ips).await?;
         let mut last_error = None;
-        let mut permitted = false;
         for address in addresses {
-            if !allow_private_ips && !is_public_ip(address.ip()) {
-                continue;
-            }
-            permitted = true;
             match TcpStream::connect(address).await {
                 Ok(stream) => return Ok(stream),
                 Err(error) => last_error = Some(error),
             }
-        }
-        if !permitted {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "destination resolved only to non-public addresses",
-            ));
         }
         Err(last_error.unwrap_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "destination did not resolve")
@@ -887,6 +939,14 @@ mod tests {
         }
         assert!(is_public_ip("1.1.1.1".parse().unwrap()));
         assert!(is_public_ip("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn resolved_intercept_target_rejects_private_addresses() {
+        let error = resolve_target("localhost", 443, false, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test]
