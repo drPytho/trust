@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
@@ -7,6 +8,7 @@ use pingora::prelude::*;
 use trust::config::{
     CredentialSource, Injection, InjectionScheme, Origin, Upstream, UpstreamKind, UpstreamMode,
 };
+use trust::credentials::{CredentialError, CredentialProvider, ResolvedCredential};
 use trust::git::mirror::MirrorStore;
 use trust::git::sync::SyncManager;
 use trust::jwt::{Issuer, Verifier};
@@ -16,13 +18,34 @@ use trust::proxy::ProxyService;
 use trust::resource::ResourceKind;
 use trust::router::Router;
 use trust::scope::ScopeSet;
-use trust::secrets::SecretProvider;
 use trust::secrets::fake::FakeSecretProvider;
+use trust::secrets::{Secret, SecretProvider};
 
 fn signing_key_pem() -> String {
     rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
         .unwrap()
         .serialize_pem()
+}
+
+struct RecordingCredentials {
+    resolved_paths: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl CredentialProvider for RecordingCredentials {
+    async fn resolve(
+        &self,
+        _upstream: &Upstream,
+        _method: &str,
+        path: &str,
+    ) -> Result<ResolvedCredential, CredentialError> {
+        self.resolved_paths.lock().unwrap().push(path.to_string());
+        Ok(ResolvedCredential {
+            secret: Secret::new("INJECTED-INSTALLATION-TOKEN".to_string()),
+            cache_key: None,
+            result: "test",
+        })
+    }
 }
 
 fn start_mock_upstream() -> (u16, Arc<Mutex<Vec<String>>>) {
@@ -130,9 +153,19 @@ fn raw_request_with_authorization(
     path: &str,
     authorization: &str,
 ) -> (u16, String) {
+    raw_request_with_method_and_authorization(proxy_port, host, "GET", path, authorization)
+}
+
+fn raw_request_with_method_and_authorization(
+    proxy_port: u16,
+    host: &str,
+    method: &str,
+    path: &str,
+    authorization: &str,
+) -> (u16, String) {
     let mut stream = TcpStream::connect(("127.0.0.1", proxy_port)).unwrap();
     let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: {authorization}\r\nConnection: close\r\n\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: {authorization}\r\nConnection: close\r\n\r\n"
     );
     stream.write_all(req.as_bytes()).unwrap();
     let mut resp = String::new();
@@ -454,7 +487,7 @@ fn linear_personal_api_key_is_injected_verbatim() {
 }
 
 #[test]
-fn github_cli_rest_and_repo_rooted_graphql_are_proxied_without_connect() {
+fn github_cli_pr_creation_is_scoped_and_handles_enterprise_preflights() {
     let (mock_port, upstream_reqs) = start_mock_upstream();
     let keystore = Arc::new(Keystore::new());
     keystore.store(build_key_material(&signing_key_pem(), None).unwrap());
@@ -468,24 +501,34 @@ fn github_cli_rest_and_repo_rooted_graphql_are_proxied_without_connect() {
         .mint(
             &km,
             "spiffe://example/sandbox/test",
-            &ScopeSet::parse("github:example-org/example-repo").unwrap(),
+            &ScopeSet::parse("github-cli:example-org/example-repo").unwrap(),
+            jsonwebtoken::get_current_timestamp(),
+        )
+        .unwrap();
+    let wildcard_token = issuer
+        .mint(
+            &km,
+            "spiffe://example/sandbox/test",
+            &ScopeSet::parse("github-cli:example-org/*").unwrap(),
             jsonwebtoken::get_current_timestamp(),
         )
         .unwrap();
 
     let mut upstream = (*scoped_upstream(mock_port)).clone();
+    upstream.name = "github-cli".into();
     upstream.resource = Some(ResourceKind::GithubCliRepo);
     upstream.listen_host = "github-cli.test".into();
-    let service = ProxyService::new(
+    let resolved_paths = Arc::new(Mutex::new(Vec::new()));
+    let service = ProxyService::with_credentials_and_metrics(
         Router::new(&[Arc::new(upstream)]),
         Verifier::new("trust".into(), "trust-proxy".into()),
         keystore,
-        Arc::new(FakeSecretProvider::new(&[(
-            "ref/gh",
-            "INJECTED-INSTALLATION-TOKEN",
-        )])),
+        Arc::new(RecordingCredentials {
+            resolved_paths: resolved_paths.clone(),
+        }),
         Arc::new(MirrorStore::new("/tmp")),
         Arc::new(SyncManager::new()),
+        Arc::new(ProxyMetrics::new()),
     );
     let proxy_port = free_port();
     let addr = format!("127.0.0.1:{proxy_port}");
@@ -525,6 +568,84 @@ fn github_cli_rest_and_repo_rooted_graphql_are_proxied_without_connect() {
         .0,
         403
     );
+    // The GitHub CLI route does not expose arbitrary REST writes, even when
+    // the GitHub App itself has pull-request/content write permissions.
+    assert_eq!(
+        raw_request_with_method_and_authorization(
+            proxy_port,
+            "github-cli.test",
+            "PATCH",
+            "/repos/example-org/example-repo/pulls/1",
+            &format!("token {token}"),
+        )
+        .0,
+        405
+    );
+    assert_eq!(
+        raw_request_with_method_and_authorization(
+            proxy_port,
+            "github-cli.test",
+            "PUT",
+            "/api/v3/repos/example-org/example-repo/contents/unexpected.txt",
+            &format!("token {token}"),
+        )
+        .0,
+        405
+    );
+
+    // A custom GH_HOST is treated as GitHub Enterprise. `gh pr create` first
+    // probes /meta; Trust answers the bounded local compatibility response
+    // rather than forwarding a client JWT or a broad GitHub credential.
+    let meta = raw_request_with_authorization(
+        proxy_port,
+        "github-cli.test",
+        "/api/v3/meta",
+        &format!("token {token}"),
+    );
+    assert_eq!(meta.0, 200);
+    assert!(meta.1.contains(r#"{"installed_version":"3.17.0"}"#));
+    assert_eq!(
+        raw_request_with_authorization(
+            proxy_port,
+            "github-cli.test",
+            "/api/v3/meta",
+            &format!("token {wildcard_token}"),
+        )
+        .0,
+        403
+    );
+
+    let issue_fields = serde_json::json!({
+        "query": "query Issue_fields { Issue: __type(name: \"Issue\") { fields(includeDeprecated: true) { name } } }",
+        "variables": {}
+    })
+    .to_string();
+    let issue_feature_response = raw_json_request(
+        proxy_port,
+        "github-cli.test",
+        "/api/graphql",
+        "token",
+        &token,
+        &issue_fields,
+    );
+    assert_eq!(issue_feature_response.0, 200);
+    assert!(
+        issue_feature_response
+            .1
+            .contains(r#"{"data":{"Issue":{"fields":[]}}}"#)
+    );
+    assert_eq!(
+        raw_json_request(
+            proxy_port,
+            "github-cli.test",
+            "/api/graphql",
+            "token",
+            &wildcard_token,
+            &issue_fields,
+        )
+        .0,
+        403
+    );
 
     let graphql = serde_json::json!({
         "query": "query PullRequestList($owner: String!, $repo: String!) { repository(owner: $owner, name: $repo) { pullRequests(first: 10) { totalCount } } }",
@@ -542,6 +663,47 @@ fn github_cli_rest_and_repo_rooted_graphql_are_proxied_without_connect() {
         )
         .0,
         200
+    );
+
+    // `gh pr create` sends an opaque repository node ID. Trust accepts only
+    // this root mutation and binds it to the sole exact repository scope
+    // before minting the injected installation token.
+    let create_pull_request = serde_json::json!({
+        "query": "mutation PullRequestCreate($input: CreatePullRequestInput!) { createPullRequest(input: $input) { pullRequest { id url } } }",
+        "variables": {
+            "input": {
+                "repositoryId": "R_kgDOExample",
+                "title": "Create from Trust",
+                "body": "Scoped GitHub App token injection",
+                "baseRefName": "main",
+                "headRefName": "agent-branch"
+            }
+        }
+    })
+    .to_string();
+    assert_eq!(
+        raw_json_request(
+            proxy_port,
+            "github-cli.test",
+            "/api/graphql",
+            "token",
+            &token,
+            &create_pull_request,
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        raw_json_request(
+            proxy_port,
+            "github-cli.test",
+            "/api/graphql",
+            "token",
+            &wildcard_token,
+            &create_pull_request,
+        )
+        .0,
+        403
     );
 
     // Global GraphQL operations fail before reaching the upstream.
@@ -565,15 +727,25 @@ fn github_cli_rest_and_repo_rooted_graphql_are_proxied_without_connect() {
 
     std::thread::sleep(Duration::from_millis(100));
     let requests = upstream_reqs.lock().unwrap();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 3);
     assert!(requests[0].starts_with("GET /repos/example-org/example-repo/pulls HTTP/1.1"));
     assert!(requests[1].starts_with("POST /graphql HTTP/1.1"));
     assert!(requests[1].ends_with(&graphql));
+    assert!(requests[2].starts_with("POST /graphql HTTP/1.1"));
+    assert!(requests[2].ends_with(&create_pull_request));
     for request in requests.iter() {
         let lower = request.to_ascii_lowercase();
         assert!(lower.contains("authorization: bearer injected-installation-token"));
         assert!(!request.contains(&token));
     }
+    assert_eq!(
+        *resolved_paths.lock().unwrap(),
+        vec![
+            "/repos/example-org/example-repo/pulls",
+            "/repos/example-org/example-repo",
+            "/repos/example-org/example-repo",
+        ]
+    );
 }
 
 #[test]

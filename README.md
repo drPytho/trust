@@ -24,7 +24,7 @@ want to distribute to every client, script, or CI job. Instead:
 - The client mints a **scoped JWT** from the `/token` endpoint; the JWT is short-lived and
   never carries real upstream keys.
 - The real key lives in a secret manager and is injected at the edge.
-- Access is per-upstream and per-repo: a token scoped to `github:example-org/example-repo` cannot
+- Access is per-upstream and per-repo: a token scoped to `github-cli:example-org/example-repo` cannot
   reach `anthropic` or any other GitHub repo.
 - Rotating an upstream key is a secret-manager change — clients are untouched.
 
@@ -40,7 +40,7 @@ allowed for that identity in the `[[issuance.clients]]` policy.
   client (mTLS)          trust :8443
   POST /token            ──────────────────────────────────────────
   grant_type=client_credentials
-  &scope=github:example-org/example-repo
+  &scope=github-cli:example-org/example-repo
                          1. verify client cert → extract SPIFFE URI
                          2. look up allowed scopes for that identity
                          3. cap requested scopes to allowed set
@@ -109,13 +109,15 @@ A scope is either a bare upstream name or a resource-scoped token:
 | `anthropic`            | Full access to the `anthropic` upstream                  |
 | `linear`               | Full access to the `linear` GraphQL upstream             |
 | `mistral`              | Full access to the `mistral` upstream                    |
-| `github:owner/repo`    | Exact repo match on the `github` upstream                |
-| `github:owner/*`       | All repos under `owner` (one wildcard segment)           |
+| `github-cli:owner/repo` | Exact repo match on the `github-cli` upstream            |
+| `github-cli:owner/*`    | All repos under `owner` (one wildcard segment)           |
 
 Rules:
 - A bare upstream scope (`anthropic`) covers any resource under that upstream.
-- A wildcard (`github:owner/*`) covers any exact repo under that owner but not a nested path.
+- A wildcard (`github-cli:owner/*`) covers any exact repo under that owner but not a nested path.
 - Only one-segment wildcards are supported — `*` must be the entire repo component.
+- The scope prefix is the configured upstream name; the `github-cli` example below therefore
+  uses `github-cli:owner/repo`.
 - Operators should end prefix grants with `/*` (segment boundary) to avoid unintended prefix
   leakage; the parser rejects tokens with more than one `/`.
 
@@ -146,10 +148,13 @@ Rules:
 - **Authenticated HTTP(S) forwarding** — an optional forward-proxy listener accepts absolute-form
   HTTP and HTTPS CONNECT requests. Explicit destinations retain their named scope; an opt-in audit
   fallback allows all public destinations with the dedicated `outbound-audit` scope. Selected HTTPS
-  origins can instead opt in to per-host TLS interception and provider credential injection.
+  origins can instead opt in to per-host TLS interception and provider credential injection. The
+  opaque audit fallback cannot remove or inject destination TLS credentials, so it is an egress
+  audit boundary rather than a credential-isolation boundary.
 - **Repo-scoped authz** for `github-repo` upstreams — the request path is parsed for
   `owner/repo`; the JWT scope must cover it. `github-cli-repo` additionally supports the
-  GitHub Enterprise-style REST and repository-rooted GraphQL requests emitted by `gh`.
+  GitHub Enterprise-style REST and repository-rooted GraphQL requests emitted by `gh`, plus
+  the bounded `createPullRequest` mutation when its upstream has one exact repository scope.
 - **git-cache upstream** — serves `git clone`/`fetch` from a local bare mirror (fresh refs,
   cached objects; incremental `git fetch` per read, no TTL); passes `git push` through to
   the origin. Reuses JWT auth and repo-scoped authz (`git-repo` resource).
@@ -221,11 +226,11 @@ jwks_addr       = "0.0.0.0:8080"
 # Per-identity issuance policy.  spiffe may end with `*` for a prefix match.
 [[issuance.clients]]
 spiffe         = "spiffe://example/ci/example-repo"
-allowed_scopes = ["github:example-org/example-repo", "github-git:example-org/example-repo"]
+allowed_scopes = ["github-cli:example-org/example-repo", "github-git:example-org/example-repo"]
 
 [[issuance.clients]]
 spiffe         = "spiffe://example/team/platform/*"
-allowed_scopes = ["anthropic", "linear", "github:example-org/*", "npm-artifacts:my-proj/npm-private"]
+allowed_scopes = ["anthropic", "linear", "github-cli:example-org/*", "npm-artifacts:my-proj/npm-private"]
 
 # One GitHub App can have a different installation in each organization. Owner matching is
 # case-insensitive and requests for an unmapped owner fail closed.
@@ -267,11 +272,11 @@ injection       = { header = "authorization", scheme = "raw" }
 allowed_methods = ["POST"]
 
 [[upstreams]]
-name        = "github"
+name        = "github-cli"
 kind        = "api"
-listen_host = "github.proxy.internal"
+listen_host = "github-cli.proxy.internal"
 origin      = "https://api.github.com"
-credential  = { kind = "github-app", permissions = { contents = "read", pull_requests = "read", issues = "read" } }
+credential  = { kind = "github-app", permissions = { contents = "read", pull_requests = "write", issues = "read" } }
 injection   = { header = "authorization", scheme = "bearer" }
 resource    = { kind = "github-cli-repo" } # native REST plus fail-closed gh CLI compatibility
 
@@ -509,7 +514,7 @@ JWT=$(curl -s --cert client.crt --key client.key \
   --cacert server-ca.pem \
   https://trust.example.internal:8443/token \
   --data-urlencode "grant_type=client_credentials" \
-  --data-urlencode "scope=github:example-org/example-repo github-git:example-org/example-repo" \
+  --data-urlencode "scope=github-cli:example-org/example-repo github-git:example-org/example-repo" \
   | jq -r .access_token)
 ```
 
@@ -556,35 +561,41 @@ trust rewrites `/api/v3/...` to GitHub.com's REST paths and `/api/graphql` to `/
 value in `GH_ENTERPRISE_TOKEN` is the trust JWT, not a GitHub token:
 
 ```bash
-export GH_HOST=github.proxy.internal
+export GH_HOST=github-cli.proxy.internal
 export GH_ENTERPRISE_TOKEN="$JWT"
-export GH_REPO=github.proxy.internal/example-org/example-repo
+export GH_REPO=github-cli.proxy.internal/example-org/example-repo
 # Or install the internal CA in the sandbox's system trust store.
 export SSL_CERT_FILE=/var/run/trust/server/ca.crt
 
 gh repo view "$GH_REPO"
-gh pr list --repo "$GH_REPO"
-gh issue list --repo "$GH_REPO"
 gh api repos/example-org/example-repo/pulls
+gh pr create --repo "$GH_REPO" --base main --head agent-branch --title "Scoped PR" --body "Created through Trust"
 ```
 
 The CLI sends `Authorization: token <JWT>`; that scheme is accepted only by the explicit
 `github-cli-repo` mode. trust validates the JWT, derives the exact repository, mints/caches an
 installation token restricted to that repository, replaces the client header, and forwards the
-request. REST calls must use `/repos/{owner}/{repo}/...`. GraphQL is limited to named query
-operations whose root fields all select the same repository through variables. Mutations, global
-queries, node lookups, search, multiple operations, and bodies over 64 KiB fail closed. This
-supports the read paths used by `gh repo view`, `gh repo clone`, `gh pr list/view/checks/checkout`,
-and `gh issue list/view`; account-level commands and write operations are not supported.
+request. REST calls must use `/repos/{owner}/{repo}/...` and are limited to `GET`/`HEAD`.
+GraphQL is limited to named query
+operations whose root fields all select the same repository through variables, plus the single
+`createPullRequest` mutation used by basic `gh pr create`. That mutation carries an opaque
+repository node ID, so trust requires exactly one exact `github-cli:owner/repo` scope and uses
+that scope to obtain a repository-restricted installation token; GitHub rejects a node ID from
+any other repository. A custom `GH_HOST` also makes `gh` run GitHub Enterprise feature detection;
+trust answers only its static `/api/v3/meta` and `Issue_fields` probes locally after the same
+exact-scope check. Other mutations, REST writes, global queries, node lookups, search, multiple
+operations, and bodies over 64 KiB fail closed. This supports repository-scoped read requests and
+basic non-interactive PR creation. Follow-up mutations such as assigning reviewers, labels,
+projects, or closing issues remain denied.
 
 `gh repo clone` and `gh pr checkout` invoke `git` after their API query. Route that child process
-to the separate git-cache reverse-proxy hostname and give the JWT both the `github:owner/repo` and
+to the separate git-cache reverse-proxy hostname and give the JWT both the `github-cli:owner/repo` and
 `github-git:owner/repo` scopes:
 
 ```bash
 export GIT_CONFIG_COUNT=2
 export GIT_CONFIG_KEY_0=url.https://git.proxy.internal/.insteadOf
-export GIT_CONFIG_VALUE_0=https://github.proxy.internal/
+export GIT_CONFIG_VALUE_0=https://github-cli.proxy.internal/
 export GIT_CONFIG_KEY_1=http.https://git.proxy.internal/.extraHeader
 export GIT_CONFIG_VALUE_1="Authorization: Bearer $JWT"
 export GIT_SSL_CAINFO=/var/run/trust/server/ca.crt

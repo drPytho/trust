@@ -141,17 +141,20 @@ export GIT_CONFIG_VALUE_1="Authorization: Bearer $TRUST_TOKEN"
 export GIT_SSL_CAINFO=/var/run/trust/server/ca.crt
 
 gh repo view "$GH_REPO"
-gh pr list --repo "$GH_REPO"
 gh repo clone ORG/REPOSITORY
+gh pr create --repo "$GH_REPO" --base main --head agent-branch --title "Scoped PR" --body "Created through trust"
 ```
 
 No CONNECT listener is involved. `gh` sends the trust JWT using its custom-host
 `token` authorization scheme; trust replaces it with an exact-repository
-GitHub App installation token. Supported GraphQL is deliberately read-only and
-repository-rooted. Global/account queries, mutations, search, node lookups,
-multiple operations, and bodies over 64 KiB are rejected. REST calls must be
-under `/repos/ORG/REPOSITORY/...`. See the main README for the complete command
-support and security boundary.
+GitHub App installation token. The configured API upstream is named `github`,
+so this example's exact `github:ORG/REPOSITORY` scope binds the token to that
+repository. Repository-rooted GraphQL queries and the basic
+`createPullRequest` mutation are supported; trust answers gh's static GHES
+feature probes locally. Other global/account queries, mutations, REST writes,
+search, node lookups, multiple operations, and bodies over 64 KiB are rejected.
+REST calls must be `GET`/`HEAD` under `/repos/ORG/REPOSITORY/...`. See the main
+README for the complete command support and security boundary.
 
 Artifact Registry npm workers use a non-secret `.npmrc` pointing at the proxy
 and place their short-lived trust JWT in `TRUST_TOKEN`; they do not run

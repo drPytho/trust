@@ -153,6 +153,11 @@ fn deployment_config_enables_audit_egress_and_allowlists_google_api_connect_endp
         .expect("example must include the GitHub CLI API upstream");
     assert_eq!(github.resource, Some(ResourceKind::GithubCliRepo));
     assert_eq!(github.origin.host, "api.github.com");
+    assert!(matches!(
+        github.credential,
+        Some(CredentialSource::GithubApp { ref permissions, .. })
+            if permissions.get("pull_requests").is_some_and(|permission| permission == "write")
+    ));
 
     let github_git = config
         .upstreams
