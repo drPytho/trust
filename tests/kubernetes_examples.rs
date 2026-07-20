@@ -61,7 +61,7 @@ fn all_kubernetes_examples_are_valid_yaml() {
 }
 
 #[test]
-fn deployment_config_allowlists_google_api_connect_endpoints() {
+fn deployment_config_enables_audit_egress_and_allowlists_google_api_connect_endpoints() {
     let documents = yaml_documents("deployment.yaml");
     let config_map = document(&documents, "ConfigMap", "trust-config");
     let config_source = config_map["data"]["config.toml"]
@@ -71,14 +71,29 @@ fn deployment_config_allowlists_google_api_connect_endpoints() {
 
     let forward_proxy = config
         .forward_proxy
-        .expect("example must enable the CONNECT listener");
+        .expect("example must enable the forward-proxy listener");
     assert!(
-        forward_proxy.tls,
-        "example must protect proxy JWTs with TLS"
+        !forward_proxy.tls,
+        "example confines the plaintext proxy listener with NetworkPolicy"
     );
-    assert!(
-        forward_proxy.audit_unmatched.is_none(),
-        "the production-oriented example must remain deny-by-default"
+    assert_eq!(
+        forward_proxy
+            .audit_unmatched
+            .as_ref()
+            .map(|audit| audit.scope.as_str()),
+        Some("outbound-audit"),
+        "the sandbox egress example must audit-allow unmatched public destinations"
+    );
+    let mitm = forward_proxy
+        .mitm
+        .expect("example must configure its dedicated egress signer");
+    assert_eq!(
+        mitm.issuer_cert_chain_path,
+        "/etc/trust/egress-mitm/intermediate-chain.pem"
+    );
+    assert_eq!(
+        mitm.issuer_key_path,
+        "/etc/trust/egress-mitm/intermediate.key"
     );
 
     for (name, host) in [
@@ -101,6 +116,7 @@ fn deployment_config_allowlists_google_api_connect_endpoints() {
     let allowed_scopes = &config.issuance.clients[0].allowed_scopes;
     assert!(allowed_scopes.iter().any(|scope| scope == "gcp-pubsub"));
     assert!(allowed_scopes.iter().any(|scope| scope == "gcp-storage"));
+    assert!(allowed_scopes.iter().any(|scope| scope == "outbound-audit"));
 
     let linear = config
         .upstreams
@@ -120,6 +136,15 @@ fn deployment_config_allowlists_google_api_connect_endpoints() {
                 && injection.scheme == InjectionScheme::Raw
     ));
     assert!(allowed_scopes.iter().any(|scope| scope == "linear"));
+
+    let anthropic = config
+        .upstreams
+        .iter()
+        .find(|upstream| upstream.name == "anthropic")
+        .expect("example must include the opt-in Anthropic interception route");
+    assert!(anthropic.intercept_connect);
+    assert!(!anthropic.allow_connect);
+    assert!(allowed_scopes.iter().any(|scope| scope == "anthropic"));
 
     let github = config
         .upstreams
@@ -145,6 +170,76 @@ fn deployment_config_allowlists_google_api_connect_endpoints() {
         allowed_scopes
             .iter()
             .any(|scope| scope == "github-git:ORG/REPOSITORY")
+    );
+}
+
+#[test]
+fn kubernetes_examples_keep_mitm_signer_and_workload_ca_separate() {
+    let trust_documents = yaml_documents("deployment.yaml");
+    let trust = document(&trust_documents, "Deployment", "trust");
+    let trust_pod = &trust["spec"]["template"]["spec"];
+    let trust_container = &trust_pod["containers"]
+        .as_sequence()
+        .expect("trust deployment must have a container")[0];
+    let signer_mount = trust_container["volumeMounts"]
+        .as_sequence()
+        .expect("trust container must have volume mounts")
+        .iter()
+        .find(|mount| mount["name"].as_str() == Some("egress-mitm-intermediate"))
+        .expect("trust must mount the egress signer");
+    assert_eq!(
+        signer_mount["mountPath"].as_str(),
+        Some("/etc/trust/egress-mitm")
+    );
+    assert_eq!(signer_mount["readOnly"].as_bool(), Some(true));
+    let signer_volume = trust_pod["volumes"]
+        .as_sequence()
+        .expect("trust pod must have volumes")
+        .iter()
+        .find(|volume| volume["name"].as_str() == Some("egress-mitm-intermediate"))
+        .expect("trust must define the egress signer volume");
+    assert_eq!(
+        signer_volume["secret"]["secretName"].as_str(),
+        Some("trust-egress-mitm-intermediate")
+    );
+
+    let workload_documents = yaml_documents("client-workload.yaml");
+    let workload_ca = document(&workload_documents, "ConfigMap", "trust-egress-mitm-ca");
+    let ca_data = workload_ca["data"]
+        .as_mapping()
+        .expect("egress CA ConfigMap must have data");
+    assert_eq!(ca_data.len(), 1, "workload receives only the public CA");
+    let ca = workload_ca["data"]["ca-bundle.crt"]
+        .as_str()
+        .expect("egress CA ConfigMap must provide ca-bundle.crt");
+    assert!(ca.contains("BEGIN CERTIFICATE"));
+    assert!(!ca.contains("PRIVATE KEY"));
+
+    let workload = document(&workload_documents, "Deployment", "my-service");
+    let workload_pod = &workload["spec"]["template"]["spec"];
+    let workload_container = &workload_pod["containers"]
+        .as_sequence()
+        .expect("workload deployment must have a container")[0];
+    let ca_mount = workload_container["volumeMounts"]
+        .as_sequence()
+        .expect("workload container must have volume mounts")
+        .iter()
+        .find(|mount| mount["name"].as_str() == Some("trust-egress-mitm-ca"))
+        .expect("workload must mount the opt-in public CA");
+    assert_eq!(
+        ca_mount["mountPath"].as_str(),
+        Some("/var/run/trust/egress-mitm")
+    );
+    assert_eq!(ca_mount["readOnly"].as_bool(), Some(true));
+    let ca_volume = workload_pod["volumes"]
+        .as_sequence()
+        .expect("workload pod must have volumes")
+        .iter()
+        .find(|volume| volume["name"].as_str() == Some("trust-egress-mitm-ca"))
+        .expect("workload must define the egress CA volume");
+    assert_eq!(
+        ca_volume["configMap"]["name"].as_str(),
+        Some("trust-egress-mitm-ca")
     );
 }
 
@@ -197,10 +292,13 @@ fn restricted_sandbox_can_reach_only_trust_dns_and_gke_metadata() {
 }
 
 #[test]
-fn workload_bypasses_proxy_only_for_metadata_and_internal_trust_hosts() {
+fn workload_uses_the_internal_proxy_without_a_relay_sidecar() {
     let documents = yaml_documents("client-workload.yaml");
     let deployment = document(&documents, "Deployment", "my-service");
-    let env = deployment["spec"]["template"]["spec"]["containers"][0]["env"]
+    let containers = deployment["spec"]["template"]["spec"]["containers"]
+        .as_sequence()
+        .expect("workload must define containers");
+    let env = containers[0]["env"]
         .as_sequence()
         .expect("client container must define env");
     let no_proxy = env
@@ -220,6 +318,26 @@ fn workload_bypasses_proxy_only_for_metadata_and_internal_trust_hosts() {
         assert!(entries.contains(required), "NO_PROXY is missing {required}");
     }
     assert!(!entries.contains(".googleapis.com"));
+    assert_eq!(containers.len(), 1, "workload must not run a relay sidecar");
+    assert!(env.iter().any(
+        |entry| entry["name"].as_str() == Some("TRUST_FORWARD_PROXY")
+            && entry["value"].as_str() == Some("http://trust.trust-system.svc:6180")
+    ));
+    for proxy_variable in ["HTTP_PROXY", "HTTPS_PROXY"] {
+        assert!(
+            env.iter()
+                .any(|entry| entry["name"].as_str() == Some(proxy_variable)
+                    && entry["value"].as_str()
+                        == Some(
+                            "http://jwt:REPLACE_WITH_SHORT_LIVED_TRUST_JWT@trust.trust-system.svc:6180"
+                        ))
+        );
+    }
+    assert!(
+        env.iter()
+            .any(|entry| entry["name"].as_str() == Some("SSL_CERT_FILE")
+                && entry["value"].as_str() == Some("/var/run/trust/egress-mitm/ca-bundle.crt"))
+    );
 }
 
 #[test]
@@ -252,7 +370,7 @@ fn live_gke_smoke_job_exercises_metadata_pubsub_and_storage() {
         .expect("smoke command must contain a script");
     for required in [
         "metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
-        "https://trust.trust-system.svc:6180",
+        "http://trust.trust-system.svc:6180",
         "Proxy-Authorization: Bearer ${TRUST_TOKEN}",
         "https://pubsub.googleapis.com/",
         "https://storage.googleapis.com/",

@@ -9,6 +9,7 @@ pub mod issuance;
 pub mod jwt;
 pub mod keystore;
 pub mod metrics;
+pub mod mitm;
 pub mod proxy;
 pub mod resource;
 pub mod router;

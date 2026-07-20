@@ -410,6 +410,7 @@ mod tests {
             git: None,
             allowed_methods: vec!["GET".into()],
             allow_connect: false,
+            intercept_connect: false,
         };
 
         let one = manager

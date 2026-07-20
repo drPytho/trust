@@ -68,8 +68,7 @@ spec:
               test -n "${GOOGLE_TOKEN}"
 
               curl --fail --silent --show-error \
-                --proxy https://trust.trust-system.svc:6180 \
-                --proxy-cacert /var/run/trust/server/ca.crt \
+                --proxy http://trust.trust-system.svc:6180 \
                 --proxy-header "Proxy-Authorization: Bearer ${TRUST_TOKEN}" \
                 -H "Authorization: Bearer ${GOOGLE_TOKEN}" \
                 -H 'Content-Type: application/json' \
@@ -79,8 +78,7 @@ spec:
 
               OBJECT_NAME="trust-wif-smoke-$(date +%s).txt"
               curl --fail --silent --show-error \
-                --proxy https://trust.trust-system.svc:6180 \
-                --proxy-cacert /var/run/trust/server/ca.crt \
+                --proxy http://trust.trust-system.svc:6180 \
                 --proxy-header "Proxy-Authorization: Bearer ${TRUST_TOKEN}" \
                 -H "Authorization: Bearer ${GOOGLE_TOKEN}" \
                 -H 'Content-Type: text/plain' \

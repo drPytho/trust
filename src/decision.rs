@@ -79,6 +79,7 @@ mod tests {
             git: None,
             allowed_methods: Vec::new(),
             allow_connect: false,
+            intercept_connect: false,
         })
     }
 

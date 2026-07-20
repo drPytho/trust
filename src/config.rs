@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashSet};
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -64,6 +65,18 @@ pub enum ConfigError {
     ConnectWithoutListener(String),
     #[error("duplicate CONNECT destination authority: {0}")]
     DuplicateConnectAuthority(String),
+    #[error("CONNECT upstream '{0}' cannot enable both allow_connect and intercept_connect")]
+    ConnectModeConflict(String),
+    #[error("intercept CONNECT upstream '{0}' must use api kind, inject mode, and an HTTPS origin")]
+    InterceptConnectRequiresInject(String),
+    #[error("intercept CONNECT upstream '{0}' requires [forward_proxy.mitm]")]
+    InterceptConnectWithoutMitm(String),
+    #[error("intercept CONNECT upstream '{upstream}' has invalid DNS origin host '{host}'")]
+    InvalidInterceptHost { upstream: String, host: String },
+    #[error(
+        "intercept CONNECT upstream '{0}' uses a request transformation unsupported by TLS interception"
+    )]
+    InterceptConnectPolicyUnsupported(String),
     #[error("invalid forward proxy configuration: {0}")]
     BadForwardProxy(String),
 }
@@ -183,6 +196,7 @@ pub struct Upstream {
     pub git: Option<GitConfig>,
     pub allowed_methods: Vec<String>,
     pub allow_connect: bool,
+    pub intercept_connect: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -207,6 +221,17 @@ pub struct ForwardProxyConfig {
     pub max_concurrent_tunnels: usize,
     pub allow_private_ips: bool,
     pub audit_unmatched: Option<AuditUnmatchedConfig>,
+    pub mitm: Option<ForwardProxyMitmConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ForwardProxyMitmConfig {
+    pub issuer_cert_chain_path: String,
+    pub issuer_key_path: String,
+    pub leaf_ttl: std::time::Duration,
+    pub refresh_before: std::time::Duration,
+    pub leaf_cache_capacity: usize,
+    pub handshake_timeout: std::time::Duration,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -234,6 +259,36 @@ fn default_max_concurrent_tunnels() -> usize {
     1024
 }
 
+fn default_leaf_ttl() -> String {
+    "24h".to_string()
+}
+
+fn default_refresh_before() -> String {
+    "1h".to_string()
+}
+
+fn default_leaf_cache_capacity() -> usize {
+    256
+}
+
+fn default_handshake_timeout() -> String {
+    "10s".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawForwardProxyMitmConfig {
+    issuer_cert_chain_path: String,
+    issuer_key_path: String,
+    #[serde(default = "default_leaf_ttl")]
+    leaf_ttl: String,
+    #[serde(default = "default_refresh_before")]
+    refresh_before: String,
+    #[serde(default = "default_leaf_cache_capacity")]
+    leaf_cache_capacity: usize,
+    #[serde(default = "default_handshake_timeout")]
+    handshake_timeout: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct RawForwardProxyConfig {
     addr: String,
@@ -251,6 +306,8 @@ struct RawForwardProxyConfig {
     allow_private_ips: bool,
     #[serde(default)]
     audit_unmatched: Option<AuditUnmatchedConfig>,
+    #[serde(default)]
+    mitm: Option<RawForwardProxyMitmConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -328,6 +385,8 @@ struct RawUpstream {
     allowed_methods: Vec<String>,
     #[serde(default)]
     allow_connect: bool,
+    #[serde(default)]
+    intercept_connect: bool,
 }
 
 #[derive(Deserialize)]
@@ -387,6 +446,36 @@ fn parse_origin(raw: &str) -> Result<Origin, ConfigError> {
     })
 }
 
+pub(crate) fn canonical_intercept_dns_host(host: &str) -> Option<String> {
+    let canonical = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+    if canonical.is_empty()
+        || canonical.len() > 253
+        || canonical.contains('*')
+        || canonical.parse::<IpAddr>().is_ok()
+    {
+        return None;
+    }
+
+    for label in canonical.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return None;
+        }
+    }
+    Some(canonical)
+}
+
+fn canonical_connect_host(host: &str) -> Option<String> {
+    let canonical = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+    (!canonical.is_empty()).then_some(canonical)
+}
+
 impl Config {
     pub fn load(path: &str) -> Result<Config, ConfigError> {
         let text = std::fs::read_to_string(path)?;
@@ -400,6 +489,7 @@ impl Config {
         let mut names = HashSet::new();
         let mut hosts = HashSet::new();
         let mut connect_authorities = HashSet::new();
+        let mut intercepted_connect_routes = 0_usize;
         let mut upstreams = Vec::with_capacity(raw.upstreams.len());
         if let Some(github_app) = &raw.github_app {
             if github_app.app_id == 0 || github_app.private_key_secret_ref.is_empty() {
@@ -439,7 +529,7 @@ impl Config {
             if !hosts.insert(ru.listen_host.clone()) {
                 return Err(ConfigError::DuplicateListenHost(ru.listen_host));
             }
-            let origin = parse_origin(&ru.origin)?;
+            let mut origin = parse_origin(&ru.origin)?;
             let (credential, injection) = match ru.mode {
                 UpstreamMode::Inject => {
                     let credential = match (ru.secret_ref, ru.credential) {
@@ -556,6 +646,10 @@ impl Config {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
 
+            if ru.allow_connect && ru.intercept_connect {
+                return Err(ConfigError::ConnectModeConflict(ru.name));
+            }
+
             if ru.allow_connect {
                 if ru.kind != UpstreamKind::Api || ru.mode != UpstreamMode::Passthrough {
                     return Err(ConfigError::ConnectRequiresPassthrough(ru.name));
@@ -566,10 +660,57 @@ impl Config {
                 if raw.forward_proxy.is_none() {
                     return Err(ConfigError::ConnectWithoutListener(ru.name));
                 }
-                let authority = format!("{}:{}", origin.host.to_ascii_lowercase(), origin.port);
+                let host =
+                    canonical_connect_host(&origin.host).ok_or_else(|| ConfigError::BadOrigin {
+                        url: ru.origin.clone(),
+                        reason: "CONNECT origin host is empty after canonicalization".to_string(),
+                    })?;
+                origin.host = host.clone();
+                origin.sni = host;
+                let authority = format!("{}:{}", origin.host, origin.port);
                 if !connect_authorities.insert(authority.clone()) {
                     return Err(ConfigError::DuplicateConnectAuthority(authority));
                 }
+            }
+
+            if ru.intercept_connect {
+                if ru.kind != UpstreamKind::Api || ru.mode != UpstreamMode::Inject || !origin.tls {
+                    return Err(ConfigError::InterceptConnectRequiresInject(ru.name));
+                }
+                if raw
+                    .forward_proxy
+                    .as_ref()
+                    .and_then(|forward| forward.mitm.as_ref())
+                    .is_none()
+                {
+                    return Err(ConfigError::InterceptConnectWithoutMitm(ru.name));
+                }
+                let Some(host) = canonical_intercept_dns_host(&origin.host) else {
+                    return Err(ConfigError::InvalidInterceptHost {
+                        upstream: ru.name,
+                        host: origin.host,
+                    });
+                };
+                if matches!(
+                    &ru.resource,
+                    Some(RawResource {
+                        kind: ResourceKind::GithubCliRepo
+                    })
+                ) || matches!(
+                    &credential,
+                    Some(CredentialSource::GcpAdc {
+                        rewrite_registry_to: Some(_)
+                    })
+                ) {
+                    return Err(ConfigError::InterceptConnectPolicyUnsupported(ru.name));
+                }
+                origin.host = host.clone();
+                origin.sni = host;
+                let authority = format!("{}:{}", origin.host, origin.port);
+                if !connect_authorities.insert(authority.clone()) {
+                    return Err(ConfigError::DuplicateConnectAuthority(authority));
+                }
+                intercepted_connect_routes += 1;
             }
 
             // Validate git-cache-specific rules.
@@ -609,6 +750,7 @@ impl Config {
                 git: ru.git,
                 allowed_methods,
                 allow_connect: ru.allow_connect,
+                intercept_connect: ru.intercept_connect,
             }));
         }
 
@@ -623,6 +765,54 @@ impl Config {
                             value: value.to_string(),
                         })
                 };
+                let connect_timeout = parse_duration(&forward.connect_timeout)?;
+                let idle_timeout = parse_duration(&forward.idle_timeout)?;
+                let max_tunnel_duration = parse_duration(&forward.max_tunnel_duration)?;
+                let mitm = forward
+                    .mitm
+                    .map(|mitm| {
+                        if mitm.issuer_cert_chain_path.is_empty() || mitm.issuer_key_path.is_empty()
+                        {
+                            return Err(ConfigError::BadForwardProxy(
+                                "mitm issuer_cert_chain_path and issuer_key_path are required"
+                                    .to_string(),
+                            ));
+                        }
+                        let leaf_ttl = parse_duration(&mitm.leaf_ttl)?;
+                        let refresh_before = parse_duration(&mitm.refresh_before)?;
+                        if refresh_before >= leaf_ttl {
+                            return Err(ConfigError::BadForwardProxy(
+                                "mitm refresh_before must be shorter than leaf_ttl".to_string(),
+                            ));
+                        }
+                        let handshake_timeout = parse_duration(&mitm.handshake_timeout)?;
+                        if handshake_timeout > max_tunnel_duration {
+                            return Err(ConfigError::BadForwardProxy(
+                                "mitm handshake_timeout must not exceed max_tunnel_duration"
+                                    .to_string(),
+                            ));
+                        }
+                        if mitm.leaf_cache_capacity == 0 {
+                            return Err(ConfigError::BadForwardProxy(
+                                "mitm leaf_cache_capacity must be greater than zero".to_string(),
+                            ));
+                        }
+                        if mitm.leaf_cache_capacity < intercepted_connect_routes {
+                            return Err(ConfigError::BadForwardProxy(format!(
+                                "mitm leaf_cache_capacity ({}) must cover all {intercepted_connect_routes} intercepted CONNECT routes",
+                                mitm.leaf_cache_capacity
+                            )));
+                        }
+                        Ok::<_, ConfigError>(ForwardProxyMitmConfig {
+                            issuer_cert_chain_path: mitm.issuer_cert_chain_path,
+                            issuer_key_path: mitm.issuer_key_path,
+                            leaf_ttl,
+                            refresh_before,
+                            leaf_cache_capacity: mitm.leaf_cache_capacity,
+                            handshake_timeout,
+                        })
+                    })
+                    .transpose()?;
                 if let Some(audit) = &forward.audit_unmatched {
                     if audit.scope.is_empty()
                         || !audit.scope.bytes().all(|byte| {
@@ -650,9 +840,9 @@ impl Config {
                 Ok::<_, ConfigError>(ForwardProxyConfig {
                     addr: forward.addr,
                     tls: forward.tls,
-                    connect_timeout: parse_duration(&forward.connect_timeout)?,
-                    idle_timeout: parse_duration(&forward.idle_timeout)?,
-                    max_tunnel_duration: parse_duration(&forward.max_tunnel_duration)?,
+                    connect_timeout,
+                    idle_timeout,
+                    max_tunnel_duration,
                     max_concurrent_tunnels: if forward.max_concurrent_tunnels == 0 {
                         return Err(ConfigError::BadForwardProxy(
                             "max_concurrent_tunnels must be greater than zero".to_string(),
@@ -662,6 +852,7 @@ impl Config {
                     },
                     allow_private_ips: forward.allow_private_ips,
                     audit_unmatched: forward.audit_unmatched,
+                    mitm,
                 })
             })
             .transpose()?;
@@ -1128,6 +1319,208 @@ allow_connect = true
                 .unwrap()
                 .allow_connect
         );
+    }
+
+    const MITM_FORWARD: &str = r#"
+[forward_proxy]
+addr = "0.0.0.0:6180"
+tls = false
+connect_timeout = "3s"
+idle_timeout = "2m"
+max_tunnel_duration = "30m"
+allow_private_ips = false
+
+[forward_proxy.mitm]
+issuer_cert_chain_path = "/etc/trust/egress-mitm/intermediate-chain.pem"
+issuer_key_path = "/etc/trust/egress-mitm/intermediate.key"
+leaf_ttl = "24h"
+refresh_before = "1h"
+leaf_cache_capacity = 2
+handshake_timeout = "10s"
+"#;
+
+    const INTERCEPT_UPSTREAM: &str = r#"
+[[upstreams]]
+name = "intercepted-api"
+kind = "api"
+listen_host = "intercepted.proxy.internal"
+origin = "https://API.EXAMPLE.COM.:8443"
+secret_ref = "projects/p/secrets/intercepted/versions/latest"
+injection = { header = "x-api-key", scheme = "raw" }
+allowed_methods = ["POST"]
+intercept_connect = true
+"#;
+
+    #[test]
+    fn parses_intercept_connect_with_a_bounded_mitm_cache() {
+        let cfg = Config::from_str(&(GOOD.to_string() + MITM_FORWARD + INTERCEPT_UPSTREAM))
+            .expect("intercept configuration should parse");
+        let forward = cfg.forward_proxy.as_ref().unwrap();
+        let mitm = forward.mitm.as_ref().expect("MITM configuration");
+        assert_eq!(
+            mitm.issuer_cert_chain_path,
+            "/etc/trust/egress-mitm/intermediate-chain.pem"
+        );
+        assert_eq!(mitm.leaf_ttl, std::time::Duration::from_secs(24 * 60 * 60));
+        assert_eq!(mitm.refresh_before, std::time::Duration::from_secs(60 * 60));
+        assert_eq!(mitm.leaf_cache_capacity, 2);
+        assert_eq!(mitm.handshake_timeout, std::time::Duration::from_secs(10));
+
+        let upstream = cfg
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.name == "intercepted-api")
+            .unwrap();
+        assert!(upstream.intercept_connect);
+        assert!(!upstream.allow_connect);
+        assert_eq!(upstream.origin.host, "api.example.com");
+        assert_eq!(upstream.origin.sni, "api.example.com");
+        assert_eq!(upstream.origin.port, 8443);
+        assert_eq!(upstream.allowed_methods, ["POST"]);
+    }
+
+    #[test]
+    fn rejects_unsafe_intercept_connect_configuration() {
+        let conflict = r#"
+[forward_proxy]
+addr = "0.0.0.0:6180"
+
+[[upstreams]]
+name = "conflicting-connect"
+kind = "api"
+mode = "passthrough"
+listen_host = "conflicting.proxy.internal"
+origin = "https://conflicting.example.com"
+allow_connect = true
+intercept_connect = true
+"#;
+        assert!(matches!(
+            Config::from_str(&(GOOD.to_string() + conflict)),
+            Err(ConfigError::ConnectModeConflict(_))
+        ));
+
+        let missing_mitm = r#"
+[forward_proxy]
+addr = "0.0.0.0:6180"
+
+[[upstreams]]
+name = "missing-mitm"
+kind = "api"
+listen_host = "missing-mitm.proxy.internal"
+origin = "https://api.example.com"
+secret_ref = "projects/p/secrets/missing-mitm/versions/latest"
+injection = { header = "x-api-key", scheme = "raw" }
+intercept_connect = true
+"#;
+        assert!(matches!(
+            Config::from_str(&(GOOD.to_string() + missing_mitm)),
+            Err(ConfigError::InterceptConnectWithoutMitm(_))
+        ));
+
+        let not_inject = r#"
+[[upstreams]]
+name = "not-inject"
+kind = "api"
+mode = "passthrough"
+listen_host = "not-inject.proxy.internal"
+origin = "https://api.example.com"
+intercept_connect = true
+"#;
+        assert!(matches!(
+            Config::from_str(&(GOOD.to_string() + MITM_FORWARD + not_inject)),
+            Err(ConfigError::InterceptConnectRequiresInject(_))
+        ));
+
+        for (name, origin) in [
+            ("ip-host", "https://127.0.0.1"),
+            ("wildcard-host", "https://*.example.com"),
+            ("ambiguous-dot-host", "https://api.example.com.."),
+        ] {
+            let invalid_host = format!(
+                r#"
+[[upstreams]]
+name = "{name}"
+kind = "api"
+listen_host = "{name}.proxy.internal"
+origin = "{origin}"
+secret_ref = "projects/p/secrets/{name}/versions/latest"
+injection = {{ header = "x-api-key", scheme = "raw" }}
+intercept_connect = true
+"#
+            );
+            assert!(matches!(
+                Config::from_str(&(GOOD.to_string() + MITM_FORWARD + &invalid_host)),
+                Err(ConfigError::InvalidInterceptHost { .. })
+            ));
+        }
+
+        let duplicate_authority = r#"
+[[upstreams]]
+name = "opaque-example"
+kind = "api"
+mode = "passthrough"
+listen_host = "opaque-example.proxy.internal"
+origin = "https://API.EXAMPLE.COM."
+allow_connect = true
+
+[[upstreams]]
+name = "intercept-example"
+kind = "api"
+listen_host = "intercept-example.proxy.internal"
+origin = "https://api.example.com"
+secret_ref = "projects/p/secrets/intercept-example/versions/latest"
+injection = { header = "x-api-key", scheme = "raw" }
+intercept_connect = true
+"#;
+        assert!(matches!(
+            Config::from_str(&(GOOD.to_string() + MITM_FORWARD + duplicate_authority)),
+            Err(ConfigError::DuplicateConnectAuthority(_))
+        ));
+
+        let insufficient_cache = r#"
+[[upstreams]]
+name = "another-intercept"
+kind = "api"
+listen_host = "another-intercept.proxy.internal"
+origin = "https://another.example.com"
+secret_ref = "projects/p/secrets/another-intercept/versions/latest"
+injection = { header = "x-api-key", scheme = "raw" }
+intercept_connect = true
+"#;
+        let tiny_cache = MITM_FORWARD.replace("leaf_cache_capacity = 2", "leaf_cache_capacity = 1");
+        assert!(matches!(
+            Config::from_str(
+                &(GOOD.to_string() + &tiny_cache + INTERCEPT_UPSTREAM + insufficient_cache)
+            ),
+            Err(ConfigError::BadForwardProxy(_))
+        ));
+
+        let long_handshake = MITM_FORWARD.replace(
+            "max_tunnel_duration = \"30m\"",
+            "max_tunnel_duration = \"5s\"",
+        );
+        assert!(matches!(
+            Config::from_str(&(GOOD.to_string() + &long_handshake + INTERCEPT_UPSTREAM)),
+            Err(ConfigError::BadForwardProxy(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_intercept_routes_needing_reverse_proxy_only_rewrites() {
+        let gcp_rewrite = r#"
+[[upstreams]]
+name = "registry"
+kind = "api"
+listen_host = "registry.proxy.internal"
+origin = "https://registry.example.com"
+credential = { kind = "gcp-adc", rewrite_registry_to = "https://registry.proxy.internal" }
+injection = { header = "authorization", scheme = "bearer" }
+intercept_connect = true
+"#;
+        assert!(matches!(
+            Config::from_str(&(GOOD.to_string() + MITM_FORWARD + gcp_rewrite)),
+            Err(ConfigError::InterceptConnectPolicyUnsupported(_))
+        ));
     }
 
     #[test]

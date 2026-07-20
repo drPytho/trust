@@ -18,6 +18,24 @@ data:
     REPLACE_WITH_TRUST_SERVER_CA_CERTIFICATE
     -----END CERTIFICATE-----
 ---
+# Mount this combined public CA bundle only into Sandbox workloads that are
+# explicitly opted in to TLS interception. It must retain the workload's normal
+# public roots and add the Trust server CA plus the dedicated egress root. It
+# must never contain an intermediate or any private key.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trust-egress-mitm-ca
+  namespace: workloads
+data:
+  ca-bundle.crt: |
+    # Replace this placeholder with the workload's normal CA bundle plus the
+    # Trust server CA and Trust egress root. A root-only bundle would break
+    # ordinary public TLS validation.
+    -----BEGIN CERTIFICATE-----
+    REPLACE_WITH_TRUST_EGRESS_MITM_ROOT_CA_CERTIFICATE
+    -----END CERTIFICATE-----
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -52,12 +70,27 @@ spec:
               value: /var/run/trust/client/tls.key
             - name: TRUST_SERVER_CA
               value: /var/run/trust/server/ca.crt
-            # Application-specific proxy address. After minting a short-lived
-            # JWT, the application supplies Proxy-Authorization: Bearer <JWT>.
-            # Clients limited to proxy URL credentials use Basic username `jwt`
-            # and the JWT as password in HTTPS_PROXY.
+            # Application-specific proxy address. The NetworkPolicy permits
+            # this plaintext in-cluster listener but no direct public egress.
+            # After minting a short-lived JWT, the application sends
+            # Proxy-Authorization: Bearer <JWT> (or Basic jwt:<JWT>) here.
             - name: TRUST_FORWARD_PROXY
-              value: https://trust.trust-system.svc:6180
+              value: http://trust.trust-system.svc:6180
+            # The Sandbox operator must replace the placeholder with a current,
+            # scoped Trust JWT. Proxy URL credentials become Basic
+            # Proxy-Authorization with the fixed `jwt` username, which Trust
+            # verifies on every request. Rotate/reinject before token expiry.
+            # Keep NO_PROXY below so token minting and internal reverse-proxy
+            # names do not traverse the generic egress listener.
+            - name: HTTP_PROXY
+              value: http://jwt:REPLACE_WITH_SHORT_LIVED_TRUST_JWT@trust.trust-system.svc:6180
+            - name: HTTPS_PROXY
+              value: http://jwt:REPLACE_WITH_SHORT_LIVED_TRUST_JWT@trust.trust-system.svc:6180
+            # Standard OpenSSL/curl/Rust-native TLS clients use this complete
+            # bundle for normal public roots plus the opt-in egress root.
+            # Java/Node runtimes must use their equivalent extra-CA setting.
+            - name: SSL_CERT_FILE
+              value: /var/run/trust/egress-mitm/ca-bundle.crt
             - name: NO_PROXY
               value: >-
                 metadata.google.internal,
@@ -72,6 +105,9 @@ spec:
             - name: trust-server-ca
               mountPath: /var/run/trust/server
               readOnly: true
+            - name: trust-egress-mitm-ca
+              mountPath: /var/run/trust/egress-mitm
+              readOnly: true
       volumes:
         - name: trust-client
           secret:
@@ -79,3 +115,6 @@ spec:
         - name: trust-server-ca
           configMap:
             name: trust-server-ca
+        - name: trust-egress-mitm-ca
+          configMap:
+            name: trust-egress-mitm-ca

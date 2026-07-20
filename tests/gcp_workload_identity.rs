@@ -62,6 +62,7 @@ async fn connect_consumes_trust_jwt_and_preserves_google_oauth_token() {
         git: None,
         allowed_methods: Vec::new(),
         allow_connect: true,
+        intercept_connect: false,
     });
 
     let keystore = Arc::new(Keystore::new());
@@ -98,6 +99,7 @@ async fn connect_consumes_trust_jwt_and_preserves_google_oauth_token() {
             max_concurrent_tunnels: 10,
             allow_private_ips: true,
             audit_unmatched: None,
+            mitm: None,
         },
     ));
     let proxy_task = tokio::spawn(serve_connect(proxy_listener, None, proxy));
