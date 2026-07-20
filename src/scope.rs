@@ -130,6 +130,49 @@ impl ScopeSet {
         }
         false
     }
+
+    /// Returns the only exact repository scope granted for an upstream.
+    ///
+    /// GitHub's `createPullRequest` GraphQL mutation identifies its target by
+    /// an opaque repository node ID rather than `owner/repo`. The caller must
+    /// therefore carry exactly one explicit repository scope for the GitHub
+    /// CLI upstream before Trust can safely select the repository-restricted
+    /// installation token. Bare, wildcard, and conflicting resource grants
+    /// are deliberately rejected.
+    pub fn sole_exact_resource(&self, upstream: &str) -> Option<Resource> {
+        let mut selected: Option<Resource> = None;
+
+        for scope in &self.0 {
+            match scope {
+                Scope::Upstream(name) if name == upstream => return None,
+                Scope::Resource {
+                    upstream: name,
+                    repo: RepoPat::Wildcard,
+                    ..
+                } if name == upstream => return None,
+                Scope::Resource {
+                    upstream: name,
+                    owner,
+                    repo: RepoPat::Exact(repo),
+                } if name == upstream => {
+                    let resource = Resource {
+                        owner: owner.clone(),
+                        repo: repo.clone(),
+                    };
+                    if selected
+                        .as_ref()
+                        .is_some_and(|current| current != &resource)
+                    {
+                        return None;
+                    }
+                    selected = Some(resource);
+                }
+                _ => {}
+            }
+        }
+
+        selected
+    }
 }
 
 /// Issuance check: can `allowed` grant `requested`?
@@ -293,5 +336,43 @@ mod tests {
     #[test]
     fn scopeset_parse_empty() {
         assert!(matches!(ScopeSet::parse(""), Err(ScopeError::Empty)));
+    }
+
+    #[test]
+    fn sole_exact_resource_requires_one_non_wildcard_scope() {
+        assert_eq!(
+            ScopeSet::parse("github-cli:example-org/example-repo")
+                .unwrap()
+                .sole_exact_resource("github-cli"),
+            Some(res("example-org", "example-repo"))
+        );
+        assert_eq!(
+            ScopeSet::parse(
+                "github-cli:example-org/example-repo github-cli:example-org/example-repo",
+            )
+            .unwrap()
+            .sole_exact_resource("github-cli"),
+            Some(res("example-org", "example-repo"))
+        );
+        assert!(
+            ScopeSet::parse("github-cli")
+                .unwrap()
+                .sole_exact_resource("github-cli")
+                .is_none()
+        );
+        assert!(
+            ScopeSet::parse("github-cli:example-org/*")
+                .unwrap()
+                .sole_exact_resource("github-cli")
+                .is_none()
+        );
+        assert!(
+            ScopeSet::parse(
+                "github-cli:example-org/example-repo github-cli:example-org/other-repo",
+            )
+            .unwrap()
+            .sole_exact_resource("github-cli")
+            .is_none()
+        );
     }
 }

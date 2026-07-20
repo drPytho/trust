@@ -15,7 +15,8 @@ use crate::git::classify::{GitRequest, classify};
 use crate::git::mirror::MirrorStore;
 use crate::git::sync::SyncManager;
 use crate::github_cli::{
-    MAX_GRAPHQL_BODY_BYTES, is_graphql_path, repository_from_graphql, rest_upstream_path,
+    GithubCliGraphqlOperation, MAX_GRAPHQL_BODY_BYTES, classify_graphql, is_graphql_path,
+    rest_upstream_path,
 };
 use crate::inject::{inject, injection_value};
 use crate::jwt::Verifier;
@@ -65,6 +66,8 @@ impl RequestCtx {
 }
 
 const MAX_NPM_METADATA_BYTES: usize = 64 * 1024 * 1024;
+const GITHUB_CLI_META_RESPONSE: &[u8] = br#"{"installed_version":"3.17.0"}"#;
+const GITHUB_CLI_ISSUE_FEATURE_RESPONSE: &[u8] = br#"{"data":{"Issue":{"fields":[]}}}"#;
 
 struct NpmRewrite {
     from: String,
@@ -206,6 +209,35 @@ impl ProxyService {
             .await?;
         Ok(true)
     }
+
+    /// Reply to the two static GitHub Enterprise capability probes emitted by
+    /// `gh` for a custom `GH_HOST`. The caller has already presented exactly
+    /// one repository scope; these bodies contain no upstream data and merely
+    /// disable optional GHES-only metadata paths before basic PR creation.
+    async fn respond_github_cli_feature(
+        &self,
+        session: &mut Session,
+        ctx: &mut RequestCtx,
+        upstream: Arc<Upstream>,
+        body: &'static [u8],
+    ) -> Result<bool> {
+        let mut response = pingora::http::ResponseHeader::build(200, Some(2))
+            .map_err(|_| Error::new_str("failed to build GitHub CLI feature response"))?;
+        response
+            .insert_header("content-type", "application/json")
+            .map_err(|_| Error::new_str("failed to set GitHub CLI feature content type"))?;
+        response
+            .insert_header("content-length", body.len().to_string())
+            .map_err(|_| Error::new_str("failed to set GitHub CLI feature content length"))?;
+        ctx.upstream = Some(upstream);
+        session
+            .write_response_header(Box::new(response), false)
+            .await?;
+        session
+            .write_response_body(Some(Bytes::from_static(body)), true)
+            .await?;
+        Ok(true)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -333,7 +365,16 @@ impl ProxyHttp for ProxyService {
         let method = session.req_header().method.as_str().to_string();
         let mut policy_path = original_path.clone();
         let mut upstream_path: Option<String> = None;
-        if github_cli && is_graphql_path(&original_path) {
+        if github_cli && original_path == "/api/v3/meta" {
+            if method != "GET" || scopes.sole_exact_resource(&upstream.name).is_none() {
+                return self
+                    .reject(session, ctx, 403, "forbidden_scope", b"not allowed")
+                    .await;
+            }
+            return self
+                .respond_github_cli_feature(session, ctx, upstream, GITHUB_CLI_META_RESPONSE)
+                .await;
+        } else if github_cli && is_graphql_path(&original_path) {
             if method != "POST" {
                 return self
                     .reject(
@@ -395,8 +436,43 @@ impl ProxyHttp for ProxyService {
                     }
                 }
             }
-            let resource = match repository_from_graphql(&body) {
-                Ok(resource) => resource,
+            let resource = match classify_graphql(&body) {
+                Ok(GithubCliGraphqlOperation::RepositoryQuery(resource)) => resource,
+                Ok(GithubCliGraphqlOperation::IssueFeatureDetection) => {
+                    if scopes.sole_exact_resource(&upstream.name).is_none() {
+                        log::warn!(
+                            "GitHub CLI issue feature detection rejected upstream={} reason=ambiguous_or_wildcard_scope",
+                            upstream.name
+                        );
+                        return self
+                            .reject(session, ctx, 403, "forbidden_scope", b"not allowed")
+                            .await;
+                    }
+                    return self
+                        .respond_github_cli_feature(
+                            session,
+                            ctx,
+                            upstream,
+                            GITHUB_CLI_ISSUE_FEATURE_RESPONSE,
+                        )
+                        .await;
+                }
+                Ok(GithubCliGraphqlOperation::CreatePullRequest) => {
+                    // GitHub only carries an opaque repository node ID in this
+                    // mutation. Bind it to exactly one explicit JWT scope,
+                    // then let both authorization and credential resolution
+                    // enforce that synthesized repository path.
+                    let Some(resource) = scopes.sole_exact_resource(&upstream.name) else {
+                        log::warn!(
+                            "GitHub CLI pull request creation rejected upstream={} reason=ambiguous_or_wildcard_scope",
+                            upstream.name
+                        );
+                        return self
+                            .reject(session, ctx, 403, "forbidden_scope", b"not allowed")
+                            .await;
+                    };
+                    resource
+                }
                 Err(error) => {
                     log::warn!(
                         "GitHub CLI GraphQL request rejected upstream={} reason={error}",
@@ -415,9 +491,26 @@ impl ProxyHttp for ProxyService {
             };
             policy_path = format!("/repos/{}/{}", resource.owner, resource.repo);
             upstream_path = Some("/graphql".to_string());
-        } else if github_cli && let Some(path) = rest_upstream_path(&original_path) {
-            policy_path = path.to_string();
-            upstream_path = Some(path.to_string());
+        } else if github_cli {
+            // This route exists for read-oriented gh commands plus the bounded
+            // GraphQL createPullRequest mutation above. Do not turn the
+            // repository-scoped GitHub App token into a general REST write
+            // capability through `gh api -X ...`.
+            if !matches!(method.as_str(), "GET" | "HEAD") {
+                return self
+                    .reject(
+                        session,
+                        ctx,
+                        405,
+                        "unsupported_github_cli_rest_method",
+                        b"unsupported GitHub CLI REST method",
+                    )
+                    .await;
+            }
+            if let Some(path) = rest_upstream_path(&original_path) {
+                policy_path = path.to_string();
+                upstream_path = Some(path.to_string());
+            }
         }
 
         // Authorize by scope (+ the normalized or body-derived resource path).
