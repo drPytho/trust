@@ -36,6 +36,14 @@ pub fn authorize(scopes: &ScopeSet, upstream: &Upstream, method: &str, path: &st
         return false;
     }
     let resource = upstream.resource.and_then(|kind| extract(kind, path));
+    let authorization_resource = resource.as_ref().cloned().or_else(|| {
+        matches!(
+            upstream.credential,
+            Some(CredentialSource::GithubApp { .. })
+        )
+        .then(|| scopes.exact_resource(&upstream.name))
+        .flatten()
+    });
     if resource.is_none()
         && upstream.resource.is_some()
         && matches!(
@@ -43,9 +51,14 @@ pub fn authorize(scopes: &ScopeSet, upstream: &Upstream, method: &str, path: &st
             Some(CredentialSource::GithubApp { .. } | CredentialSource::GcpAdc { .. })
         )
     {
-        return false;
+        // An exact repository grant also authorizes resource-less endpoints
+        // (notably GitHub GraphQL). The installation token remains scoped to
+        // that repository; concrete /repos/... paths are still checked below.
+        if scopes.exact_resource(&upstream.name).is_none() {
+            return false;
+        }
     }
-    scopes.permits(&upstream.name, resource.as_ref())
+    scopes.permits(&upstream.name, authorization_resource.as_ref())
 }
 
 #[cfg(test)]
@@ -121,7 +134,7 @@ mod tests {
             "GET",
             "/repos/example-org/other/issues"
         ));
-        // Non-repo path on a scoped upstream: only a bare token authorizes.
+        // Static credentials still require a concrete resource path.
         assert!(!authorize(&s, &up, "GET", "/user"));
         assert!(authorize(
             &ScopeSet::parse("github").unwrap(),
@@ -153,5 +166,7 @@ mod tests {
             "GET",
             "/repos/example-org/example-repo/issues"
         ));
+        let scoped = ScopeSet::parse("github:example-org/example-repo").unwrap();
+        assert!(authorize(&scoped, &github, "GET", "/graphql"));
     }
 }

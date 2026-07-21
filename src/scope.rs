@@ -96,6 +96,32 @@ impl ScopeSet {
         self.0.iter()
     }
 
+    /// Return the exact repository grant for an upstream, when one is
+    /// unambiguous. This lets credential injectors mint the repository token
+    /// even for requests (for example GraphQL) whose URL has no repo path.
+    pub fn exact_resource(&self, upstream: &str) -> Option<Resource> {
+        let mut found = None;
+        for scope in &self.0 {
+            if let Scope::Resource {
+                upstream: scoped_upstream,
+                owner,
+                repo: RepoPat::Exact(repo),
+            } = scope
+                && scoped_upstream == upstream
+            {
+                let resource = Resource {
+                    owner: owner.clone(),
+                    repo: repo.clone(),
+                };
+                if found.as_ref().is_some_and(|existing| existing != &resource) {
+                    return None;
+                }
+                found = Some(resource);
+            }
+        }
+        found
+    }
+
     pub fn to_scope_string(&self) -> String {
         self.0
             .iter()
