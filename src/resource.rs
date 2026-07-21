@@ -84,10 +84,30 @@ pub fn extract(kind: ResourceKind, path: &str) -> Option<Resource> {
         }
 
         ResourceKind::ArtifactRegistryRepo => {
-            // Artifact Registry npm endpoints are rooted at /PROJECT/REPOSITORY/.
-            let mut segs = path.split('/').filter(|s| !s.is_empty());
-            let project = segs.next()?;
-            let repository = segs.next()?;
+            // Artifact Registry npm metadata endpoints are rooted at
+            // /PROJECT/REPOSITORY/. Package tarballs may redirect to the
+            // same-origin download endpoint:
+            // /artifacts-downloads/namespaces/PROJECT/repositories/REPOSITORY/downloads/ID.
+            // Both shapes must resolve to the same repository-scoped resource.
+            let segments = path
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+                .collect::<Vec<_>>();
+            let (project, repository) = match segments.as_slice() {
+                [
+                    "artifacts-downloads",
+                    "namespaces",
+                    project,
+                    "repositories",
+                    repository,
+                    "downloads",
+                    download_id,
+                ] if safe_component(download_id) => (*project, *repository),
+                [project, repository, ..] if *project != "artifacts-downloads" => {
+                    (*project, *repository)
+                }
+                _ => return None,
+            };
             if !safe_component(project) || !safe_component(repository) {
                 return None;
             }
@@ -146,6 +166,30 @@ mod tests {
         .unwrap();
         assert_eq!(r.owner, "my-project");
         assert_eq!(r.repo, "npm-private");
+    }
+
+    #[test]
+    fn artifact_registry_repo_from_download_path() {
+        let r = extract(
+            ResourceKind::ArtifactRegistryRepo,
+            "/artifacts-downloads/namespaces/pit-artifacts/repositories/pit-npm/downloads/qOrudx2Cd3fkYTSd",
+        )
+        .unwrap();
+        assert_eq!(r.owner, "pit-artifacts");
+        assert_eq!(r.repo, "pit-npm");
+    }
+
+    #[test]
+    fn artifact_registry_rejects_malformed_download_paths() {
+        for path in [
+            "/artifacts-downloads/namespaces/pit-artifacts/repositories/pit-npm/downloads",
+            "/artifacts-downloads/namespaces/pit-artifacts/repositories/pit-npm/downloads/id/extra",
+            "/artifacts-downloads/namespaces/pit-artifacts/other/pit-npm/downloads/id",
+            "/artifacts-downloads/namespaces/../repositories/pit-npm/downloads/id",
+            "/artifacts-downloads/namespaces/pit-artifacts/repositories/../downloads/id",
+        ] {
+            assert!(extract(ResourceKind::ArtifactRegistryRepo, path).is_none());
+        }
     }
 
     #[test]
