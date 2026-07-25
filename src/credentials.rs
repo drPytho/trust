@@ -409,6 +409,7 @@ mod tests {
             resource: Some(ResourceKind::GithubRepo),
             git: None,
             allowed_methods: vec!["GET".into()],
+            allowed_paths: Vec::new(),
             allow_connect: false,
             intercept_connect: false,
         };

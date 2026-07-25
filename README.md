@@ -270,6 +270,7 @@ origin          = "https://api.linear.app"
 secret_ref      = "projects/my-proj/secrets/linear-key/versions/latest"
 injection       = { header = "authorization", scheme = "raw" }
 allowed_methods = ["POST"]
+allowed_paths   = ["/graphql"]
 
 [[upstreams]]
 name        = "github-cli"
@@ -316,6 +317,12 @@ injection   = { header = "authorization", scheme = "basic" }
 resource    = { kind = "git-repo" }
 git         = { storage_path = "/var/lib/trust/mirrors" }
 ```
+
+`allowed_methods` and `allowed_paths` are independent allowlists applied before
+credential resolution. When either list is non-empty, a request must match it.
+Paths are matched exactly without the query string, so a credential can be
+limited to a small set of provider operations even when unscoped management
+endpoints exist on the same host.
 
 Note: `[[tokens]]` (static token map from Phase 1) is **gone**. All client authentication
 is now JWT-based via the issuance endpoint.
