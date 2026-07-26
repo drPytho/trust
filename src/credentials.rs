@@ -8,7 +8,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::{Mutex, Mutex as TokioMutex, OnceCell};
 
 use crate::config::{CredentialSource, GithubAppConfig, Upstream};
 use crate::resource::extract;
@@ -88,11 +88,19 @@ struct CachedCredential {
     refresh_at: Instant,
 }
 
+#[derive(Default)]
+struct GithubCache {
+    tokens: HashMap<String, CachedCredential>,
+    /// Per-cache-key mint locks; entries are evicted after a mint completes
+    /// when no other task holds a clone.
+    mint_locks: HashMap<String, Arc<TokioMutex<()>>>,
+}
+
 pub struct CredentialManager {
     secrets: Arc<dyn SecretProvider>,
     github_app: Option<GithubAppConfig>,
     github_client: reqwest::Client,
-    github_cache: Mutex<HashMap<String, CachedCredential>>,
+    github_cache: Mutex<GithubCache>,
     google_credentials: OnceCell<AccessTokenCredentials>,
 }
 
@@ -105,7 +113,7 @@ impl CredentialManager {
             secrets,
             github_app,
             github_client: reqwest::Client::new(),
-            github_cache: Mutex::new(HashMap::new()),
+            github_cache: Mutex::new(GithubCache::default()),
             google_credentials: OnceCell::new(),
         }
     }
@@ -139,24 +147,87 @@ impl CredentialManager {
             permission_key
         );
 
-        // The mutex intentionally covers the mint operation. Token generation is rare
-        // and this gives all concurrent misses single-flight behaviour without ever
-        // duplicating installation tokens.
-        let mut cache = self.github_cache.lock().await;
-        if let Some(cached) = cache.get(&cache_key)
-            && Instant::now() < cached.refresh_at
-        {
+        let make_hit = |cached: &CachedCredential| {
             let secret = match basic_username {
                 Some(username) => Secret::new(format!("{username}:{}", cached.secret.expose())),
                 None => cached.secret.clone(),
             };
-            return Ok(ResolvedCredential {
+            ResolvedCredential {
                 secret,
-                cache_key: Some(cache_key),
+                cache_key: Some(cache_key.clone()),
                 result: ResolutionOutcome::CacheHit,
-            });
+            }
+        };
+
+        // Fast path + acquire the per-key mint lock. The outer lock is held only
+        // for map access, never across the mint HTTP request, so distinct keys
+        // mint concurrently while same-key misses stay single-flight.
+        let mint_lock = {
+            let mut cache = self.github_cache.lock().await;
+            if let Some(cached) = cache.tokens.get(&cache_key)
+                && Instant::now() < cached.refresh_at
+            {
+                return Ok(make_hit(cached));
+            }
+            cache
+                .mint_locks
+                .entry(cache_key.clone())
+                .or_insert_with(|| Arc::new(TokioMutex::new(())))
+                .clone()
+        };
+        let guard = mint_lock.lock().await;
+
+        // Re-check: a concurrent leader may have minted while we waited.
+        {
+            let cache = self.github_cache.lock().await;
+            if let Some(cached) = cache.tokens.get(&cache_key)
+                && Instant::now() < cached.refresh_at
+            {
+                let hit = make_hit(cached);
+                drop(cache);
+                drop(guard);
+                self.release_mint_lock(&cache_key, &mint_lock).await;
+                return Ok(hit);
+            }
         }
 
+        let minted = self
+            .mint_github_token(app, installation, &resource, permissions)
+            .await;
+        if let Ok((secret, refresh_in)) = &minted {
+            let mut cache = self.github_cache.lock().await;
+            cache.tokens.insert(
+                cache_key.clone(),
+                CachedCredential {
+                    secret: secret.clone(),
+                    refresh_at: Instant::now() + *refresh_in,
+                },
+            );
+        }
+        drop(guard);
+        self.release_mint_lock(&cache_key, &mint_lock).await;
+
+        let (secret, _) = minted?;
+        let resolved_secret = match basic_username {
+            Some(username) => Secret::new(format!("{username}:{}", secret.expose())),
+            None => secret,
+        };
+        Ok(ResolvedCredential {
+            secret: resolved_secret,
+            cache_key: Some(cache_key),
+            result: ResolutionOutcome::Refreshed,
+        })
+    }
+
+    /// Mint a fresh GitHub installation token. No cache lock is held here, so
+    /// distinct cache keys mint concurrently.
+    async fn mint_github_token(
+        &self,
+        app: &GithubAppConfig,
+        installation: &crate::config::GithubInstallation,
+        resource: &crate::scope::Resource,
+        permissions: &std::collections::BTreeMap<String, String>,
+    ) -> Result<(Secret, Duration), CredentialError> {
         let private_key = self
             .secrets
             .get(&app.private_key_secret_ref)
@@ -211,23 +282,21 @@ impl CredentialManager {
                 "token expires too soon".to_string(),
             ));
         }
-        let secret = Secret::new(response.token);
-        cache.insert(
-            cache_key.clone(),
-            CachedCredential {
-                secret: secret.clone(),
-                refresh_at: Instant::now() + refresh_in,
-            },
-        );
-        let resolved_secret = match basic_username {
-            Some(username) => Secret::new(format!("{username}:{}", secret.expose())),
-            None => secret,
-        };
-        Ok(ResolvedCredential {
-            secret: resolved_secret,
-            cache_key: Some(cache_key),
-            result: ResolutionOutcome::Refreshed,
-        })
+        Ok((Secret::new(response.token), refresh_in))
+    }
+
+    /// Drop a mint-lock map entry once no other task holds a clone.
+    /// strong_count == 2 means: the map's Arc + our `lock` clone. A concurrent
+    /// waiter that re-creates the entry after eviction merely repeats a mint,
+    /// which is safe (the token cache stays consistent).
+    async fn release_mint_lock(&self, cache_key: &str, lock: &Arc<TokioMutex<()>>) {
+        let mut cache = self.github_cache.lock().await;
+        if let Some(entry) = cache.mint_locks.get(cache_key)
+            && Arc::ptr_eq(entry, lock)
+            && Arc::strong_count(entry) <= 2
+        {
+            cache.mint_locks.remove(cache_key);
+        }
     }
 
     async fn resolve_google(&self) -> Result<ResolvedCredential, CredentialError> {
@@ -290,7 +359,7 @@ impl CredentialProvider for CredentialManager {
     }
 
     async fn invalidate(&self, cache_key: &str) {
-        self.github_cache.lock().await.remove(cache_key);
+        self.github_cache.lock().await.tokens.remove(cache_key);
     }
 }
 
@@ -482,6 +551,159 @@ mod tests {
         assert_eq!(requests[0].1["permissions"]["contents"], "read");
         assert_eq!(requests[1].0, 222);
         drop(requests);
+        server.abort();
+    }
+
+    type ConcRequests = Arc<Mutex<Vec<(u64, Value)>>>;
+
+    #[derive(Clone)]
+    struct ConcState {
+        requests: ConcRequests,
+        delay: Duration,
+    }
+
+    async fn conc_mint(
+        Path(installation_id): Path<u64>,
+        State(state): State<ConcState>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        assert!(
+            headers
+                .get("authorization")
+                .and_then(|header| header.to_str().ok())
+                .is_some_and(|header| header.starts_with("Bearer ey"))
+        );
+        tokio::time::sleep(state.delay).await;
+        state.requests.lock().await.push((installation_id, body));
+        Json(json!({
+            "token": format!("token-{installation_id}"),
+            "expires_at": "2099-01-01T00:00:00Z"
+        }))
+    }
+
+    /// Spawn a mock mint server whose handler sleeps `delay`, returning the
+    /// bound address, the recorded-requests handle, and the server task.
+    async fn spawn_mint_server(
+        delay: Duration,
+    ) -> (
+        std::net::SocketAddr,
+        ConcRequests,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let requests: ConcRequests = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route(
+                "/app/installations/{installation_id}/access_tokens",
+                post(conc_mint),
+            )
+            .with_state(ConcState {
+                requests: requests.clone(),
+                delay,
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (address, requests, server)
+    }
+
+    /// Build a manager + upstream wired to `address` with two installations
+    /// (org-one/111, org-two/222), matching the scaffolding of
+    /// `mints_and_caches_tokens_per_organization_installation`.
+    fn conc_manager_and_upstream(address: std::net::SocketAddr) -> (CredentialManager, Upstream) {
+        let key = Rsa::generate(2048).unwrap().private_key_to_pem().unwrap();
+        let key = String::from_utf8(key).unwrap();
+        let secrets: Arc<dyn SecretProvider> =
+            Arc::new(FakeSecretProvider::new(&[("github-key", key.as_str())]));
+        let github_app = GithubAppConfig {
+            app_id: 123,
+            private_key_secret_ref: "github-key".into(),
+            api_base: format!("http://{address}"),
+            installations: vec![
+                GithubInstallation {
+                    owner: "org-one".into(),
+                    installation_id: 111,
+                },
+                GithubInstallation {
+                    owner: "org-two".into(),
+                    installation_id: 222,
+                },
+            ],
+        };
+        let manager = CredentialManager::new(secrets, Some(github_app));
+        let upstream = Upstream {
+            name: "github".into(),
+            kind: UpstreamKind::Api,
+            listen_host: "github.proxy".into(),
+            origin: Origin {
+                host: "api.github.com".into(),
+                port: 443,
+                tls: true,
+                sni: "api.github.com".into(),
+            },
+            mode: UpstreamMode::Inject,
+            credential: Some(CredentialSource::GithubApp {
+                permissions: [("contents".to_string(), "read".to_string())]
+                    .into_iter()
+                    .collect(),
+                basic_username: None,
+            }),
+            injection: Some(Injection {
+                header: "authorization".into(),
+                scheme: InjectionScheme::Bearer,
+            }),
+            resource: Some(ResourceKind::GithubRepo),
+            git: None,
+            allowed_methods: vec!["GET".into()],
+            allowed_paths: Vec::new(),
+            allow_connect: false,
+            intercept_connect: false,
+        };
+        (manager, upstream)
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_key_resolves_mint_once() {
+        let (address, requests, server) = spawn_mint_server(Duration::from_millis(200)).await;
+        let (manager, upstream) = conc_manager_and_upstream(address);
+
+        let (a, b, c, d) = tokio::join!(
+            manager.resolve(&upstream, "GET", "/repos/org-one/repo-a/contents"),
+            manager.resolve(&upstream, "GET", "/repos/org-one/repo-a/contents"),
+            manager.resolve(&upstream, "GET", "/repos/org-one/repo-a/contents"),
+            manager.resolve(&upstream, "GET", "/repos/org-one/repo-a/contents"),
+        );
+
+        for result in [&a, &b, &c, &d] {
+            assert_eq!(result.as_ref().unwrap().secret.expose(), "token-111");
+        }
+        assert_eq!(
+            requests.lock().await.len(),
+            1,
+            "same key should mint exactly once (single-flight)"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn concurrent_distinct_keys_mint_in_parallel() {
+        let (address, requests, server) = spawn_mint_server(Duration::from_millis(500)).await;
+        let (manager, upstream) = conc_manager_and_upstream(address);
+
+        let started = std::time::Instant::now();
+        let (one, two) = tokio::join!(
+            manager.resolve(&upstream, "GET", "/repos/org-one/repo-a/contents"),
+            manager.resolve(&upstream, "GET", "/repos/org-two/repo-a/contents"),
+        );
+        let elapsed = started.elapsed();
+
+        assert_eq!(one.unwrap().secret.expose(), "token-111");
+        assert_eq!(two.unwrap().secret.expose(), "token-222");
+        assert_eq!(requests.lock().await.len(), 2);
+        assert!(
+            elapsed < Duration::from_millis(900),
+            "distinct keys must mint concurrently (elapsed {elapsed:?}, serial would be >= 1000ms)"
+        );
         server.abort();
     }
 }
