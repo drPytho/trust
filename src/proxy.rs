@@ -552,7 +552,7 @@ impl ProxyHttp for ProxyService {
                 self.metrics.credential_resolution(
                     &upstream.name,
                     provider,
-                    credential.result,
+                    credential.result.as_str(),
                     credential_started.elapsed().as_secs_f64(),
                 );
                 ctx.secret = Some(credential.secret);

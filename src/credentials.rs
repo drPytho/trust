@@ -42,12 +42,32 @@ pub enum CredentialError {
     GoogleAuth(String),
 }
 
+/// How a credential was obtained; used as the bounded `result` metric label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolutionOutcome {
+    CacheHit,
+    Refreshed,
+    Static,
+    ManagedCache,
+}
+
+impl ResolutionOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ResolutionOutcome::CacheHit => "cache-hit",
+            ResolutionOutcome::Refreshed => "refreshed",
+            ResolutionOutcome::Static => "static",
+            ResolutionOutcome::ManagedCache => "managed-cache",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolvedCredential {
     pub secret: Secret,
     /// Present for credentials that can be invalidated after an upstream 401.
     pub cache_key: Option<String>,
-    pub result: &'static str,
+    pub result: ResolutionOutcome,
 }
 
 #[async_trait]
@@ -133,7 +153,7 @@ impl CredentialManager {
             return Ok(ResolvedCredential {
                 secret,
                 cache_key: Some(cache_key),
-                result: "cache-hit",
+                result: ResolutionOutcome::CacheHit,
             });
         }
 
@@ -206,7 +226,7 @@ impl CredentialManager {
         Ok(ResolvedCredential {
             secret: resolved_secret,
             cache_key: Some(cache_key),
-            result: "refreshed",
+            result: ResolutionOutcome::Refreshed,
         })
     }
 
@@ -228,7 +248,7 @@ impl CredentialManager {
         Ok(ResolvedCredential {
             secret: Secret::new(token.token),
             cache_key: None,
-            result: "managed-cache",
+            result: ResolutionOutcome::ManagedCache,
         })
     }
 }
@@ -255,7 +275,7 @@ impl CredentialProvider for CredentialManager {
                 Ok(ResolvedCredential {
                     secret,
                     cache_key: None,
-                    result: "static",
+                    result: ResolutionOutcome::Static,
                 })
             }
             CredentialSource::GithubApp {
@@ -308,6 +328,14 @@ mod tests {
     use axum::{Json, Router};
     use openssl::rsa::Rsa;
     use serde_json::{Value, json};
+
+    #[test]
+    fn resolution_outcome_metric_labels_are_stable() {
+        assert_eq!(ResolutionOutcome::CacheHit.as_str(), "cache-hit");
+        assert_eq!(ResolutionOutcome::Refreshed.as_str(), "refreshed");
+        assert_eq!(ResolutionOutcome::Static.as_str(), "static");
+        assert_eq!(ResolutionOutcome::ManagedCache.as_str(), "managed-cache");
+    }
 
     #[test]
     fn installation_lookup_is_case_insensitive() {
