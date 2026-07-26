@@ -1,653 +1,117 @@
 # trust
 
-A policy-enforcing egress proxy built on [Pingora](https://github.com/cloudflare/pingora) and
-Hyper.
+A policy-enforcing egress proxy for sandboxed workloads, built on
+[Pingora](https://github.com/cloudflare/pingora), Hyper, and Axum.
 
-Clients authenticate to `trust` with a **short-lived JWT** they mint against their own mTLS identity.
-`trust` validates the JWT, checks the client is authorized for the requested upstream, fetches the
-**real** upstream secret from a secret manager, injects it, and forwards the request. Explicit
-destinations can instead pass caller credentials through or accept authenticated HTTP(S)
-forward-proxy traffic. The upstream credential is never handed to clients, and the client's JWT
-is never forwarded upstream.
+You have shared upstream credentials (Anthropic, Linear, GitHub, Artifact
+Registry, …) that you don't want to hand to every client, script, CI job, or
+AI agent. With `trust`:
 
-> **Status:** credential-injected API proxying, authenticated passthrough, selective TLS interception,
-> HTTP(S) forward proxying, and git smart-HTTP caching are implemented. API credentials may be static Secret Manager values,
-> repository-scoped GitHub App installation tokens, or Google ADC access tokens for services such
-> as Artifact Registry.
-
-## Why
-
-You have shared upstream credentials (Anthropic, Linear, Mistral, GitHub API, …) that you don't
-want to distribute to every client, script, or CI job. Instead:
-
-- Each client is identified by its **SPIFFE URI** (in its mTLS certificate SAN).
-- The client mints a **scoped JWT** from the `/token` endpoint; the JWT is short-lived and
-  never carries real upstream keys.
-- The real key lives in a secret manager and is injected at the edge.
-- Access is per-upstream and per-repo: a token scoped to `github-cli:example-org/example-repo` cannot
-  reach `anthropic` or any other GitHub repo.
+- Each client is identified by the **SPIFFE URI** in its mTLS certificate.
+- The client mints a **short-lived, scope-capped JWT** from the `/token`
+  endpoint; the JWT never carries real upstream keys.
+- The real credential lives in a secret manager and is **injected at the
+  edge**; clients never see it, and the client's JWT never reaches upstreams.
+- Access is per-upstream and per-repo: a token scoped to
+  `github-cli:example-org/example-repo` cannot reach `anthropic` or any other
+  repo.
 - Rotating an upstream key is a secret-manager change — clients are untouched.
 
 ## How it works
 
-### Minting a token (mTLS OAuth2)
-
-The issuance endpoint runs on a separate mTLS listener. The client presents its certificate
-(containing a `spiffe://` URI SAN), and the server mints an ES256 JWT capped to the scopes
-allowed for that identity in the `[[issuance.clients]]` policy.
-
 ```
-  client (mTLS)          trust :8443
-  POST /token            ──────────────────────────────────────────
-  grant_type=client_credentials
-  &scope=github-cli:example-org/example-repo
-                         1. verify client cert → extract SPIFFE URI
-                         2. look up allowed scopes for that identity
-                         3. cap requested scopes to allowed set
-                         4. sign ES256 JWT (iss/aud/exp/sub/scope)
-                         ──────────────────────────────────────────
-                         {"access_token": "<jwt>", "token_type": "Bearer", ...}
+ 1. mint (mTLS)                      2. proxy (Bearer JWT)
+ client ──POST /token──▶ trust       client ──▶ trust ─────────▶ upstream
+   cert SAN = spiffe://…   :8443       :6443     │                api.anthropic.com
+   scope=anthropic                               ├ route by Host        404
+   ◀── scoped ES256 JWT ──┘                      ├ verify JWT           401
+                                                 ├ authorize scope      403
+                                                 ├ fetch real secret    502
+                                                 ├ strip client auth
+                                                 └ inject x-api-key ──▶ 200
 ```
 
-JWKS (public keys for verification) is served at `/.well-known/jwks.json` on a plain HTTP
-listener (`jwks_addr`). Key rotation (current + previous) is backed by GCP Secret Manager;
-the server refreshes keys every 10 minutes without restarting.
-
-The same listener exposes `/healthz` for liveness, `/readyz` for readiness, and `/metrics`
-in Prometheus text format. Readiness requires the proxy lifecycle to be started and a signing
-key to be loaded. The exported proxy metrics are:
-
-- `trust_proxy_requests_total{upstream,status}`
-- `trust_proxy_rejections_total{upstream,reason,status}`
-- `trust_proxy_request_duration_seconds{upstream}`
-- `trust_proxy_in_flight_requests`
-- `trust_credential_resolutions_total{upstream,provider,result}`
-- `trust_credential_resolution_duration_seconds{provider}`
-- `trust_connect_attempts_total{upstream,result}`
-- `trust_connect_active_tunnels{upstream}`
-- `trust_connect_duration_seconds{upstream}`
-- `trust_connect_bytes_total{upstream,direction}`
-- `trust_forward_proxy_requests_total{upstream,result}`
-- `trust_mitm_handshakes_total{upstream,result}`
-- `trust_mitm_certificate_cache_total{result}`
-- `trust_mitm_active_connections{upstream}`
-- `trust_mitm_connection_duration_seconds{upstream}`
-
-Rejected reverse-proxy and forward-proxy calls are also logged at `WARN` with bounded reason labels
-and safe request metadata. CONNECT distinguishes invalid authorities, unknown destinations, missing
-or invalid tokens, forbidden scopes, private destinations, connection failures, and tunnel-capacity
-exhaustion. Credentials and authorization headers are never logged.
-
-### Proxying a request
-
-Each upstream owns a proxy **hostname**; the incoming `Host` header selects it.
-
-```
-                         ┌───────────────────────── trust ─────────────────────────┐
-  client                 │                                                          │
-  Authorization:  ─────▶ │  request_filter                                          │
-  Bearer <jwt>           │   ├─ route by Host ......................... 404 if none │
-                         │   ├─ verify JWT (ES256, iss/aud/exp) ....... 401 if bad  │
-                         │   ├─ authorize scope → upstream/resource ... 403 if not  │
-                         │   └─ fetch upstream secret (cached) ........ 502 on error│
-                         │  upstream_request_filter                                 │
-                         │   ├─ strip client Authorization                          │
-                         │   ├─ inject upstream secret (per scheme)                 │      Authorization:
-                         │   └─ rewrite Host → real origin           ───────────────┼────▶ Bearer <real-key>
-                         └──────────────────────────────────────────────────────────┘     api.anthropic.com
-```
-
-Reject responses (404/401/403/502) short-circuit inside the proxy; only authorized requests ever
-reach an upstream.
-
-## Scope grammar
-
-A scope is either a bare upstream name or a resource-scoped token:
-
-| Scope                  | Meaning                                                  |
-|------------------------|----------------------------------------------------------|
-| `anthropic`            | Full access to the `anthropic` upstream                  |
-| `linear`               | Full access to the `linear` GraphQL upstream             |
-| `mistral`              | Full access to the `mistral` upstream                    |
-| `github-cli:owner/repo` | Exact repo match on the `github-cli` upstream            |
-| `github-cli:owner/*`    | All repos under `owner` (one wildcard segment)           |
-
-Rules:
-- A bare upstream scope (`anthropic`) covers any resource under that upstream.
-- A wildcard (`github-cli:owner/*`) covers any exact repo under that owner but not a nested path.
-- Only one-segment wildcards are supported — `*` must be the entire repo component.
-- The scope prefix is the configured upstream name; the `github-cli` example below therefore
-  uses `github-cli:owner/repo`.
-- Operators should end prefix grants with `/*` (segment boundary) to avoid unintended prefix
-  leakage; the parser rejects tokens with more than one `/`.
+Rejects short-circuit inside the proxy; only authorized requests ever reach an
+upstream.
 
 ## Features
 
-- **JWT client auth** — clients send `Authorization: Bearer <jwt>` for injected upstreams or
-  `Proxy-Authorization: Bearer <jwt>` when their own `Authorization` must pass through; `trust`
-  verifies ES256, `iss`, `aud`, and `exp`.
-- **mTLS token issuance** — OAuth2 `client_credentials` on a dedicated mTLS listener; client
-  identity = SPIFFE URI SAN.
-- **Scope-capped issuance** — requested scopes are intersected against the per-identity policy;
-  uncovered scopes → 403.
-- **Key rotation** — current + previous ES256 keys loaded from GCP Secret Manager, refreshed
-  in the background every 10 minutes; JWKS served for external verification.
-- **Pingora reverse proxy plus optional Hyper HTTP(S) forward-proxy listener** — both reuse the same upstream
-  configuration, JWT verifier, signing keys, scopes, metrics registry, and process lifecycle.
-- **Per-upstream host routing** via the `Host` header.
-- **GCP Secret Manager** backend behind a swappable `SecretProvider` trait, with an
-  in-memory TTL cache (default 5 min).
-- **Dynamic GitHub App credentials** — selects an installation by repository owner, mints a token
-  restricted to the exact repository and configured permissions, and caches it until five minutes
-  before expiry.
-- **Artifact Registry credentials via ADC** — obtains Google access tokens through Application
-  Default Credentials/Workload Identity, without placing Google tokens in worker `.npmrc` files.
-- **Configurable injection** per upstream: header name + scheme (`bearer` / `basic` / `raw`).
-- **Authenticated passthrough** — explicitly allowlisted hosts can proxy without credential
-  injection while retaining scoped JWT authorization and preserving the caller's headers.
-- **Authenticated HTTP(S) forwarding** — an optional forward-proxy listener accepts absolute-form
-  HTTP and HTTPS CONNECT requests. Explicit destinations retain their named scope; an opt-in audit
-  fallback allows all public destinations with the dedicated `outbound-audit` scope. Selected HTTPS
-  origins can instead opt in to per-host TLS interception and provider credential injection. The
-  opaque audit fallback cannot remove or inject destination TLS credentials, so it is an egress
-  audit boundary rather than a credential-isolation boundary.
-- **Repo-scoped authz** for `github-repo` upstreams — the request path is parsed for
-  `owner/repo`; the JWT scope must cover it. `github-cli-repo` additionally supports the
-  GitHub Enterprise-style REST and repository-rooted GraphQL requests emitted by `gh`, plus
-  the bounded `createPullRequest` mutation when its upstream has one exact repository scope.
-- **git-cache upstream** — serves `git clone`/`fetch` from a local bare mirror (fresh refs,
-  cached objects; incremental `git fetch` per read, no TTL); passes `git push` through to
-  the origin. Reuses JWT auth and repo-scoped authz (`git-repo` resource).
-- **Client JWT never leaks** — `Authorization` is stripped before forwarding; secrets are
-  never logged (redacted `Debug`, no `Display`).
-- **Health and metrics** — the management listener exposes Kubernetes-compatible liveness and
-  readiness probes plus Prometheus proxy metrics.
+- **mTLS token issuance** — OAuth2 `client_credentials`; requested scopes are
+  capped to the per-identity policy. ES256 keys live in GCP Secret Manager,
+  rotate without restarts, and are published via JWKS.
+- **Credential injection** per upstream (`bearer` / `basic` / `raw` header
+  schemes) from a swappable secret backend with a TTL cache.
+- **Dynamic credentials** — per-repository GitHub App installation tokens and
+  Google ADC access tokens (e.g. Artifact Registry npm), minted and cached
+  server-side.
+- **Repo-scoped authorization** — `upstream:owner/repo` scopes with one-segment
+  wildcards, enforced against the request path, including fail-closed `gh` CLI
+  REST/GraphQL compatibility and scoped `gh pr create`.
+- **git smart-HTTP cache** — clones/fetches served from a local bare mirror
+  with always-fresh refs; pushes pass through to the origin.
+- **HTTP(S) forward proxy** — authenticated absolute-form HTTP and CONNECT
+  tunnels: opaque passthrough per exact destination, an opt-in audit fallback
+  for unmatched public hosts, and selective per-host TLS interception with
+  credential injection behind a dedicated CA hierarchy.
+- **Method/path allowlists** per upstream, applied before credential
+  resolution.
+- **Kubernetes-ready** — liveness/readiness probes, Prometheus metrics,
+  bounded-cardinality audit logging.
 
-## Configuration
+## Quick start
 
-`trust` reads a TOML file (path from `TRUST_CONFIG`, default `./config.toml`). The file
-holds **no plaintext secrets** — only secret-manager references.
-
-```toml
-# Plain HTTP listener (use [tls] below for TLS termination).
-[listen]
-tcp = "0.0.0.0:6191"
-
-# TLS listener (required by the issuance server for its cert/key).
-[tls]
-addr = "0.0.0.0:6443"
-cert_path = "/etc/trust/server.crt"
-key_path  = "/etc/trust/server.key"
-
-# Optional HTTP(S) forward proxy. It accepts absolute-form HTTP requests and
-# HTTPS CONNECT tunnels. TLS protects the JWT on the client-to-proxy hop when
-# enabled; the [tls] certificate/key above are reused and must cover this
-# listener's DNS name.
-[forward_proxy]
-addr = "0.0.0.0:6180"
-tls = true
-connect_timeout = "10s"
-idle_timeout = "5m"
-max_tunnel_duration = "1h"
-max_concurrent_tunnels = 1024
-allow_private_ips = false
-# Audit fallback for otherwise-unmatched public HTTP(S) destinations:
-# audit_unmatched = { scope = "outbound-audit" }
-
-# Optional dedicated online signer for explicitly intercepted HTTPS CONNECT
-# destinations. Mount an intermediate chain/key here; never mount the root.
-[forward_proxy.mitm]
-issuer_cert_chain_path = "/etc/trust/egress-mitm/intermediate-chain.pem"
-issuer_key_path = "/etc/trust/egress-mitm/intermediate.key"
-leaf_ttl = "24h"
-refresh_before = "1h"
-leaf_cache_capacity = 256
-handshake_timeout = "10s"
-
-# JWT auth: issuer/audience embedded in minted tokens and verified on every request.
-[auth]
-issuer   = "https://trust.example.internal/"
-audience = "trust-proxy"
-
-[auth.signing]
-algorithm              = "ES256"
-token_ttl              = "7d"
-# GCP Secret Manager reference for the current signing key (P-256 PEM).
-key_secret_ref          = "projects/my-proj/secrets/trust-signing-key/versions/latest"
-# Optional: previous key (verify-only during rotation).
-# previous_key_secret_ref = "projects/my-proj/secrets/trust-signing-key/versions/3"
-
-# mTLS token-issuance server + plain JWKS/health/metrics management server.
-[issuance]
-mtls_addr       = "0.0.0.0:8443"
-client_ca_path  = "/etc/trust/client-ca.pem"
-jwks_addr       = "0.0.0.0:8080"
-
-# Per-identity issuance policy.  spiffe may end with `*` for a prefix match.
-[[issuance.clients]]
-spiffe         = "spiffe://example/ci/example-repo"
-allowed_scopes = ["github-cli:example-org/example-repo", "github-git:example-org/example-repo"]
-
-[[issuance.clients]]
-spiffe         = "spiffe://example/team/platform/*"
-allowed_scopes = ["anthropic", "linear", "github-cli:example-org/*", "npm-artifacts:my-proj/npm-private"]
-
-# One GitHub App can have a different installation in each organization. Owner matching is
-# case-insensitive and requests for an unmapped owner fail closed.
-[github_app]
-app_id = 123456
-private_key_secret_ref = "projects/my-proj/secrets/github-app-key/versions/latest"
-
-[[github_app.installations]]
-owner = "example-org"
-installation_id = 111111
-
-[[github_app.installations]]
-owner = "customer-org"
-installation_id = 222222
-
-# Upstreams. Each owns a listen_host; the Host header routes to it.
-# Unknown hosts are denied. The default mode is "inject" for backward compatibility.
-[[upstreams]]
-name        = "anthropic"
-kind        = "api"
-listen_host = "anthropic.proxy.internal"
-origin      = "https://api.anthropic.com"
-secret_ref  = "projects/my-proj/secrets/anthropic-key/versions/latest"
-injection   = { header = "x-api-key", scheme = "raw" }
-# A standard HTTPS client can use api.anthropic.com through HTTPS_PROXY.
-# It still needs the named `anthropic` scope; outbound-audit does not suffice.
-intercept_connect = true
-
-# Linear's GraphQL API accepts personal API keys as `Authorization: <key>`
-# (without a Bearer prefix). If the stored secret is an OAuth access token,
-# use `scheme = "bearer"` instead.
-[[upstreams]]
-name            = "linear"
-kind            = "api"
-listen_host     = "linear.proxy.internal"
-origin          = "https://api.linear.app"
-secret_ref      = "projects/my-proj/secrets/linear-key/versions/latest"
-injection       = { header = "authorization", scheme = "raw" }
-allowed_methods = ["POST"]
-allowed_paths   = ["/graphql"]
-
-[[upstreams]]
-name        = "github-cli"
-kind        = "api"
-listen_host = "github-cli.proxy.internal"
-origin      = "https://api.github.com"
-credential  = { kind = "github-app", permissions = { contents = "read", pull_requests = "write", issues = "read" } }
-injection   = { header = "authorization", scheme = "bearer" }
-resource    = { kind = "github-cli-repo" } # native REST plus fail-closed gh CLI compatibility
-
-# Read-only npm access through GCP Artifact Registry. The proxy obtains the upstream token via
-# ADC; grant its workload identity Artifact Registry Reader on only this repository.
-[[upstreams]]
-name            = "npm-artifacts"
-kind            = "api"
-listen_host     = "npm.proxy.internal"
-origin          = "https://europe-north1-npm.pkg.dev"
-credential      = { kind = "gcp-adc", rewrite_registry_to = "https://npm.proxy.internal" }
-injection       = { header = "authorization", scheme = "bearer" }
-resource        = { kind = "artifact-registry-repo" }
-allowed_methods = ["GET", "HEAD"]
-
-# Explicitly allowlisted passthrough. No secret is fetched or injected. Clients must put their
-# trust JWT in Proxy-Authorization; their normal Authorization header is forwarded unchanged.
-# allow_connect additionally permits an opaque tunnel to exactly api.example.com:443.
-[[upstreams]]
-name          = "public-api"
-kind          = "api"
-mode          = "passthrough"
-listen_host   = "public.proxy.internal"
-origin        = "https://api.example.com"
-allow_connect = true
-
-# git-cache upstream: bare mirror + pass-through push.
-# Requires `git` in PATH where trust runs.
-[[upstreams]]
-name        = "github-git"
-kind        = "git-cache"
-listen_host = "git.proxy.internal"
-origin      = "https://github.com"
-credential  = { kind = "github-app", permissions = { contents = "read" }, basic_username = "x-access-token" }
-# GitHub receives `Authorization: Basic base64(x-access-token:<installation-token>)`.
-injection   = { header = "authorization", scheme = "basic" }
-resource    = { kind = "git-repo" }
-git         = { storage_path = "/var/lib/trust/mirrors" }
-```
-
-`allowed_methods` and `allowed_paths` are independent allowlists applied before
-credential resolution. When either list is non-empty, a request must match it.
-Paths are matched exactly without the query string, so a credential can be
-limited to a small set of provider operations even when unscoped management
-endpoints exist on the same host.
-
-Note: `[[tokens]]` (static token map from Phase 1) is **gone**. All client authentication
-is now JWT-based via the issuance endpoint.
-
-### Injection schemes
-
-| Scheme   | Header value written               | Use for                                   |
-|----------|------------------------------------|-------------------------------------------|
-| `raw`    | `<secret>` verbatim                | API-key headers, e.g. `x-api-key` or Linear personal keys |
-| `bearer` | `Bearer <secret>`                  | OAuth/PAT bearer auth                      |
-| `basic`  | `Basic base64(<secret>)`           | HTTP Basic (secret is the `user:pass` string) |
-
-Config is validated at startup: duplicate upstream names/listen hosts, malformed origins, ambiguous
-CONNECT authorities, zero tunnel capacity, and invalid CONNECT mode combinations are rejected before
-the server binds. `allow_connect` is opaque passthrough only. `intercept_connect` requires an API
-inject upstream with an HTTPS, exact DNS origin and `[forward_proxy.mitm]`; it cannot be combined
-with `allow_connect`, an IP/wildcard origin, or a cache too small to prewarm every interception host.
-`secret_ref = "..."` remains supported as shorthand for `credential = { kind = "static-secret",
-secret_ref = "..." }`.
-
-### npm client configuration
-
-Workers need only non-secret routing configuration and their short-lived `trust` JWT. The npm CLI
-expands the environment variable at runtime:
-
-```ini
-@company:registry=https://npm.proxy.internal/my-proj/npm-private/
-//npm.proxy.internal/my-proj/npm-private/:_authToken=${TRUST_TOKEN}
-always-auth=true
-```
-
-No `gcloud` CLI or `google-artifactregistry-auth` invocation is required in the worker. The
-`rewrite_registry_to` setting rewrites absolute Artifact Registry tarball URLs and redirects back
-through the proxy. Existing lockfiles should still be regenerated against the proxy, or tested
-with `replace-registry-host=always`, so previously stored direct `*.pkg.dev` URLs cannot bypass it.
-Publishing should use a separate upstream, workload identity, and method policy with Artifact
-Registry Writer access.
-
-### Using the HTTP(S) forward proxy
-
-The listener accepts absolute-form `http://` requests and HTTPS CONNECT tunnels. Its paths are
-deliberately distinct:
-
-| CONNECT destination | Required scope | TLS handling | Credential injection |
-|---|---|---|---|
-| Unknown public host with `audit_unmatched` | `outbound-audit` | opaque TCP tunnel | never |
-| `allow_connect = true` upstream | that upstream's name | opaque TCP tunnel | never |
-| `intercept_connect = true` upstream | that upstream's name | per-host TLS termination and verified upstream TLS | configured inject mode |
-
-An exact configured route takes precedence over the audit fallback. Consequently an
-`outbound-audit` token cannot select a configured intercepted host: it receives `403` before the
-TLS upgrade begins. Opaque paths remain compatible with HTTP/2, gRPC, and other TLS protocols, but
-the intercepted path deliberately accepts HTTP/1.1 only in this release.
-
-Clients that can set proxy headers directly should use Bearer authentication:
+Prerequisites: Rust (edition 2024), `cmake` (pinned via
+[`mise`](https://mise.jdx.dev): `mise install`), and GCP Application Default
+Credentials with `secretmanager.versions.access` on the referenced secrets.
 
 ```bash
-curl --proxy https://trust.example.internal:6180 \
-  --proxy-cacert server-ca.pem \
-  --proxy-header "Proxy-Authorization: Bearer $JWT" \
-  https://api.example.com/resource
-```
+# 1. Dev certs (server cert, client CA, SPIFFE client cert) + signing key
+./scripts/dev-certs.sh certs
+./scripts/gen-signing-key.sh signing-key.pem
+gcloud secrets create trust-signing-key --data-file=signing-key.pem --project=$PROJECT
+printf '%s' "sk-ant-…" | gcloud secrets create anthropic-key --data-file=- --project=$PROJECT
 
-For tools that only understand proxy URL credentials, `trust` also accepts HTTP Basic with the
-fixed username `jwt` and the JWT as its password:
-
-```bash
-export HTTPS_PROXY="https://jwt:${JWT}@trust.example.internal:6180"
-export NO_PROXY="trust.example.internal,.proxy.internal"
-```
-
-The `https://` proxy scheme means TLS is used between the client and `trust`; client support varies.
-Setting `tls = false` and using `http://` is more widely compatible, but exposes the JWT to anyone
-who can observe that network hop. Keep the listener private if plaintext is unavoidable. Avoid
-putting long-lived secrets in proxy URLs; these JWTs should be short-lived and scoped.
-
-For a private cluster-internal path where plaintext transport is an accepted
-boundary, set `tls = false` and point standard proxy variables directly at the
-ClusterIP listener:
-
-```bash
-export HTTP_PROXY="http://jwt:${JWT}@trust.example.internal:6180"
-export HTTPS_PROXY="$HTTP_PROXY"
-```
-
-Keep that listener private and restrict its sources with NetworkPolicy. Trust
-remains responsible for proxy authentication, scope checks, destination policy,
-and audit logs.
-
-The proxy resolves DNS server-side and rejects non-global special-use addresses (including
-loopback, link-local, private, multicast, documentation, benchmarking, and reserved ranges) by
-default. For intercepted routes, the approved addresses are resolved and frozen at CONNECT time
-before Trust returns `200`; the decrypted upstream connection tries only that set rather than
-performing a second DNS lookup. Set `allow_private_ips = true` only when explicitly configured
-internal upstreams are required; the caller-selected audit fallback always remains public-only.
-Tunnels end at JWT expiry, the idle timeout, or `max_tunnel_duration`, whichever comes first.
-
-#### Selective TLS interception
-
-TLS interception is an explicit tenant opt-in, not a generic egress feature. Create a dedicated
-offline root and a scoped online intermediate; do not reuse the reverse-proxy certificate, workload
-mTLS CA, or JWT signing key. For development, the helper creates the three materials separately:
-
-```bash
-./scripts/dev-egress-mitm-ca.sh dev-egress-mitm-ca
-# Trust mount: dev-egress-mitm-ca/intermediate/{intermediate-chain.pem,intermediate.key}
-# Opt-in workload trust anchor: dev-egress-mitm-ca/egress-root-ca.pem
-# Keep dev-egress-mitm-ca/root/egress-root-ca.key offline.
-```
-
-Mount only the intermediate chain/key read-only in the Trust Pod and add only the public root to a
-combined CA bundle in opted-in Sandboxes. That bundle must retain the workload's regular public
-roots (and the Trust server CA when needed); replacing it with the egress root alone breaks ordinary
-TLS. `trust` synchronously prewarms a bounded in-memory leaf cache at startup and refreshes it
-locally; TLS handshakes never call Secret Manager or KMS. Each leaf has one exact DNS SAN, the
-response chain omits the root, and upstream certificate/hostname verification stays enabled.
-
-For an intercepted origin, the CONNECT authority, TLS SNI, and decrypted HTTP/1 `Host` must all
-match the canonical configured host and port. A mismatch, missing SNI, absent/duplicate `Host`,
-expired CONNECT JWT, cache miss, or unsupported ALPN fails before an upstream request. The outer
-`Proxy-Authorization` and client `Authorization` are stripped; the stored provider credential is
-the only credential injected upstream.
-
-With a plaintext in-cluster proxy listener, a client whose combined CA bundle trusts the egress
-root can make a normal provider request without changing its destination hostname:
-
-```bash
-curl --proxy http://trust.example.internal:6180 \
-  --proxy-header "Proxy-Authorization: Bearer $ANTHROPIC_JWT" \
-  --cacert dev-egress-mitm-ca/egress-root-ca.pem \
-  https://api.anthropic.com/v1/messages
-```
-
-When `forward_proxy.tls = true`, keep the existing `--proxy-cacert` for the outer proxy TLS
-certificate and use `--cacert` (or a combined workload CA bundle) for the egress root. Certificate
-pinning and clients that require HTTP/2/HTTP/3 are not compatible with interception; retain an
-opaque or reverse-proxy route only after an explicit review. Block direct UDP/443 for egress-enforced
-Sandboxes so QUIC cannot bypass the HTTP proxy policy.
-
-#### Auditing unmatched outbound destinations
-
-During migration, the forward proxy can allow otherwise-unmatched public destinations while
-inventorying them. This is opt-in and still requires a valid JWT with a dedicated bare scope:
-
-```toml
-[forward_proxy]
-addr = "0.0.0.0:6180"
-tls = true
-allow_private_ips = false
-audit_unmatched = { scope = "outbound-audit" }
-
-[[issuance.clients]]
-spiffe = "spiffe://example/sandboxes/*"
-allowed_scopes = ["outbound-audit"]
-```
-
-For an unknown CONNECT authority or absolute-form HTTP request, trust logs the requested hostname
-and port at `WARN`, verifies the JWT and `outbound-audit` scope, and applies the normal
-DNS/private-IP checks. CONNECT results are recorded under
-`trust_connect_attempts_total{upstream="audit-unmatched",result="..."}`; plain HTTP results use
-`trust_forward_proxy_requests_total{upstream="audit-unmatched",result="..."}`. Destination names
-stay in logs rather than Prometheus labels to avoid unbounded metric cardinality. Authorization
-headers and tokens are never logged.
-
-Exact configured CONNECT destinations always take precedence and continue to require their named
-upstream scopes. Give a sandbox its intended named scopes plus `outbound-audit` during discovery,
-then convert observed destinations into explicit opaque passthrough upstreams or carefully reviewed
-`intercept_connect` providers, and remove the audit scope and setting to return to deny-by-default
-behavior. The audit fallback never enters interception and does not apply to reverse-proxy hosts or
-private destinations, even when exact configured routes enable `allow_private_ips`.
-
-## Running
-
-### Prerequisites
-
-- Rust (edition 2024) toolchain.
-- `cmake` — required by Pingora's `zlib-ng`. This repo pins it via [`mise`](https://mise.jdx.dev);
-  `mise install` provides it, or install `cmake` yourself.
-- GCP credentials via [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials):
-  `gcloud auth application-default login`, `GOOGLE_APPLICATION_CREDENTIALS`, or workload
-  identity on GCP. The identity needs `secretmanager.versions.access` on the referenced secrets.
-- A CA certificate for client mTLS, and certificates for each client with a `spiffe://` URI SAN.
-
-### Build & run
-
-```bash
-cargo build --release
+# 2. Write config.toml (see docs/CONFIGURATION.md), then run
 TRUST_CONFIG=./config.toml RUST_LOG=info cargo run --release
+
+# 3. Mint a scoped JWT and call the API through the proxy
+JWT=$(./scripts/mint-jwt.sh anthropic)
+curl https://anthropic.proxy.internal:6443/v1/messages \
+  --resolve anthropic.proxy.internal:6443:127.0.0.1 --cacert certs/server.crt \
+  -H "Authorization: Bearer $JWT" -H "anthropic-version: 2023-06-01" \
+  -H "content-type: application/json" \
+  -d '{"model":"claude-opus-4-8","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}'
 ```
 
-### Minting a token (client side)
+The proxy validates the JWT, strips it, injects the real `x-api-key`, and
+forwards. See [docs/SETUP.md](docs/SETUP.md) for the Docker-based walkthrough.
 
-```bash
-# Mint a JWT for a specific repo scope:
-JWT=$(curl -s --cert client.crt --key client.key \
-  --cacert server-ca.pem \
-  https://trust.example.internal:8443/token \
-  --data-urlencode "grant_type=client_credentials" \
-  --data-urlencode "scope=github-cli:example-org/example-repo github-git:example-org/example-repo" \
-  | jq -r .access_token)
-```
+## Listeners
 
-### Using the token
+| Port (default) | Listener | Purpose |
+|---|---|---|
+| `6191` | reverse proxy (plain HTTP) | development only |
+| `6443` | reverse proxy (TLS) | credential injection + authenticated passthrough |
+| `6180` | HTTP(S) forward proxy | absolute-form HTTP + authenticated CONNECT |
+| `8443` | issuance (mTLS) | `POST /token` mints scoped JWTs |
+| `8080` | management (plain HTTP) | JWKS, `/healthz`, `/readyz`, `/metrics` |
 
-```bash
-# API call through the proxy:
-curl -H "Authorization: Bearer $ANTHROPIC_JWT" \
-  -H "Host: anthropic.proxy.internal" \
-  https://trust.example.internal:6443/v1/messages
+## Documentation
 
-# Linear GraphQL call. The proxy replaces the trust JWT with the stored Linear key.
-curl -X POST -H "Authorization: Bearer $LINEAR_JWT" \
-  -H "Content-Type: application/json" \
-  -H "Host: linear.proxy.internal" \
-  --data '{"query":"{ viewer { id name } }"}' \
-  https://trust.example.internal:6443/graphql
+| Doc | Contents |
+|---|---|
+| [docs/SETUP.md](docs/SETUP.md) | build, certs, secrets, run, end-to-end quickstart |
+| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | full config reference: upstreams, scopes, injection, GitHub App, npm |
+| [docs/FORWARD_PROXY.md](docs/FORWARD_PROXY.md) | CONNECT tunnels, selective TLS interception, audit fallback |
+| [docs/GITHUB.md](docs/GITHUB.md) | `gh` CLI support and git-cache behaviour |
+| [docs/SECURITY.md](docs/SECURITY.md) | security model, invariants, known limitations |
+| [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) | metrics, logging, troubleshooting |
 
-# With @linear/sdk, set `accessToken` to the trust JWT and `apiUrl` to the
-# complete proxy endpoint (`https://linear.proxy.internal/graphql`).
-# See examples/linear-js for a runnable configuration and query.
+Runnable examples: [examples/anthropic-js](examples/anthropic-js),
+[examples/linear-js](examples/linear-js),
+[examples/kubernetes](examples/kubernetes) (full sandbox-egress deployment).
 
-# Authenticated passthrough. The trust JWT is consumed by the proxy while the caller's
-# upstream credential is forwarded in Authorization without modification:
-curl -H "Proxy-Authorization: Bearer $JWT" \
-  -H "Authorization: Bearer $CALLER_UPSTREAM_TOKEN" \
-  -H "Host: public.proxy.internal" \
-  https://trust.example.internal:6443/resource
-
-# git clone via the git-cache upstream (cached mirror, fresh refs):
-git -c http.extraHeader="Authorization: Bearer $JWT" \
-  clone https://git.proxy.internal/example-org/example-repo.git
-
-# git push via the git-cache upstream (passed through to origin):
-git -c http.extraHeader="Authorization: Bearer $JWT" \
-  push https://git.proxy.internal/example-org/example-repo.git HEAD:main
-```
-
-### GitHub CLI without CONNECT
-
-Configure the GitHub API upstream with `resource = { kind = "github-cli-repo" }`, then point
-`gh` at its reverse-proxy hostname. Because `gh` treats a custom host as GitHub Enterprise,
-trust rewrites `/api/v3/...` to GitHub.com's REST paths and `/api/graphql` to `/graphql`. The
-value in `GH_ENTERPRISE_TOKEN` is the trust JWT, not a GitHub token:
-
-```bash
-export GH_HOST=github-cli.proxy.internal
-export GH_ENTERPRISE_TOKEN="$JWT"
-export GH_REPO=github-cli.proxy.internal/example-org/example-repo
-# Or install the internal CA in the sandbox's system trust store.
-export SSL_CERT_FILE=/var/run/trust/server/ca.crt
-
-gh repo view "$GH_REPO"
-gh api repos/example-org/example-repo/pulls
-gh pr create --repo "$GH_REPO" --base main --head agent-branch --title "Scoped PR" --body "Created through Trust"
-```
-
-The CLI sends `Authorization: token <JWT>`; that scheme is accepted only by the explicit
-`github-cli-repo` mode. trust validates the JWT, derives the exact repository, mints/caches an
-installation token restricted to that repository, replaces the client header, and forwards the
-request. REST calls must use `/repos/{owner}/{repo}/...` and are limited to `GET`/`HEAD`.
-GraphQL is limited to named query
-operations whose root fields all select the same repository through variables, plus the single
-`createPullRequest` mutation used by basic `gh pr create`. That mutation carries an opaque
-repository node ID, so trust requires exactly one exact `github-cli:owner/repo` scope and uses
-that scope to obtain a repository-restricted installation token; GitHub rejects a node ID from
-any other repository. A custom `GH_HOST` also makes `gh` run GitHub Enterprise feature detection;
-trust answers only its static `/api/v3/meta` and `Issue_fields` probes locally after the same
-exact-scope check. Other mutations, REST writes, global queries, node lookups, search, multiple
-operations, and bodies over 64 KiB fail closed. This supports repository-scoped read requests and
-basic non-interactive PR creation. Follow-up mutations such as assigning reviewers, labels,
-projects, or closing issues remain denied.
-
-`gh repo clone` and `gh pr checkout` invoke `git` after their API query. Route that child process
-to the separate git-cache reverse-proxy hostname and give the JWT both the `github-cli:owner/repo` and
-`github-git:owner/repo` scopes:
-
-```bash
-export GIT_CONFIG_COUNT=2
-export GIT_CONFIG_KEY_0=url.https://git.proxy.internal/.insteadOf
-export GIT_CONFIG_VALUE_0=https://github-cli.proxy.internal/
-export GIT_CONFIG_KEY_1=http.https://git.proxy.internal/.extraHeader
-export GIT_CONFIG_VALUE_1="Authorization: Bearer $JWT"
-export GIT_SSL_CAINFO=/var/run/trust/server/ca.crt
-
-gh repo clone example-org/example-repo
-```
-
-These inherited Git settings avoid CONNECT and ensure the git subprocess also stays behind trust.
-
-### git-cache behaviour
-
-- **Clone / fetch:** trust serves objects from a local bare mirror. On every read request, it
-  runs `git fetch` to pull fresh refs and any new objects from the origin (no TTL — always
-  up-to-date). Objects already in the mirror are served without hitting the origin.
-- **Push:** classified as passthrough; trust injects the upstream PAT and forwards to the real
-  origin. The mirror is refreshed on the next read.
-- **Auth:** same JWT flow as `api` upstreams. The client's `Authorization` header is stripped;
-  the upstream credential is injected via the configured injection scheme.
-- **Requirement:** `git` must be installed where trust runs (`git http-backend` serves reads;
-  `git fetch` syncs the mirror).
-
-## Security model
-
-- `Proxy-Authorization` is always removed before forwarding. In inject mode, the client's
-  `Authorization` is also removed before the upstream secret is injected. In passthrough mode,
-  the caller's `Authorization` is preserved and the trust JWT is accepted only from
-  `Proxy-Authorization`.
-- Upstream secrets are fetched server-side, held only in memory with a TTL, and **never logged**
-  (`Secret` has a redacted `Debug` and no `Display`).
-- No request reaches an upstream without a valid, authorized JWT (verified ES256, `iss`, `aud`,
-  `exp`, and scope).
-- Unknown hosts are denied, and passthrough must be enabled explicitly per configured upstream.
-- CONNECT destinations are denied unless their exact origin `host:port` has `allow_connect = true`
-  (opaque) or `intercept_connect = true` (selective TLS interception). The latter requires a named
-  provider scope, exact CONNECT/SNI/Host agreement, and a dedicated egress CA; it cannot be reached
-  with `outbound-audit`. Opaque CONNECT reuses the same JWT verifier, scope names, upstream
-  allowlist, logs, and metrics but never inspects or injects into the encrypted tunnel. The optional
-  audit fallback is the only policy that permits otherwise-unmatched public destinations, and it is
-  always opaque.
-- The issuance server is mTLS-only — unauthenticated clients cannot reach the `/token` endpoint.
-- Scopes are capped at issuance to the per-identity policy; clients cannot self-escalate.
-- The config file contains no plaintext secrets — only secret-manager references. Keep your
-  local `config.toml` out of version control (it is `.gitignore`d).
-
-## Testing
+## Development
 
 ```bash
 cargo test
@@ -655,57 +119,32 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-`tests/jwt_egress.rs` spins the real Pingora service against a mock upstream and asserts:
-- issuance policy + grant decisions (scope coverage, capping, rejection)
-- end-to-end proxy authz with JWT: unknown host → 404, missing/invalid JWT → 401,
-  wrong scope → 403, and on success the upstream received the injected secret with the
-  client JWT stripped and the Host rewritten.
-- GitHub CLI REST rewriting, `token`-scheme JWT auth, bounded GraphQL body replay,
-  repository scope enforcement, credential replacement, and global-query rejection.
-
-`tests/git_cache.rs` spins a real `git http-backend` origin and the full Pingora proxy and asserts:
-- clone through the git-cache upstream populates a local mirror and delivers objects
-- incremental fetch updates the mirror after a new commit is pushed to origin
-- push through the proxy lands on the origin (verified by direct clone from bare origin)
-- unauthorized requests (bad JWT, wrong scope) are rejected before touching the mirror
+Integration tests spin up the real Pingora proxy: `tests/jwt_egress.rs`
+(issuance policy, authz, injection, `gh` compatibility), `tests/git_cache.rs`
+(clone/fetch/push against a real `git http-backend` origin),
+`tests/gcp_workload_identity.rs`, and `tests/kubernetes_examples.rs`
+(validates the example manifests).
 
 ## Project layout
 
 ```
 src/
-  config.rs        # TOML load + validation; [auth], [issuance], per-upstream resource
-  scope.rs         # Scope/ScopeSet parse, permits, covers, grant
-  resource.rs      # ResourceKind, path → Resource extraction
-  github_cli.rs    # gh REST translation + repository-rooted GraphQL validation
-  router.rs        # Host → upstream
-  decision.rs      # route + JWT verify + scope authz (404/401/403 / forward)
-  inject.rs        # per-scheme secret injection
-  jwt.rs           # ES256 Issuer + Verifier (jsonwebtoken)
-  keystore.rs      # KeyMaterial, Keystore (current + previous), JWKS JSON
-  secrets/
-    mod.rs         # SecretProvider trait, redacted Secret, TTL cache
-    gcp.rs         # GCP Secret Manager provider (lazy client)
-    fake.rs        # in-memory provider for tests
-  issuance/
-    mod.rs
-    mtls.rs        # SPIFFE URI SAN extraction from client certs
-    policy.rs      # ClientPolicy: exact/prefix identity → ScopeSet
-    server.rs      # mTLS /token endpoint + plain /.well-known/jwks.json
-  git/
-    mod.rs
-    classify.rs    # classify HTTP path → GitRequest (Read / Push / Other)
-    mirror.rs      # MirrorStore: bare-repo init, path validation, GitError
-    sync.rs        # SyncManager: single-flight git fetch per repo
-    backend.rs     # CGI env builder + cgi-head parser for git http-backend
-  proxy.rs         # ProxyHttp: strip → inject → rewrite Host; git-cache serve/push
-  main.rs          # server bootstrap (proxy + issuance + JWKS + key rotation)
-tests/
-  jwt_egress.rs    # JWT egress e2e
-  git_cache.rs     # git-cache e2e (clone, incremental fetch, push, authz rejection)
+  main.rs          # bootstrap: proxy + issuance + forward proxy + key rotation
+  config.rs        # TOML load + exhaustive startup validation
+  proxy.rs         # Pingora ProxyHttp: route → verify → authorize → inject
+  router.rs        # Host / CONNECT-authority → upstream
+  decision.rs      # JWT verify + scope authz (404/401/403/forward)
+  scope.rs         # scope grammar: parse, permits, covers, grant
+  resource.rs      # path → owner/repo resource extraction
+  jwt.rs           # ES256 issuer + verifier
+  keystore.rs      # current+previous signing keys, JWKS
+  credentials.rs   # static / GitHub App / GCP ADC credential resolution
+  inject.rs        # per-scheme header injection
+  connect.rs       # forward proxy: CONNECT tunnels, DNS policy
+  github_cli.rs    # gh REST translation + bounded GraphQL validation
+  metrics.rs       # Prometheus metrics
+  issuance/        # mTLS /token server, SPIFFE policy, JWKS/health/metrics
+  git/             # smart-HTTP cache: classify, mirror, single-flight sync, CGI
+  mitm/            # selective TLS interception: CA, leaf cache, runtime
+  secrets/         # SecretProvider trait, GCP backend, TTL cache, fake
 ```
-
-## Roadmap
-
-- **Metrics / observability** — Prometheus scrape endpoint; per-upstream latency and error counters.
-- **Hot config reload** — SIGHUP reloads `config.toml` without dropping connections.
-- **Mirror pre-warming** — optional background task to keep mirrors warm before any client request.
