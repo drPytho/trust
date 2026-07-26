@@ -150,7 +150,7 @@ jwks_addr      = "0.0.0.0:8080"
 # Which SPIFFE identity may mint which scopes (exact, or trailing '*' prefix).
 [[issuance.clients]]
 spiffe = "spiffe://example/dev/local"
-allowed_scopes = ["anthropic", "linear", "github:example-org/*", "public-api"]
+allowed_scopes = ["anthropic", "linear", "github-git:example-org/*", "public-api"]
 
 [[upstreams]]
 name = "anthropic"
@@ -183,9 +183,12 @@ origin = "https://api.example.com"
 allow_connect = true
 ```
 
-Scope grammar: `anthropic` or `linear` (whole upstream); `github:owner/repo` (exact repo);
-`github:owner/*` (one wildcard segment — end prefix grants with `/*`). Injection
-schemes: `raw` (verbatim), `bearer` (`Bearer <s>`), `basic` (`Basic base64(s)`).
+Scope grammar: a bare upstream name (`anthropic`, `linear`) covers the whole
+upstream; `<upstream>:owner/repo` matches an exact repo and `<upstream>:owner/*`
+one wildcard segment (end prefix grants with `/*`). The prefix is always the
+configured upstream name. Injection schemes: `raw` (verbatim), `bearer`
+(`Bearer <s>`), `basic` (`Basic base64(s)`). Full reference:
+[CONFIGURATION.md](CONFIGURATION.md).
 
 ## 5. Run
 
@@ -219,7 +222,7 @@ Under the hood that's an mTLS `client_credentials` call; the requested scopes ar
 curl --cert certs/client.crt --key certs/client.key --cacert certs/server.crt \
   https://localhost:8443/token \
   --data-urlencode grant_type=client_credentials \
-  --data-urlencode "scope=anthropic github:example-org/example-repo"
+  --data-urlencode "scope=anthropic github-git:example-org/example-repo"
 # → {"access_token":"<jwt>","token_type":"Bearer","expires_in":604800,"scope":"..."}
 ```
 
@@ -305,7 +308,7 @@ certificate-pinned, HTTP/2, HTTP/3, or unreviewed providers opaque.
 **git smart-HTTP cache:**
 
 ```bash
-JWT=$(./scripts/mint-jwt.sh "github:example-org/example-repo")
+JWT=$(./scripts/mint-jwt.sh "github-git:example-org/example-repo")
 git -c http.extraHeader="Authorization: Bearer $JWT" \
   clone https://github-git.proxy.internal/example-org/example-repo.git
 ```
