@@ -96,7 +96,72 @@ GitHub CLI API endpoint and `git.proxy.internal` as its git-cache companion.
 Configure both names in cluster DNS to resolve to the `trust` Service, and add
 `github.proxy.internal` and `git.proxy.internal` to the reverse-proxy server
 certificate. The example uses an `emptyDir` for git mirrors; replace it with
-persistent storage when cache survival across Pod replacement matters.
+persistent storage when cache survival across Pod replacement matters — see
+[Persistent storage for the git cache](#persistent-storage-for-the-git-cache).
+
+## Persistent storage for the git cache
+
+The `github-git` upstream stores bare mirrors under
+`git = { storage_path = "/var/lib/trust/mirrors" }`, mounted from the
+`git-mirrors` volume. With the example's `emptyDir`, every Pod replacement
+starts with a cold cache and re-clones each repository on first read. To keep
+mirrors across restarts, back the volume with a PersistentVolumeClaim.
+
+Create the claim (pick a `storageClassName` your cluster provides; on GKE the
+default class provisions a zonal PD):
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: trust-git-mirrors
+  namespace: trust-system
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+```
+
+Then change two things in `deployment.yaml`:
+
+```yaml
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate        # see note below
+  template:
+    spec:
+      volumes:
+        - name: git-mirrors
+          persistentVolumeClaim:
+            claimName: trust-git-mirrors
+```
+
+Notes:
+
+- **`strategy: Recreate` is required with `ReadWriteOnce`.** The default
+  RollingUpdate starts the new Pod before terminating the old one; the new Pod
+  cannot attach the RWO volume while the old Pod holds it and the rollout
+  deadlocks. Recreate stops the old Pod first, at the cost of a brief gap the
+  readiness probe already covers.
+- **Do not share one volume between replicas.** trust serialises clones and
+  fetches with in-process locks, so two Pods writing the same mirror directory
+  (e.g. via a ReadWriteMany volume) can corrupt mirrors. If you need more than
+  one replica, convert the Deployment to a StatefulSet with
+  `volumeClaimTemplates` so each Pod gets its own cache; every replica then
+  warms independently.
+- **Sizing and lifecycle.** Mirrors grow with the number of distinct
+  repositories and their object history; there is no TTL or eviction. The
+  cache is disposable — refs are re-fetched on every read — so recovering
+  space is safe: scale the Deployment to zero, delete stale
+  `<upstream>/<owner>/<repo>.git` directories (or the whole volume contents),
+  and scale back up.
+- **Permissions.** The published image runs as root, so the mount works as-is.
+  If you add a `securityContext` with `runAsNonRoot`, also set
+  `fsGroup` (e.g. `fsGroup: 65532`) so the mirror directory is writable by the
+  trust process.
 
 It also includes `linear.proxy.internal` for Linear's GraphQL API. Create a
 Linear personal API key, store it in the referenced `linear-key` Secret Manager
