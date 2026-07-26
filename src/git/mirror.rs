@@ -68,11 +68,8 @@ pub enum GitError {
 pub struct MirrorStore {
     root: PathBuf,
     /// Per-path locks to serialise concurrent first-clones of the same mirror.
-    ///
-    // TODO: entries in this HashMap are never evicted — unbounded small growth
-    // for a long-running proxy mirroring many distinct repos. Future cleanup:
-    // evict entries whose Arc has a strong_count of 1 (no waiters) after the
-    // clone succeeds, or replace with a bounded LRU.
+    /// Entries are evicted at the end of `ensure` once no other task holds a
+    /// clone, so the map stays bounded by in-flight clones.
     locks: Mutex<HashMap<PathBuf, Arc<TokioMutex<()>>>>,
 }
 
@@ -148,8 +145,36 @@ impl MirrorStore {
         };
 
         // Serialise concurrent first-clones for this exact path.
-        let _guard = lock_arc.lock().await;
+        let result = {
+            let _guard = lock_arc.lock().await;
+            self.clone_if_absent(path, clone_url, auth_header).await
+        };
 
+        // Evict the lock entry once no other task holds a clone: the map's Arc +
+        // our `lock_arc` = 2 strong refs. A waiter that re-creates the entry after
+        // eviction re-checks the path on disk, so a duplicate clone cannot happen
+        // after a success; after a failure a retry is acceptable.
+        {
+            let mut map = self.locks.lock().await;
+            if let Some(entry) = map.get(path)
+                && Arc::strong_count(entry) <= 2
+            {
+                map.remove(path);
+            }
+        }
+
+        result
+    }
+
+    /// Body of the locked region: re-check existence, then clone.
+    /// SECURITY: `auth_header` is never written to logs or included in any
+    /// error message or `Debug` output of `GitError`.
+    async fn clone_if_absent(
+        &self,
+        path: &Path,
+        clone_url: &str,
+        auth_header: &str,
+    ) -> Result<(), GitError> {
         // Re-check after acquiring the lock — a prior waiter may have cloned.
         match tokio::fs::metadata(path).await {
             Ok(_) => return Ok(()),
@@ -186,6 +211,11 @@ impl MirrorStore {
         }
 
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn lock_count(&self) -> usize {
+        self.locks.lock().await.len()
     }
 }
 
@@ -313,5 +343,19 @@ mod tests {
         let sample_secret = "ghp_supersecrettoken";
         let display = format!("{err}");
         assert!(!display.contains(sample_secret));
+    }
+
+    #[tokio::test]
+    async fn ensure_evicts_per_path_lock_after_failed_clone() {
+        let tmp = std::env::temp_dir().join(format!("trust-mirror-evict-{}", std::process::id()));
+        let store = MirrorStore::new(&tmp);
+        let path = store.path_for("github.com", "owner", "repo").unwrap();
+        // Nonexistent local origin → git clone fails fast, exercising the lock path.
+        let result = store
+            .ensure(&path, "file:///nonexistent-trust-test-origin", "Basic Zm9v")
+            .await;
+        assert!(matches!(result, Err(GitError::Clone { .. })));
+        assert_eq!(store.lock_count().await, 0, "lock entry must be evicted");
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
     }
 }

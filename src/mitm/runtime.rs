@@ -408,7 +408,7 @@ mod tests {
         UpstreamMode,
     };
     use crate::connect::{ConnectProxy, serve_connect};
-    use crate::credentials::{CredentialError, ResolvedCredential};
+    use crate::credentials::{CredentialError, ResolutionOutcome, ResolvedCredential};
     use crate::jwt::{Issuer as JwtIssuer, Verifier};
     use crate::keystore::{Keystore, build_key_material};
     use crate::router::Router;
@@ -428,7 +428,7 @@ mod tests {
             Ok(ResolvedCredential {
                 secret: Secret::new("trust-injected-key".to_string()),
                 cache_key: None,
-                result: "test",
+                result: ResolutionOutcome::Static,
             })
         }
     }

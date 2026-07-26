@@ -8,7 +8,9 @@ use pingora::prelude::*;
 use trust::config::{
     CredentialSource, Injection, InjectionScheme, Origin, Upstream, UpstreamKind, UpstreamMode,
 };
-use trust::credentials::{CredentialError, CredentialProvider, ResolvedCredential};
+use trust::credentials::{
+    CredentialError, CredentialProvider, ResolutionOutcome, ResolvedCredential,
+};
 use trust::git::mirror::MirrorStore;
 use trust::git::sync::SyncManager;
 use trust::jwt::{Issuer, Verifier};
@@ -43,7 +45,7 @@ impl CredentialProvider for RecordingCredentials {
         Ok(ResolvedCredential {
             secret: Secret::new("INJECTED-INSTALLATION-TOKEN".to_string()),
             cache_key: None,
-            result: "test",
+            result: ResolutionOutcome::Static,
         })
     }
 }

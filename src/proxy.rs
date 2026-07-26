@@ -24,6 +24,7 @@ use crate::keystore::Keystore;
 use crate::metrics::ProxyMetrics;
 use crate::resource::{ResourceKind, extract};
 use crate::router::Router;
+use crate::scope::ScopeSet;
 use crate::secrets::{Secret, SecretProvider};
 
 pub struct RequestCtx {
@@ -74,6 +75,18 @@ struct NpmRewrite {
     to: String,
     buffer_body: bool,
     buffer: Vec<u8>,
+}
+
+/// Outcome of GitHub CLI compatibility routing.
+enum GithubCliRoute {
+    /// A response was already written; propagate as request_filter's return.
+    Responded(bool),
+    /// Continue: authorize against `policy_path`, optionally rewrite the
+    /// upstream request path.
+    Forward {
+        policy_path: String,
+        upstream_path: Option<String>,
+    },
 }
 
 fn rewrite_registry_json(body: &[u8], from: &str, to: &str) -> Result<Vec<u8>, serde_json::Error> {
@@ -238,6 +251,191 @@ impl ProxyService {
             .await?;
         Ok(true)
     }
+
+    /// GitHub CLI treats a custom GH_HOST as an Enterprise host. In the
+    /// explicit compatibility mode, translate its REST prefix and inspect
+    /// bounded GraphQL request bodies before authorizing or minting a token.
+    async fn route_github_cli(
+        &self,
+        session: &mut Session,
+        ctx: &mut RequestCtx,
+        upstream: &Arc<Upstream>,
+        scopes: &ScopeSet,
+        method: &str,
+        original_path: &str,
+    ) -> Result<GithubCliRoute> {
+        if original_path == "/api/v3/meta" {
+            if method != "GET" || scopes.sole_exact_resource(&upstream.name).is_none() {
+                return self
+                    .reject(session, ctx, 403, "forbidden_scope", b"not allowed")
+                    .await
+                    .map(GithubCliRoute::Responded);
+            }
+            return self
+                .respond_github_cli_feature(
+                    session,
+                    ctx,
+                    upstream.clone(),
+                    GITHUB_CLI_META_RESPONSE,
+                )
+                .await
+                .map(GithubCliRoute::Responded);
+        }
+        if is_graphql_path(original_path) {
+            if method != "POST" {
+                return self
+                    .reject(
+                        session,
+                        ctx,
+                        405,
+                        "unsupported_github_graphql",
+                        b"unsupported GitHub GraphQL request",
+                    )
+                    .await
+                    .map(GithubCliRoute::Responded);
+            }
+            if session
+                .req_header()
+                .headers
+                .get("content-length")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<usize>().ok())
+                .is_some_and(|length| length > MAX_GRAPHQL_BODY_BYTES)
+            {
+                return self
+                    .reject(
+                        session,
+                        ctx,
+                        413,
+                        "github_graphql_body_too_large",
+                        b"GitHub GraphQL request too large",
+                    )
+                    .await
+                    .map(GithubCliRoute::Responded);
+            }
+            let mut body = Vec::new();
+            session.as_mut().enable_retry_buffering();
+            loop {
+                match session.read_request_body().await {
+                    Ok(Some(chunk)) => {
+                        if body.len() + chunk.len() > MAX_GRAPHQL_BODY_BYTES {
+                            return self
+                                .reject(
+                                    session,
+                                    ctx,
+                                    413,
+                                    "github_graphql_body_too_large",
+                                    b"GitHub GraphQL request too large",
+                                )
+                                .await
+                                .map(GithubCliRoute::Responded);
+                        }
+                        body.extend_from_slice(&chunk);
+                    }
+                    Ok(None) => break,
+                    Err(_) => {
+                        return self
+                            .reject(
+                                session,
+                                ctx,
+                                400,
+                                "invalid_github_graphql",
+                                b"invalid GitHub GraphQL request",
+                            )
+                            .await
+                            .map(GithubCliRoute::Responded);
+                    }
+                }
+            }
+            let resource = match classify_graphql(&body) {
+                Ok(GithubCliGraphqlOperation::RepositoryQuery(resource)) => resource,
+                Ok(GithubCliGraphqlOperation::IssueFeatureDetection) => {
+                    if scopes.sole_exact_resource(&upstream.name).is_none() {
+                        log::warn!(
+                            "GitHub CLI issue feature detection rejected upstream={} reason=ambiguous_or_wildcard_scope",
+                            upstream.name
+                        );
+                        return self
+                            .reject(session, ctx, 403, "forbidden_scope", b"not allowed")
+                            .await
+                            .map(GithubCliRoute::Responded);
+                    }
+                    return self
+                        .respond_github_cli_feature(
+                            session,
+                            ctx,
+                            upstream.clone(),
+                            GITHUB_CLI_ISSUE_FEATURE_RESPONSE,
+                        )
+                        .await
+                        .map(GithubCliRoute::Responded);
+                }
+                Ok(GithubCliGraphqlOperation::CreatePullRequest) => {
+                    // GitHub only carries an opaque repository node ID in this
+                    // mutation. Bind it to exactly one explicit JWT scope,
+                    // then let both authorization and credential resolution
+                    // enforce that synthesized repository path.
+                    let Some(resource) = scopes.sole_exact_resource(&upstream.name) else {
+                        log::warn!(
+                            "GitHub CLI pull request creation rejected upstream={} reason=ambiguous_or_wildcard_scope",
+                            upstream.name
+                        );
+                        return self
+                            .reject(session, ctx, 403, "forbidden_scope", b"not allowed")
+                            .await
+                            .map(GithubCliRoute::Responded);
+                    };
+                    resource
+                }
+                Err(error) => {
+                    log::warn!(
+                        "GitHub CLI GraphQL request rejected upstream={} reason={error}",
+                        upstream.name
+                    );
+                    return self
+                        .reject(
+                            session,
+                            ctx,
+                            403,
+                            "unsupported_github_graphql",
+                            b"unsupported GitHub GraphQL request",
+                        )
+                        .await
+                        .map(GithubCliRoute::Responded);
+                }
+            };
+            return Ok(GithubCliRoute::Forward {
+                policy_path: format!("/repos/{}/{}", resource.owner, resource.repo),
+                upstream_path: Some("/graphql".to_string()),
+            });
+        }
+        // This route exists for read-oriented gh commands plus the bounded
+        // GraphQL createPullRequest mutation above. Do not turn the
+        // repository-scoped GitHub App token into a general REST write
+        // capability through `gh api -X ...`.
+        if !matches!(method, "GET" | "HEAD") {
+            return self
+                .reject(
+                    session,
+                    ctx,
+                    405,
+                    "unsupported_github_cli_rest_method",
+                    b"unsupported GitHub CLI REST method",
+                )
+                .await
+                .map(GithubCliRoute::Responded);
+        }
+        if let Some(path) = rest_upstream_path(original_path) {
+            return Ok(GithubCliRoute::Forward {
+                policy_path: path.to_string(),
+                upstream_path: Some(path.to_string()),
+            });
+        }
+        Ok(GithubCliRoute::Forward {
+            policy_path: original_path.to_string(),
+            upstream_path: None,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -358,158 +556,23 @@ impl ProxyHttp for ProxyService {
             }
         };
 
-        // GitHub CLI treats a custom GH_HOST as an Enterprise host. In the
-        // explicit compatibility mode, translate its REST prefix and inspect
-        // bounded GraphQL request bodies before authorizing or minting a token.
         let original_path = session.req_header().uri.path().to_string();
         let method = session.req_header().method.as_str().to_string();
         let mut policy_path = original_path.clone();
         let mut upstream_path: Option<String> = None;
-        if github_cli && original_path == "/api/v3/meta" {
-            if method != "GET" || scopes.sole_exact_resource(&upstream.name).is_none() {
-                return self
-                    .reject(session, ctx, 403, "forbidden_scope", b"not allowed")
-                    .await;
-            }
-            return self
-                .respond_github_cli_feature(session, ctx, upstream, GITHUB_CLI_META_RESPONSE)
-                .await;
-        } else if github_cli && is_graphql_path(&original_path) {
-            if method != "POST" {
-                return self
-                    .reject(
-                        session,
-                        ctx,
-                        405,
-                        "unsupported_github_graphql",
-                        b"unsupported GitHub GraphQL request",
-                    )
-                    .await;
-            }
-            if session
-                .req_header()
-                .headers
-                .get("content-length")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<usize>().ok())
-                .is_some_and(|length| length > MAX_GRAPHQL_BODY_BYTES)
+        if github_cli {
+            match self
+                .route_github_cli(session, ctx, &upstream, &scopes, &method, &original_path)
+                .await?
             {
-                return self
-                    .reject(
-                        session,
-                        ctx,
-                        413,
-                        "github_graphql_body_too_large",
-                        b"GitHub GraphQL request too large",
-                    )
-                    .await;
-            }
-            let mut body = Vec::new();
-            session.as_mut().enable_retry_buffering();
-            loop {
-                match session.read_request_body().await {
-                    Ok(Some(chunk)) => {
-                        if body.len() + chunk.len() > MAX_GRAPHQL_BODY_BYTES {
-                            return self
-                                .reject(
-                                    session,
-                                    ctx,
-                                    413,
-                                    "github_graphql_body_too_large",
-                                    b"GitHub GraphQL request too large",
-                                )
-                                .await;
-                        }
-                        body.extend_from_slice(&chunk);
-                    }
-                    Ok(None) => break,
-                    Err(_) => {
-                        return self
-                            .reject(
-                                session,
-                                ctx,
-                                400,
-                                "invalid_github_graphql",
-                                b"invalid GitHub GraphQL request",
-                            )
-                            .await;
-                    }
+                GithubCliRoute::Responded(done) => return Ok(done),
+                GithubCliRoute::Forward {
+                    policy_path: p,
+                    upstream_path: u,
+                } => {
+                    policy_path = p;
+                    upstream_path = u;
                 }
-            }
-            let resource = match classify_graphql(&body) {
-                Ok(GithubCliGraphqlOperation::RepositoryQuery(resource)) => resource,
-                Ok(GithubCliGraphqlOperation::IssueFeatureDetection) => {
-                    if scopes.sole_exact_resource(&upstream.name).is_none() {
-                        log::warn!(
-                            "GitHub CLI issue feature detection rejected upstream={} reason=ambiguous_or_wildcard_scope",
-                            upstream.name
-                        );
-                        return self
-                            .reject(session, ctx, 403, "forbidden_scope", b"not allowed")
-                            .await;
-                    }
-                    return self
-                        .respond_github_cli_feature(
-                            session,
-                            ctx,
-                            upstream,
-                            GITHUB_CLI_ISSUE_FEATURE_RESPONSE,
-                        )
-                        .await;
-                }
-                Ok(GithubCliGraphqlOperation::CreatePullRequest) => {
-                    // GitHub only carries an opaque repository node ID in this
-                    // mutation. Bind it to exactly one explicit JWT scope,
-                    // then let both authorization and credential resolution
-                    // enforce that synthesized repository path.
-                    let Some(resource) = scopes.sole_exact_resource(&upstream.name) else {
-                        log::warn!(
-                            "GitHub CLI pull request creation rejected upstream={} reason=ambiguous_or_wildcard_scope",
-                            upstream.name
-                        );
-                        return self
-                            .reject(session, ctx, 403, "forbidden_scope", b"not allowed")
-                            .await;
-                    };
-                    resource
-                }
-                Err(error) => {
-                    log::warn!(
-                        "GitHub CLI GraphQL request rejected upstream={} reason={error}",
-                        upstream.name
-                    );
-                    return self
-                        .reject(
-                            session,
-                            ctx,
-                            403,
-                            "unsupported_github_graphql",
-                            b"unsupported GitHub GraphQL request",
-                        )
-                        .await;
-                }
-            };
-            policy_path = format!("/repos/{}/{}", resource.owner, resource.repo);
-            upstream_path = Some("/graphql".to_string());
-        } else if github_cli {
-            // This route exists for read-oriented gh commands plus the bounded
-            // GraphQL createPullRequest mutation above. Do not turn the
-            // repository-scoped GitHub App token into a general REST write
-            // capability through `gh api -X ...`.
-            if !matches!(method.as_str(), "GET" | "HEAD") {
-                return self
-                    .reject(
-                        session,
-                        ctx,
-                        405,
-                        "unsupported_github_cli_rest_method",
-                        b"unsupported GitHub CLI REST method",
-                    )
-                    .await;
-            }
-            if let Some(path) = rest_upstream_path(&original_path) {
-                policy_path = path.to_string();
-                upstream_path = Some(path.to_string());
             }
         }
 
@@ -552,7 +615,7 @@ impl ProxyHttp for ProxyService {
                 self.metrics.credential_resolution(
                     &upstream.name,
                     provider,
-                    credential.result,
+                    credential.result.as_str(),
                     credential_started.elapsed().as_secs_f64(),
                 );
                 ctx.secret = Some(credential.secret);
@@ -809,6 +872,58 @@ impl ProxyHttp for ProxyService {
 // git-cache handler
 // ---------------------------------------------------------------------------
 
+/// Buffer the full request body. Returns Err(()) after having logged; the
+/// caller responds 500. SECURITY: body bytes are never logged.
+async fn buffer_request_body(session: &mut Session) -> std::result::Result<Vec<u8>, ()> {
+    let mut body = Vec::new();
+    loop {
+        match session.read_request_body().await {
+            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            Ok(None) => return Ok(body),
+            Err(e) => {
+                log::error!("git-cache: read request body failed: {e}");
+                return Err(());
+            }
+        }
+    }
+}
+
+/// Phase 1: read child stdout until the CGI header terminator, capped at
+/// HEAD_CAP. Ok(Some((status, headers, body_offset, head_buf))) on success;
+/// Ok(None) on EOF-before-terminator or cap exceeded (logged); Err on io
+/// error (logged).
+async fn read_cgi_head(
+    stdout: &mut tokio::process::ChildStdout,
+) -> std::result::Result<Option<(u16, Vec<(String, String)>, usize, Vec<u8>)>, ()> {
+    const HEAD_CAP: usize = 64 * 1024; // 64 KiB head-read limit
+    let mut head_buf: Vec<u8> = Vec::with_capacity(4096);
+    loop {
+        let mut tmp = [0u8; 512];
+        let n = match stdout.read(&mut tmp).await {
+            Ok(n) => n,
+            Err(e) => {
+                log::error!("git-cache: stdout head-read failed: {e}");
+                return Err(());
+            }
+        };
+        if n == 0 {
+            // EOF before finding header terminator.
+            log::error!("git-cache: stdout EOF before CGI header terminator");
+            return Ok(None);
+        }
+        head_buf.extend_from_slice(&tmp[..n]);
+        if head_buf.len() > HEAD_CAP {
+            log::error!("git-cache: CGI head exceeded {HEAD_CAP} bytes without terminator");
+            return Ok(None);
+        }
+        // Parse once per iteration; on success the returned tuple is the
+        // definitive parse — no second call needed after the loop.
+        if let Some((status, headers, body_offset)) = backend::parse_cgi_head(&head_buf) {
+            return Ok(Some((status, headers, body_offset, head_buf)));
+        }
+    }
+}
+
 impl ProxyService {
     async fn handle_git_cache(
         &self,
@@ -1013,20 +1128,15 @@ impl ProxyService {
         // stdout. The ordering constraint is removed entirely.
         //
         // SECURITY: request body bytes are never logged.
-        let mut req_body: Vec<u8> = Vec::new();
-        loop {
-            match session.read_request_body().await {
-                Ok(Some(chunk)) => req_body.extend_from_slice(&chunk),
-                Ok(None) => break,
-                Err(e) => {
-                    log::error!("git-cache: read request body failed: {e}");
-                    session
-                        .respond_error_with_body(500, Bytes::from_static(b"body read error"))
-                        .await?;
-                    return Ok(true);
-                }
+        let req_body = match buffer_request_body(session).await {
+            Ok(body) => body,
+            Err(()) => {
+                session
+                    .respond_error_with_body(500, Bytes::from_static(b"body read error"))
+                    .await?;
+                return Ok(true);
             }
-        }
+        };
 
         // Build CGI env now that we know the actual body length.
         // CONTENT_LENGTH is derived from the buffered bytes — NOT from the client's
@@ -1101,7 +1211,6 @@ impl ProxyService {
         //
         // This ensures we never buffer a full packfile (potentially hundreds of
         // MB) in a Vec<u8>.
-        const HEAD_CAP: usize = 64 * 1024; // 64 KiB head-read limit
         const CHUNK: usize = 64 * 1024; // streaming chunk size
 
         let mut stdout = match child.stdout.take() {
@@ -1117,43 +1226,24 @@ impl ProxyService {
         };
 
         // Phase 1: read until we have the full CGI header block.
-        // The loop break value carries the parsed tuple so we avoid a second parse.
-        let mut head_buf: Vec<u8> = Vec::with_capacity(4096);
-        let (cgi_status, cgi_headers, body_offset) = loop {
-            let mut tmp = [0u8; 512];
-            let n = match stdout.read(&mut tmp).await {
-                Ok(n) => n,
-                Err(e) => {
-                    log::error!("git-cache: stdout head-read failed: {e}");
-                    let _ = child.kill().await;
-                    session
-                        .respond_error_with_body(500, Bytes::from_static(b"backend read error"))
-                        .await?;
-                    return Ok(true);
-                }
-            };
-            if n == 0 {
-                // EOF before finding header terminator.
-                log::error!("git-cache: stdout EOF before CGI header terminator");
+        // The parsed tuple is returned so we avoid a second parse.
+        let (cgi_status, cgi_headers, body_offset, head_buf) = match read_cgi_head(&mut stdout)
+            .await
+        {
+            Ok(Some(parsed)) => parsed,
+            Ok(None) => {
                 let _ = child.kill().await;
                 session
                     .respond_error_with_body(500, Bytes::from_static(b"invalid backend response"))
                     .await?;
                 return Ok(true);
             }
-            head_buf.extend_from_slice(&tmp[..n]);
-            if head_buf.len() > HEAD_CAP {
-                log::error!("git-cache: CGI head exceeded {HEAD_CAP} bytes without terminator");
+            Err(()) => {
                 let _ = child.kill().await;
                 session
-                    .respond_error_with_body(500, Bytes::from_static(b"invalid backend response"))
+                    .respond_error_with_body(500, Bytes::from_static(b"backend read error"))
                     .await?;
                 return Ok(true);
-            }
-            // Parse once per iteration; on success the returned tuple is the
-            // definitive parse — no second call needed after the loop.
-            if let Some(parsed) = backend::parse_cgi_head(&head_buf) {
-                break parsed;
             }
         };
 

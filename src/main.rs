@@ -25,6 +25,16 @@ use trust::router::Router;
 use trust::secrets::gcp::GcpSecretProvider;
 use trust::secrets::{CachingSecretProvider, SecretProvider};
 
+/// Read the [tls] certificate and key PEM files, panicking with a
+/// purpose-specific message on failure (startup is fail-fast by design).
+fn read_tls_material(tls: &trust::config::TlsConfig, purpose: &str) -> (String, String) {
+    let cert = std::fs::read_to_string(&tls.cert_path)
+        .unwrap_or_else(|e| panic!("read {purpose} TLS certificate {}: {e}", tls.cert_path));
+    let key = std::fs::read_to_string(&tls.key_path)
+        .unwrap_or_else(|e| panic!("read {purpose} TLS key {}: {e}", tls.key_path));
+    (cert, key)
+}
+
 fn main() {
     env_logger::init();
 
@@ -74,10 +84,7 @@ fn main() {
 
                 // 3. All fallible issuance setup before signalling ready.
                 let tls_cfg = config.tls.as_ref().expect("validated present");
-                let server_cert = std::fs::read_to_string(&tls_cfg.cert_path)
-                    .expect("issuance needs a server cert (reuse [tls] cert/key)");
-                let server_key = std::fs::read_to_string(&tls_cfg.key_path)
-                    .expect("issuance needs a server key");
+                let (server_cert, server_key) = read_tls_material(tls_cfg, "issuance");
                 let client_ca = std::fs::read_to_string(&config.issuance.client_ca_path)
                     .expect("read client CA");
                 let mtls_cfg = build_mtls_server_config(&server_cert, &server_key, &client_ca)
@@ -169,10 +176,7 @@ fn main() {
             .expect("set forward proxy listener nonblocking");
         let tls = if forward.tls {
             let tls_config = config.tls.as_ref().expect("validated TLS configuration");
-            let certificate = std::fs::read_to_string(&tls_config.cert_path)
-                .expect("read forward proxy TLS certificate");
-            let key =
-                std::fs::read_to_string(&tls_config.key_path).expect("read forward proxy TLS key");
+            let (certificate, key) = read_tls_material(tls_config, "forward proxy");
             Some(
                 build_tls_server_config(&certificate, &key)
                     .expect("build forward proxy TLS configuration"),
