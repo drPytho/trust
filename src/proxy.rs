@@ -872,6 +872,58 @@ impl ProxyHttp for ProxyService {
 // git-cache handler
 // ---------------------------------------------------------------------------
 
+/// Buffer the full request body. Returns Err(()) after having logged; the
+/// caller responds 500. SECURITY: body bytes are never logged.
+async fn buffer_request_body(session: &mut Session) -> std::result::Result<Vec<u8>, ()> {
+    let mut body = Vec::new();
+    loop {
+        match session.read_request_body().await {
+            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            Ok(None) => return Ok(body),
+            Err(e) => {
+                log::error!("git-cache: read request body failed: {e}");
+                return Err(());
+            }
+        }
+    }
+}
+
+/// Phase 1: read child stdout until the CGI header terminator, capped at
+/// HEAD_CAP. Ok(Some((status, headers, body_offset, head_buf))) on success;
+/// Ok(None) on EOF-before-terminator or cap exceeded (logged); Err on io
+/// error (logged).
+async fn read_cgi_head(
+    stdout: &mut tokio::process::ChildStdout,
+) -> std::result::Result<Option<(u16, Vec<(String, String)>, usize, Vec<u8>)>, ()> {
+    const HEAD_CAP: usize = 64 * 1024; // 64 KiB head-read limit
+    let mut head_buf: Vec<u8> = Vec::with_capacity(4096);
+    loop {
+        let mut tmp = [0u8; 512];
+        let n = match stdout.read(&mut tmp).await {
+            Ok(n) => n,
+            Err(e) => {
+                log::error!("git-cache: stdout head-read failed: {e}");
+                return Err(());
+            }
+        };
+        if n == 0 {
+            // EOF before finding header terminator.
+            log::error!("git-cache: stdout EOF before CGI header terminator");
+            return Ok(None);
+        }
+        head_buf.extend_from_slice(&tmp[..n]);
+        if head_buf.len() > HEAD_CAP {
+            log::error!("git-cache: CGI head exceeded {HEAD_CAP} bytes without terminator");
+            return Ok(None);
+        }
+        // Parse once per iteration; on success the returned tuple is the
+        // definitive parse — no second call needed after the loop.
+        if let Some((status, headers, body_offset)) = backend::parse_cgi_head(&head_buf) {
+            return Ok(Some((status, headers, body_offset, head_buf)));
+        }
+    }
+}
+
 impl ProxyService {
     async fn handle_git_cache(
         &self,
@@ -1076,20 +1128,15 @@ impl ProxyService {
         // stdout. The ordering constraint is removed entirely.
         //
         // SECURITY: request body bytes are never logged.
-        let mut req_body: Vec<u8> = Vec::new();
-        loop {
-            match session.read_request_body().await {
-                Ok(Some(chunk)) => req_body.extend_from_slice(&chunk),
-                Ok(None) => break,
-                Err(e) => {
-                    log::error!("git-cache: read request body failed: {e}");
-                    session
-                        .respond_error_with_body(500, Bytes::from_static(b"body read error"))
-                        .await?;
-                    return Ok(true);
-                }
+        let req_body = match buffer_request_body(session).await {
+            Ok(body) => body,
+            Err(()) => {
+                session
+                    .respond_error_with_body(500, Bytes::from_static(b"body read error"))
+                    .await?;
+                return Ok(true);
             }
-        }
+        };
 
         // Build CGI env now that we know the actual body length.
         // CONTENT_LENGTH is derived from the buffered bytes — NOT from the client's
@@ -1164,7 +1211,6 @@ impl ProxyService {
         //
         // This ensures we never buffer a full packfile (potentially hundreds of
         // MB) in a Vec<u8>.
-        const HEAD_CAP: usize = 64 * 1024; // 64 KiB head-read limit
         const CHUNK: usize = 64 * 1024; // streaming chunk size
 
         let mut stdout = match child.stdout.take() {
@@ -1180,43 +1226,24 @@ impl ProxyService {
         };
 
         // Phase 1: read until we have the full CGI header block.
-        // The loop break value carries the parsed tuple so we avoid a second parse.
-        let mut head_buf: Vec<u8> = Vec::with_capacity(4096);
-        let (cgi_status, cgi_headers, body_offset) = loop {
-            let mut tmp = [0u8; 512];
-            let n = match stdout.read(&mut tmp).await {
-                Ok(n) => n,
-                Err(e) => {
-                    log::error!("git-cache: stdout head-read failed: {e}");
-                    let _ = child.kill().await;
-                    session
-                        .respond_error_with_body(500, Bytes::from_static(b"backend read error"))
-                        .await?;
-                    return Ok(true);
-                }
-            };
-            if n == 0 {
-                // EOF before finding header terminator.
-                log::error!("git-cache: stdout EOF before CGI header terminator");
+        // The parsed tuple is returned so we avoid a second parse.
+        let (cgi_status, cgi_headers, body_offset, head_buf) = match read_cgi_head(&mut stdout)
+            .await
+        {
+            Ok(Some(parsed)) => parsed,
+            Ok(None) => {
                 let _ = child.kill().await;
                 session
                     .respond_error_with_body(500, Bytes::from_static(b"invalid backend response"))
                     .await?;
                 return Ok(true);
             }
-            head_buf.extend_from_slice(&tmp[..n]);
-            if head_buf.len() > HEAD_CAP {
-                log::error!("git-cache: CGI head exceeded {HEAD_CAP} bytes without terminator");
+            Err(()) => {
                 let _ = child.kill().await;
                 session
-                    .respond_error_with_body(500, Bytes::from_static(b"invalid backend response"))
+                    .respond_error_with_body(500, Bytes::from_static(b"backend read error"))
                     .await?;
                 return Ok(true);
-            }
-            // Parse once per iteration; on success the returned tuple is the
-            // definitive parse — no second call needed after the loop.
-            if let Some(parsed) = backend::parse_cgi_head(&head_buf) {
-                break parsed;
             }
         };
 
