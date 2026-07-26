@@ -47,6 +47,8 @@ pub enum ConfigError {
     DuplicateGithubOwner(String),
     #[error("invalid allowed method '{method}' on upstream '{upstream}'")]
     BadAllowedMethod { upstream: String, method: String },
+    #[error("invalid allowed path '{path}' on upstream '{upstream}'")]
+    BadAllowedPath { upstream: String, path: String },
     #[error("invalid GitHub App configuration: {0}")]
     BadGithubApp(String),
     #[error("github-app upstream '{0}' requires a GitHub repository resource")]
@@ -59,7 +61,9 @@ pub enum ConfigError {
     GcpAdcNeedsBearer(String),
     #[error("CONNECT upstream '{0}' must use api kind and passthrough mode")]
     ConnectRequiresPassthrough(String),
-    #[error("CONNECT upstream '{0}' cannot configure resource or allowed_methods policies")]
+    #[error(
+        "CONNECT upstream '{0}' cannot configure resource, allowed_methods, or allowed_paths policies"
+    )]
     ConnectPolicyUnsupported(String),
     #[error("CONNECT upstream '{0}' requires a [forward_proxy] listener")]
     ConnectWithoutListener(String),
@@ -195,6 +199,7 @@ pub struct Upstream {
     pub resource: Option<ResourceKind>,
     pub git: Option<GitConfig>,
     pub allowed_methods: Vec<String>,
+    pub allowed_paths: Vec<String>,
     pub allow_connect: bool,
     pub intercept_connect: bool,
 }
@@ -383,6 +388,8 @@ struct RawUpstream {
     git: Option<GitConfig>,
     #[serde(default)]
     allowed_methods: Vec<String>,
+    #[serde(default)]
+    allowed_paths: Vec<String>,
     #[serde(default)]
     allow_connect: bool,
     #[serde(default)]
@@ -645,6 +652,24 @@ impl Config {
                     }
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let allowed_paths = ru
+                .allowed_paths
+                .into_iter()
+                .map(|path| {
+                    if path.is_empty()
+                        || !path.starts_with('/')
+                        || path.contains('?')
+                        || path.contains('#')
+                    {
+                        Err(ConfigError::BadAllowedPath {
+                            upstream: ru.name.clone(),
+                            path,
+                        })
+                    } else {
+                        Ok(path)
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
 
             if ru.allow_connect && ru.intercept_connect {
                 return Err(ConfigError::ConnectModeConflict(ru.name));
@@ -654,7 +679,8 @@ impl Config {
                 if ru.kind != UpstreamKind::Api || ru.mode != UpstreamMode::Passthrough {
                     return Err(ConfigError::ConnectRequiresPassthrough(ru.name));
                 }
-                if ru.resource.is_some() || !allowed_methods.is_empty() {
+                if ru.resource.is_some() || !allowed_methods.is_empty() || !allowed_paths.is_empty()
+                {
                     return Err(ConfigError::ConnectPolicyUnsupported(ru.name));
                 }
                 if raw.forward_proxy.is_none() {
@@ -749,6 +775,7 @@ impl Config {
                 resource: ru.resource.map(|r| r.kind),
                 git: ru.git,
                 allowed_methods,
+                allowed_paths,
                 allow_connect: ru.allow_connect,
                 intercept_connect: ru.intercept_connect,
             }));
@@ -993,6 +1020,44 @@ resource = { kind = "github-repo" }
                 scheme: InjectionScheme::Raw,
             }) if header.eq_ignore_ascii_case("authorization")
         ));
+    }
+
+    #[test]
+    fn parses_exact_allowed_paths() {
+        let configured = GOOD.replace(
+            r#"injection = { header = "x-api-key", scheme = "raw" }"#,
+            r#"injection = { header = "x-api-key", scheme = "raw" }
+allowed_paths = ["/v1/messages", "/v1/models"]"#,
+        );
+        let cfg = Config::from_str(&configured).unwrap();
+
+        assert_eq!(
+            cfg.upstreams[0].allowed_paths,
+            ["/v1/messages", "/v1/models"]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_allowed_paths() {
+        for path in [
+            "",
+            "v1/messages",
+            "/v1/messages?stream=true",
+            "/v1#messages",
+        ] {
+            let configured = GOOD.replace(
+                r#"injection = { header = "x-api-key", scheme = "raw" }"#,
+                &format!(
+                    r#"injection = {{ header = "x-api-key", scheme = "raw" }}
+allowed_paths = ["{path}"]"#
+                ),
+            );
+
+            assert!(matches!(
+                Config::from_str(&configured),
+                Err(ConfigError::BadAllowedPath { .. })
+            ));
+        }
     }
 
     #[test]

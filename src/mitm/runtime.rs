@@ -517,6 +517,7 @@ mod tests {
             resource: None,
             git: None,
             allowed_methods: Vec::new(),
+            allowed_paths: Vec::new(),
             allow_connect: false,
             intercept_connect: true,
         })
@@ -663,6 +664,7 @@ mod tests {
             resource: None,
             git: None,
             allowed_methods: vec!["GET".to_string()],
+            allowed_paths: Vec::new(),
             allow_connect: false,
             intercept_connect: true,
         });

@@ -35,6 +35,11 @@ pub fn authorize(scopes: &ScopeSet, upstream: &Upstream, method: &str, path: &st
     {
         return false;
     }
+    if !upstream.allowed_paths.is_empty()
+        && !upstream.allowed_paths.iter().any(|allowed| allowed == path)
+    {
+        return false;
+    }
     let resource = upstream.resource.and_then(|kind| extract(kind, path));
     let authorization_resource = resource.as_ref().cloned().or_else(|| {
         matches!(
@@ -91,6 +96,7 @@ mod tests {
             resource,
             git: None,
             allowed_methods: Vec::new(),
+            allowed_paths: Vec::new(),
             allow_connect: false,
             intercept_connect: false,
         })
@@ -116,6 +122,20 @@ mod tests {
         assert!(authorize(&s, &up, "POST", "/v1/messages"));
         let s2 = ScopeSet::parse("mistral").unwrap();
         assert!(!authorize(&s2, &up, "POST", "/v1/messages"));
+    }
+
+    #[test]
+    fn authorize_exact_allowed_paths() {
+        let mut up = (*upstream("slack", None)).clone();
+        up.allowed_paths = vec![
+            "/api/conversations.list".into(),
+            "/api/chat.postMessage".into(),
+        ];
+        let scopes = ScopeSet::parse("slack").unwrap();
+
+        assert!(authorize(&scopes, &up, "POST", "/api/chat.postMessage"));
+        assert!(!authorize(&scopes, &up, "POST", "/api/auth.revoke"));
+        assert!(!authorize(&scopes, &up, "POST", "/api/chat.postMessage/"));
     }
 
     #[test]

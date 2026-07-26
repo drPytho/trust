@@ -228,6 +228,7 @@ fn scoped_upstream(mock_port: u16) -> Arc<Upstream> {
         resource: Some(ResourceKind::GithubRepo),
         git: None,
         allowed_methods: Vec::new(),
+        allowed_paths: Vec::new(),
         allow_connect: false,
         intercept_connect: false,
     })
@@ -255,6 +256,7 @@ fn linear_upstream(mock_port: u16) -> Arc<Upstream> {
         resource: None,
         git: None,
         allowed_methods: vec!["POST".into()],
+        allowed_paths: Vec::new(),
         allow_connect: false,
         intercept_connect: false,
     })
@@ -277,6 +279,7 @@ fn passthrough_upstream(mock_port: u16) -> Arc<Upstream> {
         resource: None,
         git: None,
         allowed_methods: vec!["GET".into()],
+        allowed_paths: Vec::new(),
         allow_connect: false,
         intercept_connect: false,
     })

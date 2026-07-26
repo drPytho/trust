@@ -61,6 +61,7 @@ async fn connect_consumes_trust_jwt_and_preserves_google_oauth_token() {
         resource: None,
         git: None,
         allowed_methods: Vec::new(),
+        allowed_paths: Vec::new(),
         allow_connect: true,
         intercept_connect: false,
     });
