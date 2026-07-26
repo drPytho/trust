@@ -492,407 +492,48 @@ impl Config {
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(toml_text: &str) -> Result<Config, ConfigError> {
         let raw: RawConfig = toml::from_str(toml_text)?;
+        let RawConfig {
+            listen,
+            tls,
+            auth,
+            issuance,
+            forward_proxy,
+            github_app,
+            upstreams: raw_upstreams,
+        } = raw;
 
-        let mut names = HashSet::new();
-        let mut hosts = HashSet::new();
-        let mut connect_authorities = HashSet::new();
-        let mut intercepted_connect_routes = 0_usize;
-        let mut upstreams = Vec::with_capacity(raw.upstreams.len());
-        if let Some(github_app) = &raw.github_app {
-            if github_app.app_id == 0 || github_app.private_key_secret_ref.is_empty() {
-                return Err(ConfigError::BadGithubApp(
-                    "app_id and private_key_secret_ref are required".to_string(),
-                ));
-            }
-            let api_base = Url::parse(&github_app.api_base)
-                .map_err(|error| ConfigError::BadGithubApp(format!("invalid api_base: {error}")))?;
-            if !matches!(api_base.scheme(), "http" | "https") || api_base.host_str().is_none() {
-                return Err(ConfigError::BadGithubApp(
-                    "api_base must be an HTTP(S) URL".to_string(),
-                ));
-            }
-            let mut owners = HashSet::new();
-            for installation in &github_app.installations {
-                if installation.installation_id == 0
-                    || !crate::resource::safe_component(&installation.owner)
-                {
-                    return Err(ConfigError::BadGithubApp(format!(
-                        "invalid installation for owner '{}'",
-                        installation.owner
-                    )));
-                }
-                let owner = installation.owner.to_ascii_lowercase();
-                if !owners.insert(owner) {
-                    return Err(ConfigError::DuplicateGithubOwner(
-                        installation.owner.clone(),
-                    ));
-                }
-            }
-        }
-        for ru in raw.upstreams {
-            if !names.insert(ru.name.clone()) {
-                return Err(ConfigError::DuplicateUpstream(ru.name));
-            }
-            if !hosts.insert(ru.listen_host.clone()) {
-                return Err(ConfigError::DuplicateListenHost(ru.listen_host));
-            }
-            let mut origin = parse_origin(&ru.origin)?;
-            let (credential, injection) = match ru.mode {
-                UpstreamMode::Inject => {
-                    let credential = match (ru.secret_ref, ru.credential) {
-                        (Some(secret_ref), None) => CredentialSource::StaticSecret { secret_ref },
-                        (None, Some(credential)) => credential,
-                        _ => return Err(ConfigError::BadCredentialConfig(ru.name)),
-                    };
-                    let injection = ru
-                        .injection
-                        .ok_or_else(|| ConfigError::MissingInjection(ru.name.clone()))?;
-                    (Some(credential), Some(injection))
-                }
-                UpstreamMode::Passthrough => {
-                    if ru.secret_ref.is_some() || ru.credential.is_some() || ru.injection.is_some()
-                    {
-                        return Err(ConfigError::PassthroughConfig(ru.name));
-                    }
-                    (None, None)
-                }
-            };
-            if matches!(credential, Some(CredentialSource::GithubApp { .. }))
-                && raw.github_app.is_none()
-            {
-                return Err(ConfigError::MissingGithubApp(ru.name));
-            }
-            if let Some(CredentialSource::GithubApp { basic_username, .. }) = &credential {
-                if !matches!(
-                    ru.resource,
-                    Some(RawResource {
-                        kind: ResourceKind::GithubRepo
-                            | ResourceKind::GithubCliRepo
-                            | ResourceKind::GitRepo
-                    })
-                ) {
-                    return Err(ConfigError::GithubAppNeedsResource(ru.name));
-                }
-                if basic_username.as_deref().is_some_and(|username| {
-                    username.is_empty()
-                        || username
-                            .bytes()
-                            .any(|byte| byte == b':' || byte.is_ascii_control())
-                }) {
-                    return Err(ConfigError::BadGithubApp(
-                        "basic_username must be a non-empty HTTP Basic username".to_string(),
-                    ));
-                }
-            }
-            if matches!(
-                ru.resource,
-                Some(RawResource {
-                    kind: ResourceKind::GithubCliRepo
-                })
-            ) && (ru.kind != UpstreamKind::Api
-                || ru.mode != UpstreamMode::Inject
-                || !matches!(
-                    credential,
-                    Some(CredentialSource::GithubApp {
-                        basic_username: None,
-                        ..
-                    })
-                )
-                || !matches!(
-                    injection,
-                    Some(Injection {
-                        ref header,
-                        scheme: InjectionScheme::Bearer,
-                    }) if header.eq_ignore_ascii_case("authorization")
-                ))
-            {
-                return Err(ConfigError::BadGithubCliUpstream(ru.name));
-            }
-            if matches!(credential, Some(CredentialSource::GcpAdc { .. }))
-                && !matches!(
-                    injection,
-                    Some(Injection {
-                        ref header,
-                        scheme: InjectionScheme::Bearer,
-                    }) if header.eq_ignore_ascii_case("authorization")
-                )
-            {
-                return Err(ConfigError::GcpAdcNeedsBearer(ru.name));
-            }
-            if let Some(CredentialSource::GcpAdc {
-                rewrite_registry_to: Some(base),
-            }) = &credential
-            {
-                let url = Url::parse(base).map_err(|error| ConfigError::BadOrigin {
-                    url: base.clone(),
-                    reason: format!("invalid rewrite_registry_to: {error}"),
-                })?;
-                if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-                    return Err(ConfigError::BadOrigin {
-                        url: base.clone(),
-                        reason: "rewrite_registry_to must be an HTTP(S) URL".to_string(),
-                    });
-                }
-            }
-            let allowed_methods = ru
-                .allowed_methods
-                .into_iter()
-                .map(|method| {
-                    if method.is_empty()
-                        || !method
-                            .bytes()
-                            .all(|byte| byte.is_ascii_uppercase() || byte == b'-')
-                    {
-                        Err(ConfigError::BadAllowedMethod {
-                            upstream: ru.name.clone(),
-                            method,
-                        })
-                    } else {
-                        Ok(method)
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let allowed_paths = ru
-                .allowed_paths
-                .into_iter()
-                .map(|path| {
-                    if path.is_empty()
-                        || !path.starts_with('/')
-                        || path.contains('?')
-                        || path.contains('#')
-                    {
-                        Err(ConfigError::BadAllowedPath {
-                            upstream: ru.name.clone(),
-                            path,
-                        })
-                    } else {
-                        Ok(path)
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-
-            if ru.allow_connect && ru.intercept_connect {
-                return Err(ConfigError::ConnectModeConflict(ru.name));
-            }
-
-            if ru.allow_connect {
-                if ru.kind != UpstreamKind::Api || ru.mode != UpstreamMode::Passthrough {
-                    return Err(ConfigError::ConnectRequiresPassthrough(ru.name));
-                }
-                if ru.resource.is_some() || !allowed_methods.is_empty() || !allowed_paths.is_empty()
-                {
-                    return Err(ConfigError::ConnectPolicyUnsupported(ru.name));
-                }
-                if raw.forward_proxy.is_none() {
-                    return Err(ConfigError::ConnectWithoutListener(ru.name));
-                }
-                let host =
-                    canonical_connect_host(&origin.host).ok_or_else(|| ConfigError::BadOrigin {
-                        url: ru.origin.clone(),
-                        reason: "CONNECT origin host is empty after canonicalization".to_string(),
-                    })?;
-                origin.host = host.clone();
-                origin.sni = host;
-                let authority = format!("{}:{}", origin.host, origin.port);
-                if !connect_authorities.insert(authority.clone()) {
-                    return Err(ConfigError::DuplicateConnectAuthority(authority));
-                }
-            }
-
-            if ru.intercept_connect {
-                if ru.kind != UpstreamKind::Api || ru.mode != UpstreamMode::Inject || !origin.tls {
-                    return Err(ConfigError::InterceptConnectRequiresInject(ru.name));
-                }
-                if raw
-                    .forward_proxy
-                    .as_ref()
-                    .and_then(|forward| forward.mitm.as_ref())
-                    .is_none()
-                {
-                    return Err(ConfigError::InterceptConnectWithoutMitm(ru.name));
-                }
-                let Some(host) = canonical_intercept_dns_host(&origin.host) else {
-                    return Err(ConfigError::InvalidInterceptHost {
-                        upstream: ru.name,
-                        host: origin.host,
-                    });
-                };
-                if matches!(
-                    &ru.resource,
-                    Some(RawResource {
-                        kind: ResourceKind::GithubCliRepo
-                    })
-                ) || matches!(
-                    &credential,
-                    Some(CredentialSource::GcpAdc {
-                        rewrite_registry_to: Some(_)
-                    })
-                ) {
-                    return Err(ConfigError::InterceptConnectPolicyUnsupported(ru.name));
-                }
-                origin.host = host.clone();
-                origin.sni = host;
-                let authority = format!("{}:{}", origin.host, origin.port);
-                if !connect_authorities.insert(authority.clone()) {
-                    return Err(ConfigError::DuplicateConnectAuthority(authority));
-                }
-                intercepted_connect_routes += 1;
-            }
-
-            // Validate git-cache-specific rules.
-            match ru.kind {
-                UpstreamKind::GitCache => {
-                    if ru.mode == UpstreamMode::Passthrough {
-                        return Err(ConfigError::PassthroughGitCache(ru.name));
-                    }
-                    if ru.git.is_none() {
-                        return Err(ConfigError::MissingGitBlock(ru.name));
-                    }
-                    if !matches!(
-                        ru.resource,
-                        Some(RawResource {
-                            kind: ResourceKind::GitRepo
-                        })
-                    ) {
-                        return Err(ConfigError::GitCacheNeedsGitRepoResource(ru.name));
-                    }
-                }
-                UpstreamKind::Api => {
-                    if ru.git.is_some() {
-                        return Err(ConfigError::UnexpectedGitBlock(ru.name));
-                    }
-                }
-            }
-
-            upstreams.push(Arc::new(Upstream {
-                name: ru.name,
-                kind: ru.kind,
-                listen_host: ru.listen_host,
-                origin,
-                mode: ru.mode,
-                credential,
-                injection,
-                resource: ru.resource.map(|r| r.kind),
-                git: ru.git,
-                allowed_methods,
-                allowed_paths,
-                allow_connect: ru.allow_connect,
-                intercept_connect: ru.intercept_connect,
-            }));
+        if let Some(github_app) = &github_app {
+            validate_github_app(github_app)?;
         }
 
-        let forward_proxy = raw
-            .forward_proxy
-            .map(|forward| {
-                let parse_duration = |value: &str| {
-                    humantime::parse_duration(value)
-                        .ok()
-                        .filter(|duration| !duration.is_zero())
-                        .ok_or_else(|| ConfigError::BadDuration {
-                            value: value.to_string(),
-                        })
-                };
-                let connect_timeout = parse_duration(&forward.connect_timeout)?;
-                let idle_timeout = parse_duration(&forward.idle_timeout)?;
-                let max_tunnel_duration = parse_duration(&forward.max_tunnel_duration)?;
-                let mitm = forward
-                    .mitm
-                    .map(|mitm| {
-                        if mitm.issuer_cert_chain_path.is_empty() || mitm.issuer_key_path.is_empty()
-                        {
-                            return Err(ConfigError::BadForwardProxy(
-                                "mitm issuer_cert_chain_path and issuer_key_path are required"
-                                    .to_string(),
-                            ));
-                        }
-                        let leaf_ttl = parse_duration(&mitm.leaf_ttl)?;
-                        let refresh_before = parse_duration(&mitm.refresh_before)?;
-                        if refresh_before >= leaf_ttl {
-                            return Err(ConfigError::BadForwardProxy(
-                                "mitm refresh_before must be shorter than leaf_ttl".to_string(),
-                            ));
-                        }
-                        let handshake_timeout = parse_duration(&mitm.handshake_timeout)?;
-                        if handshake_timeout > max_tunnel_duration {
-                            return Err(ConfigError::BadForwardProxy(
-                                "mitm handshake_timeout must not exceed max_tunnel_duration"
-                                    .to_string(),
-                            ));
-                        }
-                        if mitm.leaf_cache_capacity == 0 {
-                            return Err(ConfigError::BadForwardProxy(
-                                "mitm leaf_cache_capacity must be greater than zero".to_string(),
-                            ));
-                        }
-                        if mitm.leaf_cache_capacity < intercepted_connect_routes {
-                            return Err(ConfigError::BadForwardProxy(format!(
-                                "mitm leaf_cache_capacity ({}) must cover all {intercepted_connect_routes} intercepted CONNECT routes",
-                                mitm.leaf_cache_capacity
-                            )));
-                        }
-                        Ok::<_, ConfigError>(ForwardProxyMitmConfig {
-                            issuer_cert_chain_path: mitm.issuer_cert_chain_path,
-                            issuer_key_path: mitm.issuer_key_path,
-                            leaf_ttl,
-                            refresh_before,
-                            leaf_cache_capacity: mitm.leaf_cache_capacity,
-                            handshake_timeout,
-                        })
-                    })
-                    .transpose()?;
-                if let Some(audit) = &forward.audit_unmatched {
-                    if audit.scope.is_empty()
-                        || !audit.scope.bytes().all(|byte| {
-                            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
-                        })
-                    {
-                        return Err(ConfigError::BadForwardProxy(
-                            "audit_unmatched.scope must be a bare scope name containing only letters, numbers, '.', '-', or '_'"
-                                .to_string(),
-                        ));
-                    }
-                    if names.contains(&audit.scope) {
-                        return Err(ConfigError::BadForwardProxy(format!(
-                            "audit_unmatched.scope '{}' must not reuse a configured upstream name",
-                            audit.scope
-                        )));
-                    }
-                    if names.contains(AUDIT_UNMATCHED_METRICS_NAME) {
-                        return Err(ConfigError::BadForwardProxy(
-                            "upstream name 'audit-unmatched' is reserved while audit_unmatched is enabled"
-                                .to_string(),
-                        ));
-                    }
-                }
-                Ok::<_, ConfigError>(ForwardProxyConfig {
-                    addr: forward.addr,
-                    tls: forward.tls,
-                    connect_timeout,
-                    idle_timeout,
-                    max_tunnel_duration,
-                    max_concurrent_tunnels: if forward.max_concurrent_tunnels == 0 {
-                        return Err(ConfigError::BadForwardProxy(
-                            "max_concurrent_tunnels must be greater than zero".to_string(),
-                        ));
-                    } else {
-                        forward.max_concurrent_tunnels
-                    },
-                    allow_private_ips: forward.allow_private_ips,
-                    audit_unmatched: forward.audit_unmatched,
-                    mitm,
-                })
-            })
+        let mut v = UpstreamValidation {
+            github_app: github_app.as_ref(),
+            forward_proxy: forward_proxy.as_ref(),
+            names: HashSet::new(),
+            hosts: HashSet::new(),
+            connect_authorities: HashSet::new(),
+            intercepted_connect_routes: 0,
+        };
+        let mut upstreams = Vec::with_capacity(raw_upstreams.len());
+        for ru in raw_upstreams {
+            upstreams.push(validate_upstream(ru, &mut v)?);
+        }
+
+        let names = v.names;
+        let intercepted_connect_routes = v.intercepted_connect_routes;
+        let forward_proxy = forward_proxy
+            .map(|forward| build_forward_proxy(forward, &names, intercepted_connect_routes))
             .transpose()?;
 
         // Parse token TTL.
-        let token_ttl = humantime::parse_duration(&raw.auth.signing.token_ttl).map_err(|_| {
+        let token_ttl = humantime::parse_duration(&auth.signing.token_ttl).map_err(|_| {
             ConfigError::BadDuration {
-                value: raw.auth.signing.token_ttl.clone(),
+                value: auth.signing.token_ttl.clone(),
             }
         })?;
 
         // Validate issuance client scopes.
-        for c in &raw.issuance.clients {
+        for c in &issuance.clients {
             for s in &c.allowed_scopes {
                 crate::scope::Scope::parse(s)
                     .map_err(|_| ConfigError::BadScope { scope: s.clone() })?;
@@ -900,31 +541,422 @@ impl Config {
         }
 
         // [tls] is required because issuance reuses it for the mTLS server cert/key.
-        if raw.tls.is_none() {
+        if tls.is_none() {
             return Err(ConfigError::MissingTls);
         }
 
         let auth = AuthConfig {
-            issuer: raw.auth.issuer,
-            audience: raw.auth.audience,
+            issuer: auth.issuer,
+            audience: auth.audience,
             signing: SigningConfig {
-                algorithm: raw.auth.signing.algorithm,
+                algorithm: auth.signing.algorithm,
                 token_ttl,
-                key_secret_ref: raw.auth.signing.key_secret_ref,
-                previous_key_secret_ref: raw.auth.signing.previous_key_secret_ref,
+                key_secret_ref: auth.signing.key_secret_ref,
+                previous_key_secret_ref: auth.signing.previous_key_secret_ref,
             },
         };
 
         Ok(Config {
-            listen: raw.listen,
-            tls: raw.tls,
+            listen,
+            tls,
             auth,
-            issuance: raw.issuance,
+            issuance,
             forward_proxy,
-            github_app: raw.github_app,
+            github_app,
             upstreams,
         })
     }
+}
+
+fn validate_github_app(github_app: &GithubAppConfig) -> Result<(), ConfigError> {
+    if github_app.app_id == 0 || github_app.private_key_secret_ref.is_empty() {
+        return Err(ConfigError::BadGithubApp(
+            "app_id and private_key_secret_ref are required".to_string(),
+        ));
+    }
+    let api_base = Url::parse(&github_app.api_base)
+        .map_err(|error| ConfigError::BadGithubApp(format!("invalid api_base: {error}")))?;
+    if !matches!(api_base.scheme(), "http" | "https") || api_base.host_str().is_none() {
+        return Err(ConfigError::BadGithubApp(
+            "api_base must be an HTTP(S) URL".to_string(),
+        ));
+    }
+    let mut owners = HashSet::new();
+    for installation in &github_app.installations {
+        if installation.installation_id == 0
+            || !crate::resource::safe_component(&installation.owner)
+        {
+            return Err(ConfigError::BadGithubApp(format!(
+                "invalid installation for owner '{}'",
+                installation.owner
+            )));
+        }
+        let owner = installation.owner.to_ascii_lowercase();
+        if !owners.insert(owner) {
+            return Err(ConfigError::DuplicateGithubOwner(
+                installation.owner.clone(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Mutable accumulator threaded through per-upstream validation.
+struct UpstreamValidation<'a> {
+    github_app: Option<&'a GithubAppConfig>,
+    forward_proxy: Option<&'a RawForwardProxyConfig>,
+    names: HashSet<String>,
+    hosts: HashSet<String>,
+    connect_authorities: HashSet<String>,
+    intercepted_connect_routes: usize,
+}
+
+fn validate_upstream(
+    ru: RawUpstream,
+    v: &mut UpstreamValidation<'_>,
+) -> Result<Arc<Upstream>, ConfigError> {
+    if !v.names.insert(ru.name.clone()) {
+        return Err(ConfigError::DuplicateUpstream(ru.name));
+    }
+    if !v.hosts.insert(ru.listen_host.clone()) {
+        return Err(ConfigError::DuplicateListenHost(ru.listen_host));
+    }
+    let mut origin = parse_origin(&ru.origin)?;
+    let (credential, injection) = match ru.mode {
+        UpstreamMode::Inject => {
+            let credential = match (ru.secret_ref, ru.credential) {
+                (Some(secret_ref), None) => CredentialSource::StaticSecret { secret_ref },
+                (None, Some(credential)) => credential,
+                _ => return Err(ConfigError::BadCredentialConfig(ru.name)),
+            };
+            let injection = ru
+                .injection
+                .ok_or_else(|| ConfigError::MissingInjection(ru.name.clone()))?;
+            (Some(credential), Some(injection))
+        }
+        UpstreamMode::Passthrough => {
+            if ru.secret_ref.is_some() || ru.credential.is_some() || ru.injection.is_some() {
+                return Err(ConfigError::PassthroughConfig(ru.name));
+            }
+            (None, None)
+        }
+    };
+    if matches!(credential, Some(CredentialSource::GithubApp { .. })) && v.github_app.is_none() {
+        return Err(ConfigError::MissingGithubApp(ru.name));
+    }
+    if let Some(CredentialSource::GithubApp { basic_username, .. }) = &credential {
+        if !matches!(
+            ru.resource,
+            Some(RawResource {
+                kind: ResourceKind::GithubRepo
+                    | ResourceKind::GithubCliRepo
+                    | ResourceKind::GitRepo
+            })
+        ) {
+            return Err(ConfigError::GithubAppNeedsResource(ru.name));
+        }
+        if basic_username.as_deref().is_some_and(|username| {
+            username.is_empty()
+                || username
+                    .bytes()
+                    .any(|byte| byte == b':' || byte.is_ascii_control())
+        }) {
+            return Err(ConfigError::BadGithubApp(
+                "basic_username must be a non-empty HTTP Basic username".to_string(),
+            ));
+        }
+    }
+    if matches!(
+        ru.resource,
+        Some(RawResource {
+            kind: ResourceKind::GithubCliRepo
+        })
+    ) && (ru.kind != UpstreamKind::Api
+        || ru.mode != UpstreamMode::Inject
+        || !matches!(
+            credential,
+            Some(CredentialSource::GithubApp {
+                basic_username: None,
+                ..
+            })
+        )
+        || !matches!(
+            injection,
+            Some(Injection {
+                ref header,
+                scheme: InjectionScheme::Bearer,
+            }) if header.eq_ignore_ascii_case("authorization")
+        ))
+    {
+        return Err(ConfigError::BadGithubCliUpstream(ru.name));
+    }
+    if matches!(credential, Some(CredentialSource::GcpAdc { .. }))
+        && !matches!(
+            injection,
+            Some(Injection {
+                ref header,
+                scheme: InjectionScheme::Bearer,
+            }) if header.eq_ignore_ascii_case("authorization")
+        )
+    {
+        return Err(ConfigError::GcpAdcNeedsBearer(ru.name));
+    }
+    if let Some(CredentialSource::GcpAdc {
+        rewrite_registry_to: Some(base),
+    }) = &credential
+    {
+        let url = Url::parse(base).map_err(|error| ConfigError::BadOrigin {
+            url: base.clone(),
+            reason: format!("invalid rewrite_registry_to: {error}"),
+        })?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            return Err(ConfigError::BadOrigin {
+                url: base.clone(),
+                reason: "rewrite_registry_to must be an HTTP(S) URL".to_string(),
+            });
+        }
+    }
+    let allowed_methods = ru
+        .allowed_methods
+        .into_iter()
+        .map(|method| {
+            if method.is_empty()
+                || !method
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte == b'-')
+            {
+                Err(ConfigError::BadAllowedMethod {
+                    upstream: ru.name.clone(),
+                    method,
+                })
+            } else {
+                Ok(method)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let allowed_paths = ru
+        .allowed_paths
+        .into_iter()
+        .map(|path| {
+            if path.is_empty() || !path.starts_with('/') || path.contains('?') || path.contains('#')
+            {
+                Err(ConfigError::BadAllowedPath {
+                    upstream: ru.name.clone(),
+                    path,
+                })
+            } else {
+                Ok(path)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if ru.allow_connect && ru.intercept_connect {
+        return Err(ConfigError::ConnectModeConflict(ru.name));
+    }
+
+    if ru.allow_connect {
+        if ru.kind != UpstreamKind::Api || ru.mode != UpstreamMode::Passthrough {
+            return Err(ConfigError::ConnectRequiresPassthrough(ru.name));
+        }
+        if ru.resource.is_some() || !allowed_methods.is_empty() || !allowed_paths.is_empty() {
+            return Err(ConfigError::ConnectPolicyUnsupported(ru.name));
+        }
+        if v.forward_proxy.is_none() {
+            return Err(ConfigError::ConnectWithoutListener(ru.name));
+        }
+        let host = canonical_connect_host(&origin.host).ok_or_else(|| ConfigError::BadOrigin {
+            url: ru.origin.clone(),
+            reason: "CONNECT origin host is empty after canonicalization".to_string(),
+        })?;
+        origin.host = host.clone();
+        origin.sni = host;
+        let authority = format!("{}:{}", origin.host, origin.port);
+        if !v.connect_authorities.insert(authority.clone()) {
+            return Err(ConfigError::DuplicateConnectAuthority(authority));
+        }
+    }
+
+    if ru.intercept_connect {
+        if ru.kind != UpstreamKind::Api || ru.mode != UpstreamMode::Inject || !origin.tls {
+            return Err(ConfigError::InterceptConnectRequiresInject(ru.name));
+        }
+        if v.forward_proxy
+            .as_ref()
+            .and_then(|forward| forward.mitm.as_ref())
+            .is_none()
+        {
+            return Err(ConfigError::InterceptConnectWithoutMitm(ru.name));
+        }
+        let Some(host) = canonical_intercept_dns_host(&origin.host) else {
+            return Err(ConfigError::InvalidInterceptHost {
+                upstream: ru.name,
+                host: origin.host,
+            });
+        };
+        if matches!(
+            &ru.resource,
+            Some(RawResource {
+                kind: ResourceKind::GithubCliRepo
+            })
+        ) || matches!(
+            &credential,
+            Some(CredentialSource::GcpAdc {
+                rewrite_registry_to: Some(_)
+            })
+        ) {
+            return Err(ConfigError::InterceptConnectPolicyUnsupported(ru.name));
+        }
+        origin.host = host.clone();
+        origin.sni = host;
+        let authority = format!("{}:{}", origin.host, origin.port);
+        if !v.connect_authorities.insert(authority.clone()) {
+            return Err(ConfigError::DuplicateConnectAuthority(authority));
+        }
+        v.intercepted_connect_routes += 1;
+    }
+
+    // Validate git-cache-specific rules.
+    match ru.kind {
+        UpstreamKind::GitCache => {
+            if ru.mode == UpstreamMode::Passthrough {
+                return Err(ConfigError::PassthroughGitCache(ru.name));
+            }
+            if ru.git.is_none() {
+                return Err(ConfigError::MissingGitBlock(ru.name));
+            }
+            if !matches!(
+                ru.resource,
+                Some(RawResource {
+                    kind: ResourceKind::GitRepo
+                })
+            ) {
+                return Err(ConfigError::GitCacheNeedsGitRepoResource(ru.name));
+            }
+        }
+        UpstreamKind::Api => {
+            if ru.git.is_some() {
+                return Err(ConfigError::UnexpectedGitBlock(ru.name));
+            }
+        }
+    }
+
+    Ok(Arc::new(Upstream {
+        name: ru.name,
+        kind: ru.kind,
+        listen_host: ru.listen_host,
+        origin,
+        mode: ru.mode,
+        credential,
+        injection,
+        resource: ru.resource.map(|r| r.kind),
+        git: ru.git,
+        allowed_methods,
+        allowed_paths,
+        allow_connect: ru.allow_connect,
+        intercept_connect: ru.intercept_connect,
+    }))
+}
+
+fn build_forward_proxy(
+    forward: RawForwardProxyConfig,
+    names: &HashSet<String>,
+    intercepted_connect_routes: usize,
+) -> Result<ForwardProxyConfig, ConfigError> {
+    let parse_duration = |value: &str| {
+        humantime::parse_duration(value)
+            .ok()
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(|| ConfigError::BadDuration {
+                value: value.to_string(),
+            })
+    };
+    let connect_timeout = parse_duration(&forward.connect_timeout)?;
+    let idle_timeout = parse_duration(&forward.idle_timeout)?;
+    let max_tunnel_duration = parse_duration(&forward.max_tunnel_duration)?;
+    let mitm = forward
+        .mitm
+        .map(|mitm| {
+            if mitm.issuer_cert_chain_path.is_empty() || mitm.issuer_key_path.is_empty() {
+                return Err(ConfigError::BadForwardProxy(
+                    "mitm issuer_cert_chain_path and issuer_key_path are required".to_string(),
+                ));
+            }
+            let leaf_ttl = parse_duration(&mitm.leaf_ttl)?;
+            let refresh_before = parse_duration(&mitm.refresh_before)?;
+            if refresh_before >= leaf_ttl {
+                return Err(ConfigError::BadForwardProxy(
+                    "mitm refresh_before must be shorter than leaf_ttl".to_string(),
+                ));
+            }
+            let handshake_timeout = parse_duration(&mitm.handshake_timeout)?;
+            if handshake_timeout > max_tunnel_duration {
+                return Err(ConfigError::BadForwardProxy(
+                    "mitm handshake_timeout must not exceed max_tunnel_duration".to_string(),
+                ));
+            }
+            if mitm.leaf_cache_capacity == 0 {
+                return Err(ConfigError::BadForwardProxy(
+                    "mitm leaf_cache_capacity must be greater than zero".to_string(),
+                ));
+            }
+            if mitm.leaf_cache_capacity < intercepted_connect_routes {
+                return Err(ConfigError::BadForwardProxy(format!(
+                    "mitm leaf_cache_capacity ({}) must cover all {intercepted_connect_routes} intercepted CONNECT routes",
+                    mitm.leaf_cache_capacity
+                )));
+            }
+            Ok::<_, ConfigError>(ForwardProxyMitmConfig {
+                issuer_cert_chain_path: mitm.issuer_cert_chain_path,
+                issuer_key_path: mitm.issuer_key_path,
+                leaf_ttl,
+                refresh_before,
+                leaf_cache_capacity: mitm.leaf_cache_capacity,
+                handshake_timeout,
+            })
+        })
+        .transpose()?;
+    if let Some(audit) = &forward.audit_unmatched {
+        if audit.scope.is_empty()
+            || !audit
+                .scope
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err(ConfigError::BadForwardProxy(
+                "audit_unmatched.scope must be a bare scope name containing only letters, numbers, '.', '-', or '_'"
+                    .to_string(),
+            ));
+        }
+        if names.contains(&audit.scope) {
+            return Err(ConfigError::BadForwardProxy(format!(
+                "audit_unmatched.scope '{}' must not reuse a configured upstream name",
+                audit.scope
+            )));
+        }
+        if names.contains(AUDIT_UNMATCHED_METRICS_NAME) {
+            return Err(ConfigError::BadForwardProxy(
+                "upstream name 'audit-unmatched' is reserved while audit_unmatched is enabled"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(ForwardProxyConfig {
+        addr: forward.addr,
+        tls: forward.tls,
+        connect_timeout,
+        idle_timeout,
+        max_tunnel_duration,
+        max_concurrent_tunnels: if forward.max_concurrent_tunnels == 0 {
+            return Err(ConfigError::BadForwardProxy(
+                "max_concurrent_tunnels must be greater than zero".to_string(),
+            ));
+        } else {
+            forward.max_concurrent_tunnels
+        },
+        allow_private_ips: forward.allow_private_ips,
+        audit_unmatched: forward.audit_unmatched,
+        mitm,
+    })
 }
 
 #[cfg(test)]
