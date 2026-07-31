@@ -122,6 +122,31 @@ fn raw_json_request(
     (status, resp)
 }
 
+fn raw_json_rest_request(
+    proxy_port: u16,
+    host: &str,
+    method: &str,
+    path: &str,
+    authorization: &str,
+    body: &str,
+) -> (u16, String) {
+    let mut stream = TcpStream::connect(("127.0.0.1", proxy_port)).unwrap();
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: {authorization}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(req.as_bytes()).unwrap();
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).unwrap();
+    let status = resp
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(0);
+    (status, resp)
+}
+
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -492,7 +517,7 @@ fn linear_personal_api_key_is_injected_verbatim() {
 }
 
 #[test]
-fn github_cli_pr_creation_is_scoped_and_handles_enterprise_preflights() {
+fn github_cli_repository_capabilities_are_bounded_and_scoped() {
     let (mock_port, upstream_reqs) = start_mock_upstream();
     let keystore = Arc::new(Keystore::new());
     keystore.store(build_key_material(&signing_key_pem(), None).unwrap());
@@ -573,6 +598,130 @@ fn github_cli_pr_creation_is_scoped_and_handles_enterprise_preflights() {
         .0,
         403
     );
+
+    // `gh label create --force` first creates the repository label, then
+    // updates it when GitHub reports that the name already exists. Both
+    // writes remain bound to the repository extracted from the path.
+    let create_label = serde_json::json!({
+        "name": "auto-merge-allowed",
+        "color": "1f883d",
+        "description": "Allows policy-driven auto merge"
+    })
+    .to_string();
+    assert_eq!(
+        raw_json_rest_request(
+            proxy_port,
+            "github-cli.test",
+            "POST",
+            "/api/v3/repos/example-org/example-repo/labels",
+            &format!("token {token}"),
+            &create_label,
+        )
+        .0,
+        200
+    );
+    let update_label = serde_json::json!({
+        "color": "1f883d",
+        "description": "Allows policy-driven auto merge"
+    })
+    .to_string();
+    assert_eq!(
+        raw_json_rest_request(
+            proxy_port,
+            "github-cli.test",
+            "PATCH",
+            "/api/v3/repos/example-org/example-repo/labels/auto-merge-allowed",
+            &format!("token {token}"),
+            &update_label,
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        raw_json_rest_request(
+            proxy_port,
+            "github-cli.test",
+            "POST",
+            "/api/v3/repos/example-org/other/labels",
+            &format!("token {token}"),
+            &create_label,
+        )
+        .0,
+        403
+    );
+    assert_eq!(
+        raw_json_rest_request(
+            proxy_port,
+            "github-cli.test",
+            "PATCH",
+            "/api/v3/repos/example-org/example-repo/labels/auto-merge-allowed",
+            &format!("token {token}"),
+            r#"{"new_name":"renamed"}"#,
+        )
+        .0,
+        400
+    );
+
+    // Sandbox review automation uses both a top-level issue/PR comment and
+    // the dedicated inline review-comment reply endpoint.
+    let comment_body = r#"{"body":"Fixed in abc123"}"#;
+    assert_eq!(
+        raw_json_rest_request(
+            proxy_port,
+            "github-cli.test",
+            "POST",
+            "/api/v3/repos/example-org/example-repo/issues/42/comments",
+            &format!("token {token}"),
+            comment_body,
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        raw_json_rest_request(
+            proxy_port,
+            "github-cli.test",
+            "POST",
+            "/api/v3/repos/example-org/example-repo/pulls/42/comments/99/replies",
+            &format!("token {token}"),
+            comment_body,
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        raw_json_rest_request(
+            proxy_port,
+            "github-cli.test",
+            "POST",
+            "/api/v3/repos/example-org/other/issues/42/comments",
+            &format!("token {token}"),
+            comment_body,
+        )
+        .0,
+        403
+    );
+
+    // CI inspection is read-only. These representative list, jobs, and log
+    // endpoints exercise the paths used by `gh run list/view` and `gh pr checks`.
+    for path in [
+        "/api/v3/repos/example-org/example-repo/actions/runs",
+        "/api/v3/repos/example-org/example-repo/actions/runs/123/jobs",
+        "/api/v3/repos/example-org/example-repo/actions/jobs/456/logs",
+    ] {
+        assert_eq!(
+            raw_request_with_authorization(
+                proxy_port,
+                "github-cli.test",
+                path,
+                &format!("token {token}"),
+            )
+            .0,
+            200,
+            "{path}"
+        );
+    }
+
     // The GitHub CLI route does not expose arbitrary REST writes, even when
     // the GitHub App itself has pull-request/content write permissions.
     assert_eq!(
@@ -592,6 +741,28 @@ fn github_cli_pr_creation_is_scoped_and_handles_enterprise_preflights() {
             "github-cli.test",
             "PUT",
             "/api/v3/repos/example-org/example-repo/contents/unexpected.txt",
+            &format!("token {token}"),
+        )
+        .0,
+        405
+    );
+    assert_eq!(
+        raw_request_with_method_and_authorization(
+            proxy_port,
+            "github-cli.test",
+            "POST",
+            "/api/v3/repos/example-org/example-repo/actions/workflows/ci.yml/dispatches",
+            &format!("token {token}"),
+        )
+        .0,
+        405
+    );
+    assert_eq!(
+        raw_request_with_method_and_authorization(
+            proxy_port,
+            "github-cli.test",
+            "DELETE",
+            "/api/v3/repos/example-org/example-repo/issues/comments/99",
             &format!("token {token}"),
         )
         .0,
@@ -650,6 +821,44 @@ fn github_cli_pr_creation_is_scoped_and_handles_enterprise_preflights() {
         )
         .0,
         403
+    );
+
+    let pull_request_fields = serde_json::json!({
+        "query": "query PullRequest_fields { PullRequest: __type(name: \"PullRequest\") { fields(includeDeprecated: true) { name } } StatusCheckRollupContextConnection: __type(name: \"StatusCheckRollupContextConnection\") { fields(includeDeprecated: true) { name } } }",
+        "variables": {}
+    })
+    .to_string();
+    let pull_request_feature_response = raw_json_request(
+        proxy_port,
+        "github-cli.test",
+        "/api/graphql",
+        "token",
+        &token,
+        &pull_request_fields,
+    );
+    assert_eq!(pull_request_feature_response.0, 200);
+    assert!(pull_request_feature_response.1.contains(
+        r#"{"data":{"PullRequest":{"fields":[]},"StatusCheckRollupContextConnection":{"fields":[]}}}"#
+    ));
+
+    let workflow_run_fields = serde_json::json!({
+        "query": "query PullRequest_fields2 { WorkflowRun: __type(name: \"WorkflowRun\") { fields(includeDeprecated: true) { name } } }",
+        "variables": {}
+    })
+    .to_string();
+    let workflow_run_feature_response = raw_json_request(
+        proxy_port,
+        "github-cli.test",
+        "/api/graphql",
+        "token",
+        &token,
+        &workflow_run_fields,
+    );
+    assert_eq!(workflow_run_feature_response.0, 200);
+    assert!(
+        workflow_run_feature_response
+            .1
+            .contains(r#"{"data":{"WorkflowRun":{"fields":[]}}}"#)
     );
 
     let graphql = serde_json::json!({
@@ -711,6 +920,181 @@ fn github_cli_pr_creation_is_scoped_and_handles_enterprise_preflights() {
         403
     );
 
+    // `gh pr edit --add-label/--remove-label` uses these two bounded
+    // mutations. Their opaque node IDs are authorized through the sole exact
+    // repository scope and the repository-restricted installation token.
+    let add_labels = serde_json::json!({
+        "query": "mutation LabelAdd($input: AddLabelsToLabelableInput!) { addLabelsToLabelable(input: $input) { __typename } }",
+        "variables": {
+            "input": {
+                "labelableId": "PR_kwDOExample",
+                "labelIds": ["LA_kwDOAllowed", "LA_kwDOHead"]
+            }
+        }
+    })
+    .to_string();
+    assert_eq!(
+        raw_json_request(
+            proxy_port,
+            "github-cli.test",
+            "/api/graphql",
+            "token",
+            &token,
+            &add_labels,
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        raw_json_request(
+            proxy_port,
+            "github-cli.test",
+            "/api/graphql",
+            "token",
+            &wildcard_token,
+            &add_labels,
+        )
+        .0,
+        403
+    );
+
+    let remove_labels = serde_json::json!({
+        "query": "mutation LabelRemove($input: RemoveLabelsFromLabelableInput!) { removeLabelsFromLabelable(input: $input) { __typename } }",
+        "variables": {
+            "input": {
+                "labelableId": "PR_kwDOExample",
+                "labelIds": ["LA_kwDOStale"]
+            }
+        }
+    })
+    .to_string();
+    assert_eq!(
+        raw_json_request(
+            proxy_port,
+            "github-cli.test",
+            "/api/graphql",
+            "token",
+            &token,
+            &remove_labels,
+        )
+        .0,
+        200
+    );
+
+    // `gh pr checks` uses a bounded node query after its local feature probes.
+    // The opaque PR ID is accepted only with one exact repository scope.
+    let status_checks = serde_json::json!({
+        "query": "query PullRequestStatusChecks($id: ID!, $endCursor: String) { node(id: $id) { ... on PullRequest { statusCheckRollup: commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100, after: $endCursor) { nodes { __typename ... on StatusContext { context state targetUrl createdAt description isRequired(pullRequestId: $id) } ... on CheckRun { name checkSuite { workflowRun { workflow { name } } } status conclusion startedAt completedAt detailsUrl isRequired(pullRequestId: $id) } } pageInfo { hasNextPage endCursor } } } } } } } } }",
+        "variables": {"id": "PR_kwDOExample", "endCursor": null}
+    })
+    .to_string();
+    assert_eq!(
+        raw_json_request(
+            proxy_port,
+            "github-cli.test",
+            "/api/graphql",
+            "token",
+            &token,
+            &status_checks,
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        raw_json_request(
+            proxy_port,
+            "github-cli.test",
+            "/api/graphql",
+            "token",
+            &wildcard_token,
+            &status_checks,
+        )
+        .0,
+        403
+    );
+
+    // Non-governance PR authoring is bounded to title/body edits, marking a
+    // draft ready, and adding a discussion comment.
+    let update_pull_request = serde_json::json!({
+        "query": "mutation PullRequestUpdate($input: UpdatePullRequestInput!) { updatePullRequest(input: $input) { pullRequest { id } } }",
+        "variables": {"input": {
+            "pullRequestId": "PR_kwDOExample",
+            "title": "Updated title",
+            "body": "Updated body"
+        }}
+    })
+    .to_string();
+    let mark_ready = serde_json::json!({
+        "query": "mutation PullRequestReadyForReview($input: MarkPullRequestReadyForReviewInput!) { markPullRequestReadyForReview(input: $input) { pullRequest { id } } }",
+        "variables": {"input": {"pullRequestId": "PR_kwDOExample"}}
+    })
+    .to_string();
+    let add_comment = serde_json::json!({
+        "query": "mutation CommentCreate($input: AddCommentInput!) { addComment(input: $input) { commentEdge { node { url } } } }",
+        "variables": {"input": {
+            "subjectId": "PR_kwDOExample",
+            "body": "Review follow-up"
+        }}
+    })
+    .to_string();
+    for operation in [&update_pull_request, &mark_ready, &add_comment] {
+        assert_eq!(
+            raw_json_request(
+                proxy_port,
+                "github-cli.test",
+                "/api/graphql",
+                "token",
+                &token,
+                operation,
+            )
+            .0,
+            200
+        );
+    }
+
+    // Merge governance and base-branch changes remain blocked.
+    let destructive = serde_json::json!({
+        "query": "mutation Blocked($input: EnablePullRequestAutoMergeInput!) { enablePullRequestAutoMerge(input: $input) { pullRequest { id } } }",
+        "variables": {"input": {
+            "pullRequestId": "PR_kwDOExample",
+            "mergeMethod": "SQUASH"
+        }}
+    })
+    .to_string();
+    assert_eq!(
+        raw_json_request(
+            proxy_port,
+            "github-cli.test",
+            "/api/graphql",
+            "token",
+            &token,
+            &destructive,
+        )
+        .0,
+        403
+    );
+
+    let base_change = serde_json::json!({
+        "query": "mutation PullRequestUpdate($input: UpdatePullRequestInput!) { updatePullRequest(input: $input) { pullRequest { id } } }",
+        "variables": {"input": {
+            "pullRequestId": "PR_kwDOExample",
+            "baseRefName": "release"
+        }}
+    })
+    .to_string();
+    assert_eq!(
+        raw_json_request(
+            proxy_port,
+            "github-cli.test",
+            "/api/graphql",
+            "token",
+            &token,
+            &base_change,
+        )
+        .0,
+        403
+    );
+
     // Global GraphQL operations fail before reaching the upstream.
     let global = serde_json::json!({
         "query": "query Viewer { viewer { login } }",
@@ -732,12 +1116,46 @@ fn github_cli_pr_creation_is_scoped_and_handles_enterprise_preflights() {
 
     std::thread::sleep(Duration::from_millis(100));
     let requests = upstream_reqs.lock().unwrap();
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 16);
     assert!(requests[0].starts_with("GET /repos/example-org/example-repo/pulls HTTP/1.1"));
-    assert!(requests[1].starts_with("POST /graphql HTTP/1.1"));
-    assert!(requests[1].ends_with(&graphql));
-    assert!(requests[2].starts_with("POST /graphql HTTP/1.1"));
-    assert!(requests[2].ends_with(&create_pull_request));
+    assert!(requests[1].starts_with("POST /repos/example-org/example-repo/labels HTTP/1.1"));
+    assert!(requests[1].ends_with(&create_label));
+    assert!(
+        requests[2].starts_with(
+            "PATCH /repos/example-org/example-repo/labels/auto-merge-allowed HTTP/1.1"
+        )
+    );
+    assert!(requests[2].ends_with(&update_label));
+    assert!(
+        requests[3].starts_with("POST /repos/example-org/example-repo/issues/42/comments HTTP/1.1")
+    );
+    assert!(
+        requests[4].starts_with(
+            "POST /repos/example-org/example-repo/pulls/42/comments/99/replies HTTP/1.1"
+        )
+    );
+    assert!(requests[5].starts_with("GET /repos/example-org/example-repo/actions/runs HTTP/1.1"));
+    assert!(
+        requests[6]
+            .starts_with("GET /repos/example-org/example-repo/actions/runs/123/jobs HTTP/1.1")
+    );
+    assert!(
+        requests[7]
+            .starts_with("GET /repos/example-org/example-repo/actions/jobs/456/logs HTTP/1.1")
+    );
+    for (request, body) in [
+        (&requests[8], &graphql),
+        (&requests[9], &create_pull_request),
+        (&requests[10], &add_labels),
+        (&requests[11], &remove_labels),
+        (&requests[12], &status_checks),
+        (&requests[13], &update_pull_request),
+        (&requests[14], &mark_ready),
+        (&requests[15], &add_comment),
+    ] {
+        assert!(request.starts_with("POST /graphql HTTP/1.1"));
+        assert!(request.ends_with(body));
+    }
     for request in requests.iter() {
         let lower = request.to_ascii_lowercase();
         assert!(lower.contains("authorization: bearer injected-installation-token"));
@@ -747,6 +1165,19 @@ fn github_cli_pr_creation_is_scoped_and_handles_enterprise_preflights() {
         *resolved_paths.lock().unwrap(),
         vec![
             "/repos/example-org/example-repo/pulls",
+            "/repos/example-org/example-repo/labels",
+            "/repos/example-org/example-repo/labels/auto-merge-allowed",
+            "/repos/example-org/example-repo/issues/42/comments",
+            "/repos/example-org/example-repo/pulls/42/comments/99/replies",
+            "/repos/example-org/example-repo/actions/runs",
+            "/repos/example-org/example-repo/actions/runs/123/jobs",
+            "/repos/example-org/example-repo/actions/jobs/456/logs",
+            "/repos/example-org/example-repo",
+            "/repos/example-org/example-repo",
+            "/repos/example-org/example-repo",
+            "/repos/example-org/example-repo",
+            "/repos/example-org/example-repo",
+            "/repos/example-org/example-repo",
             "/repos/example-org/example-repo",
             "/repos/example-org/example-repo",
         ]

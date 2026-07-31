@@ -24,6 +24,11 @@ gh api repos/example-org/example-repo/pulls
 gh pr create --repo "$GH_REPO" --base main --head agent-branch --title "Scoped PR"
 ```
 
+The GitHub App installation token must request at least `contents: read`,
+`pull_requests: write`, `issues: write`, `actions: read`, `checks: read`, and
+`statuses: read` for the full capability set below. Trust can only narrow the
+permissions already granted to the installed App.
+
 The CLI sends `Authorization: token <JWT>`; that scheme is accepted only by
 `github-cli-repo` mode. Trust validates the JWT, derives the exact repository,
 mints/caches an installation token restricted to that repository, replaces the
@@ -31,22 +36,40 @@ client header, and forwards.
 
 What is allowed, and what fails closed:
 
-- **REST**: `/repos/{owner}/{repo}/...` paths only, limited to `GET`/`HEAD`.
-- **GraphQL**: named query operations whose root fields all select the same
-  repository through variables, plus the single `createPullRequest` mutation
-  used by basic `gh pr create`. That mutation carries an opaque repository
-  node ID, so trust requires exactly one exact `github-cli:owner/repo` scope
-  and uses it to obtain a repository-restricted installation token; GitHub
-  rejects node IDs from any other repository.
+- **REST reads**: repository paths use `GET`/`HEAD`, including Actions run,
+  job, and log inspection used by `gh run list`, `gh run view`, and related CI
+  diagnostics. GitHub normally redirects a log download to a public signed
+  URL; a network-restricted sandbox must also route that follow-up request
+  through Trust's forward proxy using an explicitly allowed destination or
+  the temporary `outbound-audit` discovery scope.
+- **REST writes**: only label creation/update, top-level issue or pull-request
+  comments, and replies to inline pull-request review comments are accepted.
+  JSON bodies have operation-specific key and value validation. Label updates
+  may change only color and description; renaming or deleting labels is not
+  allowed.
+- **GraphQL reads**: named queries whose root fields all select the same
+  repository through variables, plus the exact status-check query used by
+  `gh pr checks`.
+- **GraphQL writes**: `createPullRequest`, adding/removing labels, updating
+  only a pull request's title/body, marking a draft ready for review, and
+  adding a discussion comment. These operations carry opaque node IDs, so
+  trust requires exactly one exact `github-cli:owner/repo` scope and uses it
+  to obtain a repository-restricted installation token; GitHub rejects node
+  IDs from any other repository.
 - **Enterprise probes**: `gh` runs feature detection against a custom host;
-  trust answers only the static `/api/v3/meta` and `Issue_fields` probes
-  locally, after the same exact-scope check.
-- **Everything else** — other mutations, REST writes, global queries, node
-  lookups, search, multiple operations, bodies over 64 KiB — is denied.
+  trust answers only the exact static `/api/v3/meta`, `Issue_fields`,
+  `PullRequest_fields`, and `PullRequest_fields2` probes locally, after the
+  same exact-scope check.
+- **Everything else** — merge or auto-merge, approvals, closing/reopening,
+  converting a ready pull request back to draft, changing its base branch,
+  workflow dispatch/rerun/cancel, comment or label deletion, branch/repository
+  administration, other mutations or REST writes, global queries, generic
+  node lookups, search, multiple operations, and bodies over 64 KiB — is
+  denied.
 
-This supports repository-scoped reads and basic non-interactive PR creation.
-Follow-up mutations (assigning reviewers, labels, closing issues) remain
-denied.
+This supports the routine sandbox workflow: inspect repository and CI state,
+create or update a pull request, mark it ready, create and apply labels, and
+post review follow-ups. Repository governance remains outside the sandbox.
 
 ## Routing gh's git subprocess
 
