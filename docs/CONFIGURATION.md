@@ -159,7 +159,7 @@ name        = "github-cli"
 kind        = "api"
 listen_host = "github-cli.proxy.internal"
 origin      = "https://api.github.com"
-credential  = { kind = "github-app", permissions = { contents = "read", pull_requests = "write", issues = "read" } }
+credential  = { kind = "github-app", permissions = { contents = "read", pull_requests = "write", issues = "write", actions = "read", checks = "read", statuses = "read" } }
 injection   = { header = "authorization", scheme = "bearer" }
 resource    = { kind = "github-cli-repo" }
 

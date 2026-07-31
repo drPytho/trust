@@ -15,8 +15,8 @@ use crate::git::classify::{GitRequest, classify};
 use crate::git::mirror::MirrorStore;
 use crate::git::sync::SyncManager;
 use crate::github_cli::{
-    GithubCliGraphqlOperation, MAX_GRAPHQL_BODY_BYTES, classify_graphql, is_graphql_path,
-    rest_upstream_path,
+    GithubCliGraphqlOperation, MAX_GRAPHQL_BODY_BYTES, MAX_REST_BODY_BYTES, classify_graphql,
+    classify_rest_request, is_graphql_path, rest_upstream_path, validate_rest_body,
 };
 use crate::inject::{inject, injection_value};
 use crate::jwt::Verifier;
@@ -69,6 +69,10 @@ impl RequestCtx {
 const MAX_NPM_METADATA_BYTES: usize = 64 * 1024 * 1024;
 const GITHUB_CLI_META_RESPONSE: &[u8] = br#"{"installed_version":"3.17.0"}"#;
 const GITHUB_CLI_ISSUE_FEATURE_RESPONSE: &[u8] = br#"{"data":{"Issue":{"fields":[]}}}"#;
+const GITHUB_CLI_PULL_REQUEST_FEATURE_RESPONSE: &[u8] =
+    br#"{"data":{"PullRequest":{"fields":[]},"StatusCheckRollupContextConnection":{"fields":[]}}}"#;
+const GITHUB_CLI_WORKFLOW_RUN_FEATURE_RESPONSE: &[u8] =
+    br#"{"data":{"WorkflowRun":{"fields":[]}}}"#;
 
 struct NpmRewrite {
     from: String,
@@ -349,10 +353,14 @@ impl ProxyService {
             }
             let resource = match classify_graphql(&body) {
                 Ok(GithubCliGraphqlOperation::RepositoryQuery(resource)) => resource,
-                Ok(GithubCliGraphqlOperation::IssueFeatureDetection) => {
+                Ok(
+                    operation @ (GithubCliGraphqlOperation::IssueFeatureDetection
+                    | GithubCliGraphqlOperation::PullRequestFeatureDetection
+                    | GithubCliGraphqlOperation::WorkflowRunFeatureDetection),
+                ) => {
                     if scopes.sole_exact_resource(&upstream.name).is_none() {
                         log::warn!(
-                            "GitHub CLI issue feature detection rejected upstream={} reason=ambiguous_or_wildcard_scope",
+                            "GitHub CLI feature detection rejected upstream={} reason=ambiguous_or_wildcard_scope",
                             upstream.name
                         );
                         return self
@@ -360,24 +368,38 @@ impl ProxyService {
                             .await
                             .map(GithubCliRoute::Responded);
                     }
+                    let response = match operation {
+                        GithubCliGraphqlOperation::IssueFeatureDetection => {
+                            GITHUB_CLI_ISSUE_FEATURE_RESPONSE
+                        }
+                        GithubCliGraphqlOperation::PullRequestFeatureDetection => {
+                            GITHUB_CLI_PULL_REQUEST_FEATURE_RESPONSE
+                        }
+                        GithubCliGraphqlOperation::WorkflowRunFeatureDetection => {
+                            GITHUB_CLI_WORKFLOW_RUN_FEATURE_RESPONSE
+                        }
+                        _ => unreachable!(),
+                    };
                     return self
-                        .respond_github_cli_feature(
-                            session,
-                            ctx,
-                            upstream.clone(),
-                            GITHUB_CLI_ISSUE_FEATURE_RESPONSE,
-                        )
+                        .respond_github_cli_feature(session, ctx, upstream.clone(), response)
                         .await
                         .map(GithubCliRoute::Responded);
                 }
-                Ok(GithubCliGraphqlOperation::CreatePullRequest) => {
-                    // GitHub only carries an opaque repository node ID in this
-                    // mutation. Bind it to exactly one explicit JWT scope,
-                    // then let both authorization and credential resolution
-                    // enforce that synthesized repository path.
+                Ok(
+                    GithubCliGraphqlOperation::StatusChecks
+                    | GithubCliGraphqlOperation::CreatePullRequest
+                    | GithubCliGraphqlOperation::UpdatePullRequest
+                    | GithubCliGraphqlOperation::MarkPullRequestReady
+                    | GithubCliGraphqlOperation::CreateComment
+                    | GithubCliGraphqlOperation::UpdateLabels,
+                ) => {
+                    // These operations carry opaque node IDs rather than an
+                    // owner/repository pair. Bind them to exactly one explicit
+                    // JWT scope, then let authorization and credential
+                    // resolution enforce that synthesized repository path.
                     let Some(resource) = scopes.sole_exact_resource(&upstream.name) else {
                         log::warn!(
-                            "GitHub CLI pull request creation rejected upstream={} reason=ambiguous_or_wildcard_scope",
+                            "GitHub CLI repository-bound mutation rejected upstream={} reason=ambiguous_or_wildcard_scope",
                             upstream.name
                         );
                         return self
@@ -409,21 +431,98 @@ impl ProxyService {
                 upstream_path: Some("/graphql".to_string()),
             });
         }
-        // This route exists for read-oriented gh commands plus the bounded
-        // GraphQL createPullRequest mutation above. Do not turn the
-        // repository-scoped GitHub App token into a general REST write
-        // capability through `gh api -X ...`.
-        if !matches!(method, "GET" | "HEAD") {
-            return self
-                .reject(
-                    session,
-                    ctx,
-                    405,
-                    "unsupported_github_cli_rest_method",
-                    b"unsupported GitHub CLI REST method",
-                )
-                .await
-                .map(GithubCliRoute::Responded);
+        // Do not turn the repository-scoped GitHub App token into a general
+        // REST write capability through `gh api -X ...`.
+        let rest_operation = match classify_rest_request(method, original_path) {
+            Ok(operation) => operation,
+            Err(error) => {
+                log::warn!(
+                    "GitHub CLI REST request rejected upstream={} reason={error}",
+                    upstream.name
+                );
+                return self
+                    .reject(
+                        session,
+                        ctx,
+                        405,
+                        "unsupported_github_cli_rest_method",
+                        b"unsupported GitHub CLI REST method",
+                    )
+                    .await
+                    .map(GithubCliRoute::Responded);
+            }
+        };
+        if rest_operation.requires_body() {
+            if session
+                .req_header()
+                .headers
+                .get("content-length")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<usize>().ok())
+                .is_some_and(|length| length > MAX_REST_BODY_BYTES)
+            {
+                return self
+                    .reject(
+                        session,
+                        ctx,
+                        413,
+                        "github_cli_rest_body_too_large",
+                        b"GitHub CLI REST request too large",
+                    )
+                    .await
+                    .map(GithubCliRoute::Responded);
+            }
+
+            let mut body = Vec::new();
+            session.as_mut().enable_retry_buffering();
+            loop {
+                match session.read_request_body().await {
+                    Ok(Some(chunk)) => {
+                        if body.len() + chunk.len() > MAX_REST_BODY_BYTES {
+                            return self
+                                .reject(
+                                    session,
+                                    ctx,
+                                    413,
+                                    "github_cli_rest_body_too_large",
+                                    b"GitHub CLI REST request too large",
+                                )
+                                .await
+                                .map(GithubCliRoute::Responded);
+                        }
+                        body.extend_from_slice(&chunk);
+                    }
+                    Ok(None) => break,
+                    Err(_) => {
+                        return self
+                            .reject(
+                                session,
+                                ctx,
+                                400,
+                                "invalid_github_cli_rest_body",
+                                b"invalid GitHub CLI REST request",
+                            )
+                            .await
+                            .map(GithubCliRoute::Responded);
+                    }
+                }
+            }
+            if let Err(error) = validate_rest_body(rest_operation, &body) {
+                log::warn!(
+                    "GitHub CLI REST body rejected upstream={} reason={error}",
+                    upstream.name
+                );
+                return self
+                    .reject(
+                        session,
+                        ctx,
+                        400,
+                        "invalid_github_cli_rest_body",
+                        b"invalid GitHub CLI REST request",
+                    )
+                    .await
+                    .map(GithubCliRoute::Responded);
+            }
         }
         if let Some(path) = rest_upstream_path(original_path) {
             return Ok(GithubCliRoute::Forward {
