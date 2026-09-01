@@ -6,6 +6,21 @@ validated exhaustively at startup: duplicate upstream names/listen hosts,
 malformed origins, ambiguous CONNECT authorities, zero tunnel capacity, and
 invalid CONNECT mode combinations are rejected before the server binds.
 
+## Secret Manager emulator
+
+By default, Trust reads signing keys and upstream credentials from Google Secret
+Manager using Application Default Credentials. To use a compatible local
+emulator, set the standard endpoint variable:
+
+```bash
+SECRET_MANAGER_EMULATOR_HOST=http://127.0.0.1:4588
+```
+
+When this variable is set, Trust sends every Secret Manager request to that
+endpoint with anonymous credentials. The value may also use the conventional
+`host:port` form, which is interpreted as plain HTTP. Leaving it unset preserves
+the production Google endpoint and ADC behavior.
+
 ## Listeners
 
 ```toml
