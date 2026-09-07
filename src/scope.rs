@@ -21,11 +21,22 @@ pub enum RepoPat {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scope {
     Upstream(String),
+    Selector {
+        upstream: String,
+        key: String,
+    },
     Resource {
         upstream: String,
         owner: String,
         repo: RepoPat,
     },
+}
+
+pub(crate) fn valid_selector(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 impl Scope {
@@ -36,13 +47,21 @@ impl Scope {
         match tok.split_once(':') {
             None => Ok(Scope::Upstream(tok.to_string())),
             Some((upstream, resource)) => {
-                let (owner, repo) = resource
-                    .split_once('/')
-                    .ok_or_else(|| ScopeError::Malformed(tok.to_string()))?;
+                if upstream.is_empty() || resource.is_empty() {
+                    return Err(ScopeError::Malformed(tok.to_string()));
+                }
+                let Some((owner, repo)) = resource.split_once('/') else {
+                    if valid_selector(resource) {
+                        return Ok(Scope::Selector {
+                            upstream: upstream.to_string(),
+                            key: resource.to_string(),
+                        });
+                    }
+                    return Err(ScopeError::Malformed(tok.to_string()));
+                };
                 // Reject `upstream:owner/repo/extra` — split_once('/') only splits on the first /,
                 // so repo can still contain '/' even after split. This guard is load-bearing.
-                if upstream.is_empty() || owner.is_empty() || repo.is_empty() || repo.contains('/')
-                {
+                if owner.is_empty() || repo.is_empty() || repo.contains('/') {
                     return Err(ScopeError::Malformed(tok.to_string()));
                 }
                 let repo = if repo == "*" {
@@ -62,6 +81,7 @@ impl Scope {
     pub fn to_token(&self) -> String {
         match self {
             Scope::Upstream(u) => u.clone(),
+            Scope::Selector { upstream, key } => format!("{upstream}:{key}"),
             Scope::Resource {
                 upstream,
                 owner,
@@ -94,6 +114,32 @@ impl ScopeSet {
 
     pub fn iter(&self) -> impl Iterator<Item = &Scope> {
         self.0.iter()
+    }
+
+    /// Return the only selector key granted for an upstream. Duplicate copies
+    /// are harmless; bare, resource, or distinct selector grants are ambiguous.
+    pub fn sole_selector(&self, upstream: &str) -> Option<&str> {
+        let mut selected = None;
+        for scope in &self.0 {
+            match scope {
+                Scope::Selector {
+                    upstream: name,
+                    key,
+                } if name == upstream => {
+                    if selected.is_some_and(|current| current != key) {
+                        return None;
+                    }
+                    selected = Some(key.as_str());
+                }
+                Scope::Upstream(name) | Scope::Resource { upstream: name, .. }
+                    if name == upstream =>
+                {
+                    return None;
+                }
+                _ => {}
+            }
+        }
+        selected
     }
 
     /// Return the exact repository grant for an upstream, when one is
@@ -205,8 +251,19 @@ impl ScopeSet {
 pub fn covers(allowed: &Scope, requested: &Scope) -> bool {
     match (allowed, requested) {
         (Scope::Upstream(a), Scope::Upstream(r)) => a == r,
-        // A bare upstream grant covers any resource under that upstream.
+        // A bare upstream grant covers resources, but selectors must be granted
+        // explicitly so a typo cannot mint a useless selector token.
         (Scope::Upstream(a), Scope::Resource { upstream: r, .. }) => a == r,
+        (
+            Scope::Selector {
+                upstream: au,
+                key: ak,
+            },
+            Scope::Selector {
+                upstream: ru,
+                key: rk,
+            },
+        ) => au == ru && ak == rk,
         (
             Scope::Resource {
                 upstream: au,
@@ -277,16 +334,49 @@ mod tests {
                 ..
             }
         ));
+        assert!(matches!(
+            Scope::parse("linear:pit").unwrap(),
+            Scope::Selector { upstream, key } if upstream == "linear" && key == "pit"
+        ));
         assert!(Scope::parse("bad:too/many/parts").is_err());
+        assert!(Scope::parse("linear:bad:slug").is_err());
         assert!(Scope::parse("").is_err());
     }
 
     #[test]
     fn scopeset_roundtrip() {
-        let s = ScopeSet::parse("anthropic github:example-org/example-repo").unwrap();
+        let s = ScopeSet::parse("anthropic linear:pit github:example-org/example-repo").unwrap();
         assert_eq!(
             s.to_scope_string(),
-            "anthropic github:example-org/example-repo"
+            "anthropic linear:pit github:example-org/example-repo"
+        );
+    }
+
+    #[test]
+    fn sole_selector_rejects_ambiguous_grants() {
+        assert_eq!(
+            ScopeSet::parse("linear:pit")
+                .unwrap()
+                .sole_selector("linear"),
+            Some("pit")
+        );
+        assert_eq!(
+            ScopeSet::parse("linear:pit linear:pit")
+                .unwrap()
+                .sole_selector("linear"),
+            Some("pit")
+        );
+        assert!(
+            ScopeSet::parse("linear:pit linear:voi")
+                .unwrap()
+                .sole_selector("linear")
+                .is_none()
+        );
+        assert!(
+            ScopeSet::parse("linear")
+                .unwrap()
+                .sole_selector("linear")
+                .is_none()
         );
     }
 
@@ -318,7 +408,14 @@ mod tests {
         let bare = Scope::parse("github").unwrap();
         let wild = Scope::parse("github:example-org/*").unwrap();
         let exact = Scope::parse("github:example-org/example-repo").unwrap();
+        let selector = Scope::parse("github:example-org").unwrap();
         assert!(covers(&bare, &exact)); // bare grants any repo
+        assert!(!covers(&bare, &selector));
+        assert!(covers(&selector, &selector));
+        assert!(!covers(
+            &selector,
+            &Scope::parse("github:other-org").unwrap()
+        ));
         assert!(covers(&wild, &exact)); // wildcard grants a specific repo
         assert!(covers(&wild, &wild));
         assert!(!covers(&exact, &wild)); // exact does not grant wildcard
@@ -338,6 +435,13 @@ mod tests {
         assert_eq!(
             grant(&allowed, &ScopeSet::parse("mistral").unwrap()),
             Err("mistral".to_string())
+        );
+        assert_eq!(
+            grant(
+                &ScopeSet::parse("linear").unwrap(),
+                &ScopeSet::parse("linear:pit").unwrap()
+            ),
+            Err("linear:pit".to_string())
         );
     }
 

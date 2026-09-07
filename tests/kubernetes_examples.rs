@@ -127,7 +127,9 @@ fn deployment_config_enables_audit_egress_and_allowlists_google_api_connect_endp
     assert_eq!(linear.allowed_methods, ["POST"]);
     assert!(matches!(
         linear.credential,
-        Some(CredentialSource::StaticSecret { .. })
+        Some(CredentialSource::LinearPat { ref secret_refs })
+            if secret_refs.contains_key("ORG_SLUG")
+                && secret_refs.contains_key("OTHER_ORG_SLUG")
     ));
     assert!(matches!(
         linear.injection,
@@ -135,7 +137,11 @@ fn deployment_config_enables_audit_egress_and_allowlists_google_api_connect_endp
             if injection.header.eq_ignore_ascii_case("authorization")
                 && injection.scheme == InjectionScheme::Raw
     ));
-    assert!(allowed_scopes.iter().any(|scope| scope == "linear"));
+    assert!(
+        allowed_scopes
+            .iter()
+            .any(|scope| scope == "linear:ORG_SLUG")
+    );
 
     let anthropic = config
         .upstreams

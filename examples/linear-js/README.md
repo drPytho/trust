@@ -6,16 +6,16 @@ API key** — trust injects the real key at the edge.
 
 ```
  query.mjs (@linear/sdk)                    trust (localhost:6191)             api.linear.app
- apiUrl = http://localhost:6191/graphql ─▶  verify JWT (scope: linear)
- Authorization: Bearer <JWT>                strip Authorization
-                                              inject Authorization: <real key> ──▶ /graphql
+ apiUrl = http://localhost:6191/graphql ─▶  verify JWT (scope: linear:pit)
+ Authorization: Bearer <JWT>                select pit PAT + strip Authorization
+                                              inject Authorization: <pit PAT> ──▶ /graphql
                                               rewrite Host → api.linear.app
 ```
 
 Linear personal API keys deliberately use `Authorization: <key>` without a
 `Bearer` prefix. The SDK's `accessToken` option makes the client-facing
-credential `Authorization: Bearer <trust JWT>`; trust strips it and writes the
-stored Linear key verbatim before forwarding.
+credential `Authorization: Bearer <trust JWT>`; trust uses the JWT's single
+`linear:<org_slug>` scope to select and inject that organization's stored PAT.
 
 ## Prerequisites
 
@@ -34,10 +34,12 @@ Run everything from the **repo root** so the config's `certs/` paths resolve.
    gcloud secrets create trust-signing-key --data-file=signing-key.pem --project=$PROJECT
    ```
 
-3. **Linear personal API key** in GCP Secret Manager:
+3. **One team-scoped Linear personal API key per organization** in GCP Secret
+   Manager (PATs are created manually in Linear):
 
    ```bash
-   printf '%s' "lin_api_…" | gcloud secrets create linear-key --data-file=- --project=$PROJECT
+   printf '%s' "lin_api_…" | gcloud secrets create linear-pit-key --data-file=- --project=$PROJECT
+   printf '%s' "lin_api_…" | gcloud secrets create linear-voi-key --data-file=- --project=$PROJECT
    ```
 
 4. Edit `examples/linear-js/config.toml` — replace `YOUR_PROJECT` in the two
@@ -53,8 +55,8 @@ TRUST_CONFIG=examples/linear-js/config.toml RUST_LOG=info cargo run --release &
 # 2. Install the SDK
 cd examples/linear-js && npm install && cd -
 
-# 3. Mint a scoped JWT (mTLS to the /token endpoint) and query the current viewer
-TRUST_JWT="$(./scripts/mint-jwt.sh linear)" node examples/linear-js/query.mjs
+# 3. Mint a JWT selecting exactly one organization PAT, then query its viewer
+TRUST_JWT="$(./scripts/mint-jwt.sh linear:pit)" node examples/linear-js/query.mjs
 ```
 
 Expected: JSON containing the authenticated Linear viewer. The script sends
@@ -67,9 +69,12 @@ client.
   `https://linear.proxy.internal/graphql` in production.
 - Use `accessToken`, not `apiKey`, for the trust JWT. `apiKey` sends a raw
   `Authorization` value, whereas trust accepts client JWTs as Bearer tokens.
-- This example stores a personal API key and therefore uses `scheme = "raw"`.
-  If the stored secret is a Linear OAuth access token, use
-  `scheme = "bearer"` instead.
+- `credential.kind = "linear-pat"` maps explicit organization slugs to Secret
+  Manager references. A request must carry exactly one configured
+  `linear:<org_slug>` scope; matching is case-sensitive, and bare, unknown, or
+  ambiguous Linear scopes fail closed.
+- Personal API keys use raw authorization. Linear OAuth access tokens are a
+  different credential model and are not handled by `linear-pat`.
 - The example permits only `POST`, which is the method used by the Linear
   GraphQL API and SDK. Add methods intentionally if your integration needs
   another endpoint.

@@ -59,7 +59,7 @@ data:
 
     [[issuance.clients]]
     spiffe = "spiffe://example/workloads/*"
-    allowed_scopes = ["outbound-audit", "anthropic", "linear", "github:ORG/REPOSITORY", "github-git:ORG/REPOSITORY", "public-api", "gcp-pubsub", "gcp-storage"]
+    allowed_scopes = ["outbound-audit", "anthropic", "linear:ORG_SLUG", "linear:OTHER_ORG_SLUG", "github:ORG/REPOSITORY", "github-git:ORG/REPOSITORY", "public-api", "gcp-pubsub", "gcp-storage"]
 
     [github_app]
     app_id = 123456
@@ -81,16 +81,17 @@ data:
     # can never enter this credential-injection path.
     intercept_connect = true
 
-    # Linear's GraphQL API accepts personal API keys as a raw Authorization
-    # value. Store the key in Secret Manager; workloads supply only a trust JWT.
+    # One team-scoped Linear PAT per organization. A workload supplies a trust
+    # JWT with exactly one matching linear:<org_slug> selector.
     [[upstreams]]
     name = "linear"
     kind = "api"
     listen_host = "linear.proxy.internal"
     origin = "https://api.linear.app"
-    secret_ref = "projects/PROJECT_ID/secrets/linear-key/versions/latest"
+    credential = { kind = "linear-pat", secret_refs = { ORG_SLUG = "projects/PROJECT_ID/secrets/linear-org-key/versions/latest", OTHER_ORG_SLUG = "projects/PROJECT_ID/secrets/linear-other-org-key/versions/latest" } }
     injection = { header = "authorization", scheme = "raw" }
     allowed_methods = ["POST"]
+    allowed_paths = ["/graphql"]
 
     # Reverse-proxy-only GitHub CLI API. gh supplies the trust JWT as its
     # enterprise token; trust injects an exact-repository installation token.
