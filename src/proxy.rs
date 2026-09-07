@@ -699,6 +699,12 @@ impl ProxyHttp for ProxyService {
         }
 
         // --- credential-injecting API branch ---
+        let credential_selector = match &upstream.credential {
+            Some(crate::config::CredentialSource::LinearPat { .. }) => {
+                scopes.sole_selector(&upstream.name)
+            }
+            _ => None,
+        };
         let credential_started = Instant::now();
         let provider = upstream
             .credential
@@ -707,7 +713,7 @@ impl ProxyHttp for ProxyService {
             .provider_name();
         match self
             .credentials
-            .resolve(&upstream, &method, &policy_path)
+            .resolve(&upstream, &method, &policy_path, credential_selector)
             .await
         {
             Ok(credential) => {
@@ -886,7 +892,8 @@ impl ProxyHttp for ProxyService {
                 };
 
                 let path = format!("/{owner}/{repo}.git/info/refs");
-                let credential = match credentials.resolve(&upstream_arc, "GET", &path).await {
+                let credential = match credentials.resolve(&upstream_arc, "GET", &path, None).await
+                {
                     Ok(credential) => credential,
                     Err(e) => {
                         log::warn!(
@@ -1074,7 +1081,11 @@ impl ProxyService {
         let repo = res.repo;
 
         // --- Fetch the git credential (secret).  The JWT is NOT used here. ---
-        let credential = match self.credentials.resolve(&upstream, method, path).await {
+        let credential = match self
+            .credentials
+            .resolve(&upstream, method, path, None)
+            .await
+        {
             Ok(credential) => credential,
             Err(e) => {
                 log::error!(
@@ -1444,7 +1455,11 @@ impl ProxyService {
         // Fetch the secret so the normal proxy path (upstream_request_filter)
         // can inject it.
         let method = session.req_header().method.as_str().to_string();
-        let credential = match self.credentials.resolve(&upstream, &method, path).await {
+        let credential = match self
+            .credentials
+            .resolve(&upstream, &method, path, None)
+            .await
+        {
             Ok(credential) => credential,
             Err(e) => {
                 log::error!(

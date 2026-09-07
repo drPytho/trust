@@ -40,6 +40,7 @@ impl CredentialProvider for RecordingCredentials {
         _upstream: &Upstream,
         _method: &str,
         path: &str,
+        _selector: Option<&str>,
     ) -> Result<ResolvedCredential, CredentialError> {
         self.resolved_paths.lock().unwrap().push(path.to_string());
         Ok(ResolvedCredential {
@@ -273,8 +274,13 @@ fn linear_upstream(mock_port: u16) -> Arc<Upstream> {
             sni: String::new(),
         },
         mode: UpstreamMode::Inject,
-        credential: Some(CredentialSource::StaticSecret {
-            secret_ref: "ref/linear".into(),
+        credential: Some(CredentialSource::LinearPat {
+            secret_refs: [
+                ("pit".to_string(), "ref/linear-pit".to_string()),
+                ("voi".to_string(), "ref/linear-voi".to_string()),
+            ]
+            .into_iter()
+            .collect(),
         }),
         injection: Some(Injection {
             header: "authorization".into(),
@@ -456,12 +462,21 @@ fn linear_personal_api_key_is_injected_verbatim() {
         "trust-proxy".into(),
         Duration::from_secs(3600),
     );
+    let now = jsonwebtoken::get_current_timestamp();
     let token = issuer
         .mint(
             &km,
             "spiffe://example/workloads/linear-client",
-            &ScopeSet::parse("linear").unwrap(),
-            jsonwebtoken::get_current_timestamp(),
+            &ScopeSet::parse("linear:pit").unwrap(),
+            now,
+        )
+        .unwrap();
+    let ambiguous = issuer
+        .mint(
+            &km,
+            "spiffe://example/workloads/linear-client",
+            &ScopeSet::parse("linear:pit linear:voi").unwrap(),
+            now,
         )
         .unwrap();
 
@@ -469,10 +484,10 @@ fn linear_personal_api_key_is_injected_verbatim() {
         Router::new(&[linear_upstream(mock_port)]),
         Verifier::new("trust".into(), "trust-proxy".into()),
         keystore,
-        Arc::new(FakeSecretProvider::new(&[(
-            "ref/linear",
-            "lin_api_INJECTED_SECRET",
-        )])),
+        Arc::new(FakeSecretProvider::new(&[
+            ("ref/linear-pit", "lin_api_PIT_SECRET"),
+            ("ref/linear-voi", "lin_api_VOI_SECRET"),
+        ])),
         Arc::new(MirrorStore::new("/tmp")),
         Arc::new(SyncManager::new()),
     );
@@ -500,6 +515,18 @@ fn linear_personal_api_key_is_injected_verbatim() {
             "linear.test",
             "/graphql",
             "Bearer",
+            &ambiguous,
+            graphql,
+        )
+        .0,
+        403
+    );
+    assert_eq!(
+        raw_json_request(
+            proxy_port,
+            "linear.test",
+            "/graphql",
+            "Bearer",
             &token,
             graphql,
         )
@@ -512,7 +539,8 @@ fn linear_personal_api_key_is_injected_verbatim() {
     let request = requests.last().expect("upstream got a request");
     let lower = request.to_ascii_lowercase();
     assert!(request.starts_with("POST /graphql HTTP/1.1"));
-    assert!(lower.contains("authorization: lin_api_injected_secret"));
+    assert!(lower.contains("authorization: lin_api_pit_secret"));
+    assert!(!lower.contains("lin_api_voi_secret"));
     assert!(!request.contains(&token));
 }
 

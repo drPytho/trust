@@ -163,13 +163,12 @@ Notes:
   `fsGroup` (e.g. `fsGroup: 65532`) so the mirror directory is writable by the
   trust process.
 
-It also includes `linear.proxy.internal` for Linear's GraphQL API. Create a
-Linear personal API key, store it in the referenced `linear-key` Secret Manager
-secret, add `linear.proxy.internal` to cluster DNS and the reverse-proxy
-certificate, then mint the `linear` scope. Workloads POST to
-`https://linear.proxy.internal/graphql` with `Authorization: Bearer <trust JWT>`;
-trust replaces that header with the raw Linear key. With `@linear/sdk`, use the
-trust JWT as `accessToken` and the complete proxy GraphQL URL as `apiUrl`.
+It also includes `linear.proxy.internal` for Linear's GraphQL API. Create one
+team-scoped personal API key per organization, store each under the explicit
+`linear-pat.secret_refs` map, add the proxy host to cluster DNS and the
+reverse-proxy certificate, then mint exactly one `linear:<org_slug>` scope.
+Trust selects and injects only that PAT. With `@linear/sdk`, use the trust JWT
+as `accessToken` and the complete proxy GraphQL URL as `apiUrl`.
 
 The `anthropic` upstream additionally sets `intercept_connect = true`. A
 selected Sandbox may call `https://api.anthropic.com` through `HTTPS_PROXY`

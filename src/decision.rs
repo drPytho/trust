@@ -40,6 +40,11 @@ pub fn authorize(scopes: &ScopeSet, upstream: &Upstream, method: &str, path: &st
     {
         return false;
     }
+    if let Some(CredentialSource::LinearPat { secret_refs }) = &upstream.credential {
+        return scopes
+            .sole_selector(&upstream.name)
+            .is_some_and(|slug| secret_refs.contains_key(slug));
+    }
     let resource = upstream.resource.and_then(|kind| extract(kind, path));
     let authorization_resource = resource.as_ref().cloned().or_else(|| {
         matches!(
@@ -136,6 +141,43 @@ mod tests {
         assert!(authorize(&scopes, &up, "POST", "/api/chat.postMessage"));
         assert!(!authorize(&scopes, &up, "POST", "/api/auth.revoke"));
         assert!(!authorize(&scopes, &up, "POST", "/api/chat.postMessage/"));
+    }
+
+    #[test]
+    fn authorize_linear_pat_requires_one_configured_org() {
+        let mut up = (*upstream("linear", None)).clone();
+        up.credential = Some(CredentialSource::LinearPat {
+            secret_refs: [
+                ("pit".to_string(), "pit-ref".to_string()),
+                ("voi".to_string(), "voi-ref".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        });
+        assert!(authorize(
+            &ScopeSet::parse("linear:pit").unwrap(),
+            &up,
+            "POST",
+            "/graphql"
+        ));
+        assert!(!authorize(
+            &ScopeSet::parse("linear").unwrap(),
+            &up,
+            "POST",
+            "/graphql"
+        ));
+        assert!(!authorize(
+            &ScopeSet::parse("linear:pit linear:voi").unwrap(),
+            &up,
+            "POST",
+            "/graphql"
+        ));
+        assert!(!authorize(
+            &ScopeSet::parse("linear:unknown").unwrap(),
+            &up,
+            "POST",
+            "/graphql"
+        ));
     }
 
     #[test]

@@ -424,6 +424,7 @@ mod tests {
             _upstream: &Upstream,
             _method: &str,
             _path: &str,
+            _selector: Option<&str>,
         ) -> Result<ResolvedCredential, CredentialError> {
             Ok(ResolvedCredential {
                 secret: Secret::new("trust-injected-key".to_string()),

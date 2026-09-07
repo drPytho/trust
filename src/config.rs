@@ -59,6 +59,12 @@ pub enum ConfigError {
     BadGithubCliUpstream(String),
     #[error("gcp-adc upstream '{0}' requires Authorization bearer injection")]
     GcpAdcNeedsBearer(String),
+    #[error(
+        "linear-pat upstream '{0}' requires an API reverse-proxy route with raw Authorization injection and no resource"
+    )]
+    BadLinearPatUpstream(String),
+    #[error("linear-pat upstream '{upstream}' has invalid org slug or secret reference: {slug}")]
+    BadLinearPatSecret { upstream: String, slug: String },
     #[error("CONNECT upstream '{0}' must use api kind and passthrough mode")]
     ConnectRequiresPassthrough(String),
     #[error(
@@ -139,6 +145,10 @@ pub enum CredentialSource {
         #[serde(default)]
         rewrite_registry_to: Option<String>,
     },
+    LinearPat {
+        /// Explicit Linear organization slug to Secret Manager reference map.
+        secret_refs: BTreeMap<String, String>,
+    },
 }
 
 impl CredentialSource {
@@ -147,6 +157,7 @@ impl CredentialSource {
             CredentialSource::StaticSecret { .. } => "static-secret",
             CredentialSource::GithubApp { .. } => "github-app",
             CredentialSource::GcpAdc { .. } => "gcp-adc",
+            CredentialSource::LinearPat { .. } => "linear-pat",
         }
     }
 }
@@ -701,6 +712,35 @@ fn validate_upstream(
     {
         return Err(ConfigError::GcpAdcNeedsBearer(ru.name));
     }
+    if let Some(CredentialSource::LinearPat { secret_refs }) = &credential {
+        if ru.kind != UpstreamKind::Api
+            || ru.intercept_connect
+            || ru.resource.is_some()
+            || !matches!(
+                injection,
+                Some(Injection {
+                    ref header,
+                    scheme: InjectionScheme::Raw,
+                }) if header.eq_ignore_ascii_case("authorization")
+            )
+        {
+            return Err(ConfigError::BadLinearPatUpstream(ru.name));
+        }
+        if secret_refs.is_empty() {
+            return Err(ConfigError::BadLinearPatSecret {
+                upstream: ru.name,
+                slug: "<empty>".to_string(),
+            });
+        }
+        for (slug, secret_ref) in secret_refs {
+            if !crate::scope::valid_selector(slug) || secret_ref.is_empty() {
+                return Err(ConfigError::BadLinearPatSecret {
+                    upstream: ru.name,
+                    slug: slug.clone(),
+                });
+            }
+        }
+    }
     if let Some(CredentialSource::GcpAdc {
         rewrite_registry_to: Some(base),
     }) = &credential
@@ -1043,7 +1083,8 @@ resource = { kind = "github-repo" }
         assert_eq!(upstream.allowed_methods, ["POST"]);
         assert!(matches!(
             upstream.credential,
-            Some(CredentialSource::StaticSecret { .. })
+            Some(CredentialSource::LinearPat { ref secret_refs })
+                if secret_refs.keys().map(String::as_str).eq(["pit", "voi"])
         ));
         assert!(matches!(
             upstream.injection,
@@ -1052,6 +1093,32 @@ resource = { kind = "github-repo" }
                 scheme: InjectionScheme::Raw,
             }) if header.eq_ignore_ascii_case("authorization")
         ));
+    }
+
+    #[test]
+    fn rejects_unsafe_linear_pat_configuration() {
+        for credential in [
+            r#"credential = { kind = "linear-pat", secret_refs = {} }"#,
+            r#"credential = { kind = "linear-pat", secret_refs = { "bad/slug" = "ref" } }"#,
+            r#"credential = { kind = "linear-pat", secret_refs = { pit = "" } }"#,
+        ] {
+            let configured = GOOD.to_string()
+                + &format!(
+                    r#"
+[[upstreams]]
+name = "linear"
+kind = "api"
+listen_host = "linear.proxy.internal"
+origin = "https://api.linear.app"
+{credential}
+injection = {{ header = "authorization", scheme = "raw" }}
+"#
+                );
+            assert!(matches!(
+                Config::from_str(&configured),
+                Err(ConfigError::BadLinearPatSecret { .. })
+            ));
+        }
     }
 
     #[test]

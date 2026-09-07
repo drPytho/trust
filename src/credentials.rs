@@ -40,6 +40,10 @@ pub enum CredentialError {
     GithubResponse(String),
     #[error("Google application default credentials unavailable: {0}")]
     GoogleAuth(String),
+    #[error("credential selector is missing")]
+    MissingSelector,
+    #[error("credential selector is not configured: {0}")]
+    UnknownSelector(String),
 }
 
 /// How a credential was obtained; used as the bounded `result` metric label.
@@ -77,6 +81,7 @@ pub trait CredentialProvider: Send + Sync {
         upstream: &Upstream,
         method: &str,
         path: &str,
+        selector: Option<&str>,
     ) -> Result<ResolvedCredential, CredentialError>;
 
     async fn invalidate(&self, _cache_key: &str) {}
@@ -329,6 +334,7 @@ impl CredentialProvider for CredentialManager {
         upstream: &Upstream,
         _method: &str,
         path: &str,
+        selector: Option<&str>,
     ) -> Result<ResolvedCredential, CredentialError> {
         let credential = upstream
             .credential
@@ -355,6 +361,22 @@ impl CredentialProvider for CredentialManager {
                     .await
             }
             CredentialSource::GcpAdc { .. } => self.resolve_google().await,
+            CredentialSource::LinearPat { secret_refs } => {
+                let selector = selector.ok_or(CredentialError::MissingSelector)?;
+                let secret_ref = secret_refs
+                    .get(selector)
+                    .ok_or_else(|| CredentialError::UnknownSelector(selector.to_string()))?;
+                let secret = self
+                    .secrets
+                    .get(secret_ref)
+                    .await
+                    .map_err(|error| CredentialError::StaticSecret(error.to_string()))?;
+                Ok(ResolvedCredential {
+                    secret,
+                    cache_key: None,
+                    result: ResolutionOutcome::Static,
+                })
+            }
         }
     }
 
@@ -512,12 +534,12 @@ mod tests {
         };
 
         let one = manager
-            .resolve(&upstream, "GET", "/repos/org-one/repo-a/contents")
+            .resolve(&upstream, "GET", "/repos/org-one/repo-a/contents", None)
             .await
             .unwrap();
         assert_eq!(one.secret.expose(), "token-111");
         let cached = manager
-            .resolve(&upstream, "GET", "/repos/ORG-ONE/repo-a/contents")
+            .resolve(&upstream, "GET", "/repos/ORG-ONE/repo-a/contents", None)
             .await
             .unwrap();
         assert_eq!(cached.secret.expose(), "token-111");
@@ -530,12 +552,12 @@ mod tests {
             *basic_username = Some("x-access-token".into());
         }
         let git = manager
-            .resolve(&git_upstream, "GET", "/org-one/repo-a.git/info/refs")
+            .resolve(&git_upstream, "GET", "/org-one/repo-a.git/info/refs", None)
             .await
             .unwrap();
         assert_eq!(git.secret.expose(), "x-access-token:token-111");
         let two = manager
-            .resolve(&upstream, "GET", "/repos/org-two/repo-a/contents")
+            .resolve(&upstream, "GET", "/repos/org-two/repo-a/contents", None)
             .await
             .unwrap();
         assert_eq!(two.secret.expose(), "token-222");
@@ -552,6 +574,61 @@ mod tests {
         assert_eq!(requests[1].0, 222);
         drop(requests);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn linear_pat_resolves_only_the_selected_org() {
+        let secrets: Arc<dyn SecretProvider> = Arc::new(FakeSecretProvider::new(&[
+            ("linear-pit", "pit-pat"),
+            ("linear-voi", "voi-pat"),
+        ]));
+        let manager = CredentialManager::new(secrets, None);
+        let upstream = Upstream {
+            name: "linear".into(),
+            kind: UpstreamKind::Api,
+            listen_host: "linear.proxy".into(),
+            origin: Origin {
+                host: "api.linear.app".into(),
+                port: 443,
+                tls: true,
+                sni: "api.linear.app".into(),
+            },
+            mode: UpstreamMode::Inject,
+            credential: Some(CredentialSource::LinearPat {
+                secret_refs: [
+                    ("pit".to_string(), "linear-pit".to_string()),
+                    ("voi".to_string(), "linear-voi".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            }),
+            injection: Some(Injection {
+                header: "authorization".into(),
+                scheme: InjectionScheme::Raw,
+            }),
+            resource: None,
+            git: None,
+            allowed_methods: vec!["POST".into()],
+            allowed_paths: vec!["/graphql".into()],
+            allow_connect: false,
+            intercept_connect: false,
+        };
+
+        let pit = manager
+            .resolve(&upstream, "POST", "/graphql", Some("pit"))
+            .await
+            .unwrap();
+        assert_eq!(pit.secret.expose(), "pit-pat");
+        assert!(matches!(
+            manager.resolve(&upstream, "POST", "/graphql", None).await,
+            Err(CredentialError::MissingSelector)
+        ));
+        assert!(matches!(
+            manager
+                .resolve(&upstream, "POST", "/graphql", Some("unknown"))
+                .await,
+            Err(CredentialError::UnknownSelector(_))
+        ));
     }
 
     type ConcRequests = Arc<Mutex<Vec<(u64, Value)>>>;
@@ -668,10 +745,10 @@ mod tests {
         let (manager, upstream) = conc_manager_and_upstream(address);
 
         let (a, b, c, d) = tokio::join!(
-            manager.resolve(&upstream, "GET", "/repos/org-one/repo-a/contents"),
-            manager.resolve(&upstream, "GET", "/repos/org-one/repo-a/contents"),
-            manager.resolve(&upstream, "GET", "/repos/org-one/repo-a/contents"),
-            manager.resolve(&upstream, "GET", "/repos/org-one/repo-a/contents"),
+            manager.resolve(&upstream, "GET", "/repos/org-one/repo-a/contents", None),
+            manager.resolve(&upstream, "GET", "/repos/org-one/repo-a/contents", None),
+            manager.resolve(&upstream, "GET", "/repos/org-one/repo-a/contents", None),
+            manager.resolve(&upstream, "GET", "/repos/org-one/repo-a/contents", None),
         );
 
         for result in [&a, &b, &c, &d] {
@@ -692,8 +769,8 @@ mod tests {
 
         let started = std::time::Instant::now();
         let (one, two) = tokio::join!(
-            manager.resolve(&upstream, "GET", "/repos/org-one/repo-a/contents"),
-            manager.resolve(&upstream, "GET", "/repos/org-two/repo-a/contents"),
+            manager.resolve(&upstream, "GET", "/repos/org-one/repo-a/contents", None),
+            manager.resolve(&upstream, "GET", "/repos/org-two/repo-a/contents", None),
         );
         let elapsed = started.elapsed();
 

@@ -199,7 +199,11 @@ impl ProxyHttp for MitmProxyService {
             .ok_or_else(|| Error::new_str("intercept route missing credential"))?
             .provider_name();
         let started = Instant::now();
-        match self.credentials.resolve(&upstream, &method, &path).await {
+        match self
+            .credentials
+            .resolve(&upstream, &method, &path, None)
+            .await
+        {
             Ok(credential) => {
                 self.metrics.credential_resolution(
                     &upstream.name,

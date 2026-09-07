@@ -88,7 +88,7 @@ allowed_scopes = ["github-cli:example-org/example-repo", "github-git:example-org
 
 [[issuance.clients]]
 spiffe         = "spiffe://example/team/platform/*"
-allowed_scopes = ["anthropic", "linear", "github-cli:example-org/*", "npm-artifacts:my-proj/npm-private"]
+allowed_scopes = ["anthropic", "linear:pit", "linear:voi", "github-cli:example-org/*", "npm-artifacts:my-proj/npm-private"]
 ```
 
 Signing keys are refreshed from Secret Manager every 10 minutes without a
@@ -102,12 +102,15 @@ is always the **configured upstream name**.
 | Scope                   | Meaning                                        |
 |-------------------------|------------------------------------------------|
 | `anthropic`             | Full access to the `anthropic` upstream        |
+| `linear:pit`            | Select the `pit` Linear PAT                    |
 | `github-cli:owner/repo` | Exact repo match on the `github-cli` upstream  |
 | `github-cli:owner/*`    | All repos under `owner` (one wildcard segment) |
 
 Rules:
 
-- A bare upstream scope covers any resource under that upstream.
+- A bare upstream scope covers any resource under that upstream, except
+  selector-backed credentials such as `linear-pat`, which require one selector.
+- A one-component suffix such as `linear:pit` is a credential selector.
 - A wildcard covers any exact repo under that owner but not a nested path.
 - Only one-segment wildcards are supported — `*` must be the entire repo
   component; the parser rejects tokens with more than one `/`.
@@ -155,14 +158,14 @@ injection   = { header = "x-api-key", scheme = "raw" }
 # with TLS interception; still requires the named `anthropic` scope.
 intercept_connect = true
 
-# Linear personal API keys go in `Authorization: <key>` without a Bearer
-# prefix; use `scheme = "bearer"` for an OAuth access token instead.
+# One manually-created, team-scoped Linear PAT per organization. Exactly one
+# `linear:<org_slug>` JWT scope selects its explicit Secret Manager reference.
 [[upstreams]]
 name            = "linear"
 kind            = "api"
 listen_host     = "linear.proxy.internal"
 origin          = "https://api.linear.app"
-secret_ref      = "projects/my-proj/secrets/linear-key/versions/latest"
+credential      = { kind = "linear-pat", secret_refs = { pit = "projects/my-proj/secrets/linear-pit-key/versions/latest", voi = "projects/my-proj/secrets/linear-voi-key/versions/latest" } }
 injection       = { header = "authorization", scheme = "raw" }
 allowed_methods = ["POST"]
 allowed_paths   = ["/graphql"]
@@ -217,6 +220,9 @@ Notes:
 
 - `secret_ref = "..."` is shorthand for
   `credential = { kind = "static-secret", secret_ref = "..." }`.
+- `linear-pat` requires API reverse-proxy mode, raw `Authorization` injection,
+  no resource extractor, and a non-empty explicit slug map. Missing, unknown,
+  bare, or multiple Linear selectors fail closed.
 - `allowed_methods` and `allowed_paths` are independent allowlists applied
   before credential resolution. When either list is non-empty, a request must
   match it. Paths are matched exactly, without the query string.
@@ -229,7 +235,7 @@ Notes:
 
 | Scheme   | Header value written     | Use for                                       |
 |----------|--------------------------|-----------------------------------------------|
-| `raw`    | `<secret>` verbatim      | API-key headers, e.g. `x-api-key`, Linear     |
+| `raw`    | `<secret>` verbatim      | API-key headers, e.g. `x-api-key`, Linear PAT |
 | `bearer` | `Bearer <secret>`        | OAuth/PAT bearer auth                         |
 | `basic`  | `Basic base64(<secret>)` | HTTP Basic (secret is the `user:pass` string) |
 
