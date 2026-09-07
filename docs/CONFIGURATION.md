@@ -110,7 +110,9 @@ Rules:
 
 - A bare upstream scope covers any resource under that upstream, except
   selector-backed credentials such as `linear-pat`, which require one selector.
-- A one-component suffix such as `linear:pit` is a credential selector.
+- A one-component suffix such as `linear:pit` is a credential selector. Selector
+  matching is case-sensitive and the selector must be granted explicitly; a
+  bare `linear` grant does not cover `linear:pit`.
 - A wildcard covers any exact repo under that owner but not a nested path.
 - Only one-segment wildcards are supported — `*` must be the entire repo
   component; the parser rejects tokens with more than one `/`.
@@ -221,8 +223,9 @@ Notes:
 - `secret_ref = "..."` is shorthand for
   `credential = { kind = "static-secret", secret_ref = "..." }`.
 - `linear-pat` requires API reverse-proxy mode, raw `Authorization` injection,
-  no resource extractor, and a non-empty explicit slug map. Missing, unknown,
-  bare, or multiple Linear selectors fail closed.
+  exactly `allowed_methods = ["POST"]`, exactly `allowed_paths = ["/graphql"]`,
+  no resource extractor, and a non-empty explicit case-sensitive slug map.
+  Missing, unknown, bare, or multiple Linear selectors fail closed.
 - `allowed_methods` and `allowed_paths` are independent allowlists applied
   before credential resolution. When either list is non-empty, a request must
   match it. Paths are matched exactly, without the query string.

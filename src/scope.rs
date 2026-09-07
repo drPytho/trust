@@ -251,9 +251,9 @@ impl ScopeSet {
 pub fn covers(allowed: &Scope, requested: &Scope) -> bool {
     match (allowed, requested) {
         (Scope::Upstream(a), Scope::Upstream(r)) => a == r,
-        // A bare upstream grant covers any selector or resource under that upstream.
-        (Scope::Upstream(a), Scope::Selector { upstream: r, .. })
-        | (Scope::Upstream(a), Scope::Resource { upstream: r, .. }) => a == r,
+        // A bare upstream grant covers resources, but selectors must be granted
+        // explicitly so a typo cannot mint a useless selector token.
+        (Scope::Upstream(a), Scope::Resource { upstream: r, .. }) => a == r,
         (
             Scope::Selector {
                 upstream: au,
@@ -410,7 +410,7 @@ mod tests {
         let exact = Scope::parse("github:example-org/example-repo").unwrap();
         let selector = Scope::parse("github:example-org").unwrap();
         assert!(covers(&bare, &exact)); // bare grants any repo
-        assert!(covers(&bare, &selector));
+        assert!(!covers(&bare, &selector));
         assert!(covers(&selector, &selector));
         assert!(!covers(
             &selector,
@@ -435,6 +435,13 @@ mod tests {
         assert_eq!(
             grant(&allowed, &ScopeSet::parse("mistral").unwrap()),
             Err("mistral".to_string())
+        );
+        assert_eq!(
+            grant(
+                &ScopeSet::parse("linear").unwrap(),
+                &ScopeSet::parse("linear:pit").unwrap()
+            ),
+            Err("linear:pit".to_string())
         );
     }
 

@@ -60,7 +60,7 @@ pub enum ConfigError {
     #[error("gcp-adc upstream '{0}' requires Authorization bearer injection")]
     GcpAdcNeedsBearer(String),
     #[error(
-        "linear-pat upstream '{0}' requires an API reverse-proxy route with raw Authorization injection and no resource"
+        "linear-pat upstream '{0}' requires an API reverse-proxy POST /graphql route with raw Authorization injection and no resource"
     )]
     BadLinearPatUpstream(String),
     #[error("linear-pat upstream '{upstream}' has invalid org slug or secret reference: {slug}")]
@@ -543,11 +543,23 @@ impl Config {
             }
         })?;
 
-        // Validate issuance client scopes.
+        // Validate issuance client scopes, including selector/upstream/key links.
         for c in &issuance.clients {
             for s in &c.allowed_scopes {
-                crate::scope::Scope::parse(s)
+                let scope = crate::scope::Scope::parse(s)
                     .map_err(|_| ConfigError::BadScope { scope: s.clone() })?;
+                if let crate::scope::Scope::Selector { upstream, key } = scope
+                    && !upstreams.iter().any(|candidate| {
+                        candidate.name == upstream
+                            && matches!(
+                                &candidate.credential,
+                                Some(CredentialSource::LinearPat { secret_refs })
+                                    if secret_refs.contains_key(&key)
+                            )
+                    })
+                {
+                    return Err(ConfigError::BadScope { scope: s.clone() });
+                }
             }
         }
 
@@ -716,6 +728,8 @@ fn validate_upstream(
         if ru.kind != UpstreamKind::Api
             || ru.intercept_connect
             || ru.resource.is_some()
+            || ru.allowed_methods.as_slice() != ["POST"]
+            || ru.allowed_paths.as_slice() != ["/graphql"]
             || !matches!(
                 injection,
                 Some(Injection {
@@ -1112,6 +1126,8 @@ listen_host = "linear.proxy.internal"
 origin = "https://api.linear.app"
 {credential}
 injection = {{ header = "authorization", scheme = "raw" }}
+allowed_methods = ["POST"]
+allowed_paths = ["/graphql"]
 "#
                 );
             assert!(matches!(
@@ -1119,6 +1135,18 @@ injection = {{ header = "authorization", scheme = "raw" }}
                 Err(ConfigError::BadLinearPatSecret { .. })
             ));
         }
+    }
+
+    #[test]
+    fn rejects_linear_pat_without_graphql_allowlists() {
+        let configured = include_str!("../examples/linear-js/config.toml").replace(
+            "allowed_methods = [\"POST\"]       # Linear GraphQL operations\n",
+            "",
+        );
+        assert!(matches!(
+            Config::from_str(&configured),
+            Err(ConfigError::BadLinearPatUpstream(_))
+        ));
     }
 
     #[test]
@@ -1170,12 +1198,24 @@ allowed_paths = ["{path}"]"#
 
     #[test]
     fn rejects_bad_allowed_scope() {
-        let bad = GOOD.replace(
-            r#"allowed_scopes = ["github:example-org/example-repo"]"#,
-            r#"allowed_scopes = ["bad:too/many/parts"]"#,
+        for scope in ["bad:too/many/parts", "github:example-org"] {
+            let bad = GOOD.replace(
+                r#"allowed_scopes = ["github:example-org/example-repo"]"#,
+                &format!(r#"allowed_scopes = ["{scope}"]"#),
+            );
+            assert!(matches!(
+                Config::from_str(&bad),
+                Err(ConfigError::BadScope { .. })
+            ));
+        }
+
+        let typo = include_str!("../examples/linear-js/config.toml").replacen(
+            r#"allowed_scopes = ["linear:pit", "linear:voi"]"#,
+            r#"allowed_scopes = ["linear:pti", "linear:voi"]"#,
+            1,
         );
         assert!(matches!(
-            Config::from_str(&bad),
+            Config::from_str(&typo),
             Err(ConfigError::BadScope { .. })
         ));
     }

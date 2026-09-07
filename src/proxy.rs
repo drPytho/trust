@@ -699,6 +699,8 @@ impl ProxyHttp for ProxyService {
         }
 
         // --- credential-injecting API branch ---
+        // authorize() already proved selector presence and map membership for
+        // linear-pat; the credential provider checks both again defensively.
         let credential_selector = match &upstream.credential {
             Some(crate::config::CredentialSource::LinearPat { .. }) => {
                 scopes.sole_selector(&upstream.name)

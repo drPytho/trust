@@ -160,6 +160,12 @@ mod tests {
             "POST",
             "/graphql"
         ));
+        assert!(authorize(
+            &ScopeSet::parse("linear:pit github:example-org/repo").unwrap(),
+            &up,
+            "POST",
+            "/graphql"
+        ));
         assert!(!authorize(
             &ScopeSet::parse("linear").unwrap(),
             &up,

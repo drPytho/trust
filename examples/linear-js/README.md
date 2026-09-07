@@ -71,8 +71,8 @@ client.
   `Authorization` value, whereas trust accepts client JWTs as Bearer tokens.
 - `credential.kind = "linear-pat"` maps explicit organization slugs to Secret
   Manager references. A request must carry exactly one configured
-  `linear:<org_slug>` scope; bare, unknown, or ambiguous Linear scopes fail
-  closed.
+  `linear:<org_slug>` scope; matching is case-sensitive, and bare, unknown, or
+  ambiguous Linear scopes fail closed.
 - Personal API keys use raw authorization. Linear OAuth access tokens are a
   different credential model and are not handled by `linear-pat`.
 - The example permits only `POST`, which is the method used by the Linear

@@ -199,6 +199,8 @@ impl ProxyHttp for MitmProxyService {
             .ok_or_else(|| Error::new_str("intercept route missing credential"))?
             .provider_name();
         let started = Instant::now();
+        // Config validation rejects selector-backed linear-pat credentials for
+        // intercept_connect routes, so MITM resolution never has a selector.
         match self
             .credentials
             .resolve(&upstream, &method, &path, None)
