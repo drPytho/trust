@@ -233,6 +233,12 @@ fn main() {
         mirrors,
         sync,
         metrics,
+    )
+    .with_github_bot(
+        config
+            .github_app
+            .as_ref()
+            .and_then(|github_app| github_app.bot.clone()),
     );
 
     let mut proxy = http_proxy_service(&server.configuration, service);

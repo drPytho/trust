@@ -7,7 +7,7 @@ use pingora::prelude::*;
 use pingora::upstreams::peer::HttpPeer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::config::{Upstream, UpstreamKind, UpstreamMode};
+use crate::config::{GithubBotIdentity, Upstream, UpstreamKind, UpstreamMode};
 use crate::credentials::{CredentialManager, CredentialProvider};
 use crate::decision::{authorize, extract_bearer, extract_client_token};
 use crate::git::backend;
@@ -16,7 +16,8 @@ use crate::git::mirror::MirrorStore;
 use crate::git::sync::SyncManager;
 use crate::github_cli::{
     GithubCliGraphqlOperation, MAX_GRAPHQL_BODY_BYTES, MAX_REST_BODY_BYTES, classify_graphql,
-    classify_rest_request, is_graphql_path, rest_upstream_path, validate_rest_body,
+    classify_rest_request, graphql_operation_label, is_graphql_path, rest_search_repository,
+    rest_upstream_path, rewrite_link_header, validate_rest_body,
 };
 use crate::inject::{inject, injection_value};
 use crate::jwt::Verifier;
@@ -32,6 +33,10 @@ pub struct RequestCtx {
     pub secret: Option<Secret>,
     pub credential_cache_key: Option<String>,
     npm_rewrite: Option<NpmRewrite>,
+    /// GitHub CLI REST requests rewrite pagination links back to Trust.
+    link_rewrite: Option<LinkRewrite>,
+    /// GraphQL `name/rootField` label, included in rejection logs.
+    github_operation: Option<String>,
     /// Set for git-cache push requests so `response_filter` can trigger a
     /// background mirror sync after the upstream push succeeds.
     /// Tuple: (upstream_name, owner, repo).
@@ -49,6 +54,8 @@ impl RequestCtx {
             secret: None,
             credential_cache_key: None,
             npm_rewrite: None,
+            link_rewrite: None,
+            github_operation: None,
             push_repo: None,
             started_at: Instant::now(),
             metrics,
@@ -69,10 +76,29 @@ impl RequestCtx {
 const MAX_NPM_METADATA_BYTES: usize = 64 * 1024 * 1024;
 const GITHUB_CLI_META_RESPONSE: &[u8] = br#"{"installed_version":"3.17.0"}"#;
 const GITHUB_CLI_ISSUE_FEATURE_RESPONSE: &[u8] = br#"{"data":{"Issue":{"fields":[]}}}"#;
-const GITHUB_CLI_PULL_REQUEST_FEATURE_RESPONSE: &[u8] =
-    br#"{"data":{"PullRequest":{"fields":[]},"StatusCheckRollupContextConnection":{"fields":[]}}}"#;
+// Advertising `isInMergeQueue` makes `gh pr merge` take its merge-queue path
+// (enablePullRequestAutoMerge) instead of a direct merge on queued branches.
+const GITHUB_CLI_PULL_REQUEST_FEATURE_RESPONSE: &[u8] = br#"{"data":{"PullRequest":{"fields":[{"name":"isInMergeQueue"}]},"StatusCheckRollupContextConnection":{"fields":[]}}}"#;
 const GITHUB_CLI_WORKFLOW_RUN_FEATURE_RESPONSE: &[u8] =
     br#"{"data":{"WorkflowRun":{"fields":[]}}}"#;
+
+struct LinkRewrite {
+    /// Upstream origin as it appears in GitHub's links.
+    origin: String,
+    /// Scheme and Host the client used to reach Trust.
+    base: String,
+    client_path: String,
+    upstream_path: String,
+}
+
+fn origin_base(origin: &crate::config::Origin) -> String {
+    let scheme = if origin.tls { "https" } else { "http" };
+    if (origin.tls && origin.port == 443) || (!origin.tls && origin.port == 80) {
+        format!("{scheme}://{}", origin.host)
+    } else {
+        format!("{scheme}://{}:{}", origin.host, origin.port)
+    }
+}
 
 struct NpmRewrite {
     from: String,
@@ -134,6 +160,7 @@ pub struct ProxyService {
     pub mirrors: Arc<MirrorStore>,
     pub sync: Arc<SyncManager>,
     pub metrics: Arc<ProxyMetrics>,
+    pub github_bot: Option<GithubBotIdentity>,
 }
 
 impl ProxyService {
@@ -193,7 +220,14 @@ impl ProxyService {
             mirrors,
             sync,
             metrics,
+            github_bot: None,
         }
+    }
+
+    /// Answer `GET /user` and `viewer { login }` on GitHub CLI upstreams.
+    pub fn with_github_bot(mut self, bot: Option<GithubBotIdentity>) -> ProxyService {
+        self.github_bot = bot;
+        self
     }
 
     async fn reject(
@@ -216,9 +250,11 @@ impl ProxyService {
         let host = request.headers.get("host").and_then(|v| v.to_str().ok());
         let path = request.uri.path();
         let client = session.client_addr();
+        let operation = ctx.github_operation.as_deref();
         log::warn!(
             "proxy request rejected status={status} reason={reason} upstream={upstream} \
-             client={client:?} method={method:?} host={host:?} path={path:?}"
+             client={client:?} method={method:?} host={host:?} path={path:?} \
+             graphql_operation={operation:?}"
         );
 
         session
@@ -236,8 +272,9 @@ impl ProxyService {
         session: &mut Session,
         ctx: &mut RequestCtx,
         upstream: Arc<Upstream>,
-        body: &'static [u8],
+        body: impl Into<Bytes>,
     ) -> Result<bool> {
+        let body = body.into();
         let mut response = pingora::http::ResponseHeader::build(200, Some(2))
             .map_err(|_| Error::new_str("failed to build GitHub CLI feature response"))?;
         response
@@ -250,10 +287,46 @@ impl ProxyService {
         session
             .write_response_header(Box::new(response), false)
             .await?;
-        session
-            .write_response_body(Some(Bytes::from_static(body)), true)
-            .await?;
+        session.write_response_body(Some(body), true).await?;
         Ok(true)
+    }
+
+    /// Answer the App bot's own identity, which GitHub refuses to installation
+    /// tokens. The response holds only static configuration, but still
+    /// requires a grant for this upstream.
+    async fn respond_github_bot_identity(
+        &self,
+        session: &mut Session,
+        ctx: &mut RequestCtx,
+        upstream: &Arc<Upstream>,
+        scopes: &ScopeSet,
+        graphql: bool,
+    ) -> Result<bool> {
+        if !scopes.grants_upstream(&upstream.name) {
+            return self
+                .reject(session, ctx, 403, "forbidden_scope", b"not allowed")
+                .await;
+        }
+        let Some(bot) = &self.github_bot else {
+            return self
+                .reject(
+                    session,
+                    ctx,
+                    403,
+                    "github_bot_identity_unconfigured",
+                    b"GitHub bot identity is not configured",
+                )
+                .await;
+        };
+        let body = if graphql {
+            serde_json::json!({"data": {"viewer": {"login": bot.login}}})
+        } else {
+            serde_json::json!({"login": bot.login, "id": bot.id, "type": "Bot"})
+        };
+        let body = serde_json::to_vec(&body)
+            .map_err(|_| Error::new_str("failed to encode GitHub bot identity"))?;
+        self.respond_github_cli_feature(session, ctx, upstream.clone(), body)
+            .await
     }
 
     /// GitHub CLI treats a custom GH_HOST as an Enterprise host. In the
@@ -282,6 +355,24 @@ impl ProxyService {
                     upstream.clone(),
                     GITHUB_CLI_META_RESPONSE,
                 )
+                .await
+                .map(GithubCliRoute::Responded);
+        }
+        if matches!(original_path, "/api/v3/user" | "/user") {
+            if method != "GET" {
+                return self
+                    .reject(
+                        session,
+                        ctx,
+                        405,
+                        "unsupported_github_cli_rest_method",
+                        b"unsupported GitHub CLI REST method",
+                    )
+                    .await
+                    .map(GithubCliRoute::Responded);
+            }
+            return self
+                .respond_github_bot_identity(session, ctx, upstream, scopes, false)
                 .await
                 .map(GithubCliRoute::Responded);
         }
@@ -351,8 +442,18 @@ impl ProxyService {
                     }
                 }
             }
+            ctx.github_operation = graphql_operation_label(&body);
             let resource = match classify_graphql(&body) {
-                Ok(GithubCliGraphqlOperation::RepositoryQuery(resource)) => resource,
+                Ok(
+                    GithubCliGraphqlOperation::RepositoryQuery(resource)
+                    | GithubCliGraphqlOperation::Search(resource),
+                ) => resource,
+                Ok(GithubCliGraphqlOperation::Viewer) => {
+                    return self
+                        .respond_github_bot_identity(session, ctx, upstream, scopes, true)
+                        .await
+                        .map(GithubCliRoute::Responded);
+                }
                 Ok(
                     operation @ (GithubCliGraphqlOperation::IssueFeatureDetection
                     | GithubCliGraphqlOperation::PullRequestFeatureDetection
@@ -391,7 +492,11 @@ impl ProxyService {
                     | GithubCliGraphqlOperation::UpdatePullRequest
                     | GithubCliGraphqlOperation::MarkPullRequestReady
                     | GithubCliGraphqlOperation::CreateComment
-                    | GithubCliGraphqlOperation::UpdateLabels,
+                    | GithubCliGraphqlOperation::UpdateLabels
+                    | GithubCliGraphqlOperation::ResolveReviewThread
+                    | GithubCliGraphqlOperation::ConvertPullRequestToDraft
+                    | GithubCliGraphqlOperation::EnableAutoMerge
+                    | GithubCliGraphqlOperation::EnqueuePullRequest,
                 ) => {
                     // These operations carry opaque node IDs rather than an
                     // owner/repository pair. Bind them to exactly one explicit
@@ -411,8 +516,9 @@ impl ProxyService {
                 }
                 Err(error) => {
                     log::warn!(
-                        "GitHub CLI GraphQL request rejected upstream={} reason={error}",
-                        upstream.name
+                        "GitHub CLI GraphQL request rejected upstream={} operation={:?} reason={error}",
+                        upstream.name,
+                        ctx.github_operation
                     );
                     return self
                         .reject(
@@ -524,15 +630,54 @@ impl ProxyService {
                     .map(GithubCliRoute::Responded);
             }
         }
-        if let Some(path) = rest_upstream_path(original_path) {
-            return Ok(GithubCliRoute::Forward {
-                policy_path: path.to_string(),
-                upstream_path: Some(path.to_string()),
-            });
-        }
+        let upstream_path = rest_upstream_path(original_path).unwrap_or(original_path);
+        let host = session
+            .req_header()
+            .headers
+            .get("host")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or(&upstream.listen_host);
+        let scheme = if session
+            .digest()
+            .is_some_and(|digest| digest.ssl_digest.is_some())
+        {
+            "https"
+        } else {
+            "http"
+        };
+        ctx.link_rewrite = Some(LinkRewrite {
+            origin: origin_base(&upstream.origin),
+            base: format!("{scheme}://{host}"),
+            client_path: original_path.to_string(),
+            upstream_path: upstream_path.to_string(),
+        });
+
+        // Issue search has no repository path. Bind it to the one repository
+        // its query string is confined to.
+        let search = rest_search_repository(original_path, session.req_header().uri.query());
+        let policy_path = match search {
+            Some(Ok(resource)) => format!("/repos/{}/{}", resource.owner, resource.repo),
+            Some(Err(error)) => {
+                log::warn!(
+                    "GitHub CLI REST search rejected upstream={} reason={error}",
+                    upstream.name
+                );
+                return self
+                    .reject(
+                        session,
+                        ctx,
+                        403,
+                        "unsupported_github_search",
+                        b"unsupported GitHub search",
+                    )
+                    .await
+                    .map(GithubCliRoute::Responded);
+            }
+            None => upstream_path.to_string(),
+        };
         Ok(GithubCliRoute::Forward {
-            policy_path: original_path.to_string(),
-            upstream_path: None,
+            policy_path,
+            upstream_path: (upstream_path != original_path).then(|| upstream_path.to_string()),
         })
     }
 }
@@ -599,15 +744,8 @@ impl ProxyHttp for ProxyService {
             rewrite_registry_to: Some(to),
         }) = &upstream.credential
         {
-            let origin = &upstream.origin;
-            let scheme = if origin.tls { "https" } else { "http" };
-            let from = if (origin.tls && origin.port == 443) || (!origin.tls && origin.port == 80) {
-                format!("{scheme}://{}", origin.host)
-            } else {
-                format!("{scheme}://{}:{}", origin.host, origin.port)
-            };
             ctx.npm_rewrite = Some(NpmRewrite {
-                from,
+                from: origin_base(&upstream.origin),
                 to: to.trim_end_matches('/').to_string(),
                 buffer_body: false,
                 buffer: Vec::new(),
@@ -816,6 +954,24 @@ impl ProxyHttp for ProxyService {
             && let Some(cache_key) = ctx.credential_cache_key.as_deref()
         {
             self.credentials.invalidate(cache_key).await;
+        }
+
+        if let Some(rewrite) = ctx.link_rewrite.as_ref()
+            && let Some(link) = upstream_response
+                .headers
+                .get("link")
+                .and_then(|value| value.to_str().ok())
+        {
+            let link = rewrite_link_header(
+                link,
+                &rewrite.origin,
+                &rewrite.base,
+                &rewrite.client_path,
+                &rewrite.upstream_path,
+            );
+            upstream_response
+                .insert_header("link", link)
+                .map_err(|_| Error::new_str("failed to rewrite GitHub pagination link"))?;
         }
 
         if let Some(rewrite) = ctx.npm_rewrite.as_mut() {

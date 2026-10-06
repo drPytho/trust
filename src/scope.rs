@@ -168,6 +168,15 @@ impl ScopeSet {
         found
     }
 
+    /// Whether any grant (bare, selector, or resource) names this upstream.
+    pub fn grants_upstream(&self, upstream: &str) -> bool {
+        self.0.iter().any(|scope| match scope {
+            Scope::Upstream(name)
+            | Scope::Selector { upstream: name, .. }
+            | Scope::Resource { upstream: name, .. } => name == upstream,
+        })
+    }
+
     pub fn to_scope_string(&self) -> String {
         self.0
             .iter()

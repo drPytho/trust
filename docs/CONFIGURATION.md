@@ -128,6 +128,10 @@ matching is case-insensitive; requests for an unmapped owner fail closed.
 [github_app]
 app_id = 123456
 private_key_secret_ref = "projects/my-proj/secrets/github-app-key/versions/latest"
+# Optional: the App's bot account, answered locally for `GET /user` and
+# `viewer { login }` on github-cli-repo upstreams. `id` is the bot user ID
+# (`gh api users/my-app[bot] --jq .id`), not the App ID.
+bot = { login = "my-app[bot]", id = 123456789 }
 
 [[github_app.installations]]
 owner = "example-org"
@@ -141,6 +145,9 @@ installation_id = 222222
 Installation tokens are minted restricted to the exact repository and
 configured permissions, and cached until five minutes before expiry. A 401
 from GitHub invalidates the cache entry so the next request re-mints.
+
+Installation tokens cannot read their own identity from GitHub, so without
+`bot` the `GET /user` and `viewer { login }` requests are refused.
 
 ## Upstreams
 
