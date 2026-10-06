@@ -172,6 +172,16 @@ fn default_github_api_base() -> String {
     "https://api.github.com".to_string()
 }
 
+/// The App's bot account. Installation tokens cannot call `GET /user` or
+/// query `viewer`, so the GitHub CLI route answers those locally from this.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct GithubBotIdentity {
+    /// Bot login, for example `my-app[bot]`.
+    pub login: String,
+    /// Bot user ID (not the App ID), from `GET /users/<login>`.
+    pub id: u64,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct GithubAppConfig {
     pub app_id: u64,
@@ -180,6 +190,8 @@ pub struct GithubAppConfig {
     pub api_base: String,
     #[serde(default)]
     pub installations: Vec<GithubInstallation>,
+    #[serde(default)]
+    pub bot: Option<GithubBotIdentity>,
 }
 
 impl GithubAppConfig {
@@ -602,6 +614,18 @@ fn validate_github_app(github_app: &GithubAppConfig) -> Result<(), ConfigError> 
     if !matches!(api_base.scheme(), "http" | "https") || api_base.host_str().is_none() {
         return Err(ConfigError::BadGithubApp(
             "api_base must be an HTTP(S) URL".to_string(),
+        ));
+    }
+    if let Some(bot) = &github_app.bot
+        && (bot.id == 0
+            || bot.login.is_empty()
+            || !bot
+                .login
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'[' | b']')))
+    {
+        return Err(ConfigError::BadGithubApp(
+            "bot requires a non-empty login and non-zero id".to_string(),
         ));
     }
     let mut owners = HashSet::new();
@@ -1407,6 +1431,47 @@ allowed_methods = ["GET", "HEAD"]
             npm.credential,
             Some(CredentialSource::GcpAdc { .. })
         ));
+    }
+
+    #[test]
+    fn parses_and_validates_github_bot_identity() {
+        let with_bot = |bot: &str| {
+            format!(
+                "{GOOD}\n[github_app]\napp_id = 123\nprivate_key_secret_ref = \"github-app-key\"\n{bot}\n"
+            )
+        };
+        let cfg = Config::from_str(&with_bot(
+            "bot = { login = \"pitsandbox[bot]\", id = 287698917 }",
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.github_app.unwrap().bot,
+            Some(GithubBotIdentity {
+                login: "pitsandbox[bot]".into(),
+                id: 287698917
+            })
+        );
+        assert!(
+            Config::from_str(&with_bot(""))
+                .unwrap()
+                .github_app
+                .unwrap()
+                .bot
+                .is_none()
+        );
+        for bot in [
+            "bot = { login = \"pitsandbox[bot]\", id = 0 }",
+            "bot = { login = \"\", id = 1 }",
+            "bot = { login = \"bad\\\"login\", id = 1 }",
+        ] {
+            assert!(
+                matches!(
+                    Config::from_str(&with_bot(bot)),
+                    Err(ConfigError::BadGithubApp(_))
+                ),
+                "{bot}"
+            );
+        }
     }
 
     #[test]

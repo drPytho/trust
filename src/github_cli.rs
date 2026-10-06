@@ -35,6 +35,16 @@ pub enum GraphqlRequestError {
     InvalidCommentMutation,
     #[error("pull request status-check query is not the bounded gh query shape")]
     InvalidStatusCheckQuery,
+    #[error("review thread mutation must contain one safe threadId")]
+    InvalidReviewThreadMutation,
+    #[error("pull request draft mutation must contain one safe pullRequestId")]
+    InvalidPullRequestDraft,
+    #[error(
+        "auto-merge and merge-queue mutations must pin a safe pullRequestId and expectedHeadOid"
+    )]
+    InvalidMergeMutation,
+    #[error("search must be one ISSUE search bound by exactly one repo: qualifier")]
+    InvalidSearch,
 }
 
 /// A GitHub CLI GraphQL operation whose repository authority Trust can bind
@@ -51,6 +61,15 @@ pub enum GithubCliGraphqlOperation {
     MarkPullRequestReady,
     CreateComment,
     UpdateLabels,
+    ResolveReviewThread,
+    ConvertPullRequestToDraft,
+    EnableAutoMerge,
+    EnqueuePullRequest,
+    /// `viewer { login }`: answered locally from the configured App bot
+    /// identity because installation tokens cannot query the viewer.
+    Viewer,
+    /// A `search` query whose `repo:` qualifier names the bound repository.
+    Search(Resource),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,11 +79,13 @@ pub enum GithubCliRestOperation {
     UpdateLabel,
     CreateIssueComment,
     ReplyReviewComment,
+    AddIssueLabels,
+    RemoveIssueLabel,
 }
 
 impl GithubCliRestOperation {
     pub fn requires_body(self) -> bool {
-        self != Self::Read
+        !matches!(self, Self::Read | Self::RemoveIssueLabel)
     }
 }
 
@@ -147,6 +168,19 @@ pub fn classify_rest_request(
         {
             Ok(GithubCliRestOperation::ReplyReviewComment)
         }
+        ("POST", ["", "repos", owner, repo, "issues", number, "labels"])
+            if safe_component(owner) && safe_component(repo) && is_positive_decimal(number) =>
+        {
+            Ok(GithubCliRestOperation::AddIssueLabels)
+        }
+        ("DELETE", ["", "repos", owner, repo, "issues", number, "labels", label])
+            if safe_component(owner)
+                && safe_component(repo)
+                && is_positive_decimal(number)
+                && safe_component(label) =>
+        {
+            Ok(GithubCliRestOperation::RemoveIssueLabel)
+        }
         _ => Err(RestRequestError::Unsupported),
     }
 }
@@ -155,7 +189,7 @@ pub fn validate_rest_body(
     operation: GithubCliRestOperation,
     body: &[u8],
 ) -> Result<(), RestRequestError> {
-    if operation == GithubCliRestOperation::Read {
+    if !operation.requires_body() {
         return Ok(());
     }
     let value: serde_json::Value =
@@ -163,7 +197,7 @@ pub fn validate_rest_body(
     let input = value.as_object().ok_or(RestRequestError::InvalidBody)?;
 
     match operation {
-        GithubCliRestOperation::Read => Ok(()),
+        GithubCliRestOperation::Read | GithubCliRestOperation::RemoveIssueLabel => Ok(()),
         GithubCliRestOperation::CreateLabel => {
             if !has_exact_keys(input, &["name", "color", "description"])
                 || !input.get("name").is_some_and(valid_nonempty_string)
@@ -198,7 +232,114 @@ pub fn validate_rest_body(
             }
             Ok(())
         }
+        GithubCliRestOperation::AddIssueLabels => {
+            if !has_exact_keys(input, &["labels"])
+                || !input
+                    .get("labels")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|labels| {
+                        !labels.is_empty() && labels.iter().all(valid_nonempty_string)
+                    })
+            {
+                return Err(RestRequestError::InvalidBody);
+            }
+            Ok(())
+        }
     }
+}
+
+/// Bind a REST `GET /search/issues` request to the single repository named
+/// by its `q` parameter. Returns `None` for any other path.
+pub fn rest_search_repository(
+    path: &str,
+    query: Option<&str>,
+) -> Option<Result<Resource, GraphqlRequestError>> {
+    if rest_upstream_path(path).unwrap_or(path) != "/search/issues" {
+        return None;
+    }
+    let mut q = None;
+    for (key, value) in url::form_urlencoded::parse(query.unwrap_or("").as_bytes()) {
+        if key == "q" {
+            if q.is_some() {
+                return Some(Err(GraphqlRequestError::InvalidSearch));
+            }
+            q = Some(value.into_owned());
+        }
+    }
+    Some(
+        q.as_deref()
+            .and_then(search_query_repository)
+            .ok_or(GraphqlRequestError::InvalidSearch),
+    )
+}
+
+/// Return the repository a GitHub issue/PR search string is confined to.
+///
+/// The installation token is restricted to the bound repository, but search
+/// still covers public repositories, so the query itself must name exactly
+/// one `repo:` qualifier. Qualifiers that widen or replace it (`org:`,
+/// `user:`, `owner:`, negated `repo:`) and boolean `OR`/grouping, which could
+/// escape the implicit AND, are rejected.
+pub fn search_query_repository(q: &str) -> Option<Resource> {
+    let mut selected = None;
+    for token in search_tokens(q)? {
+        let bare = token.strip_prefix('-').unwrap_or(&token);
+        if token.eq_ignore_ascii_case("or") {
+            return None;
+        }
+        let Some((key, value)) = bare.split_once(':') else {
+            continue;
+        };
+        let key = key.to_ascii_lowercase();
+        match key.as_str() {
+            "org" | "user" | "owner" => return None,
+            "repo" => {
+                if token.starts_with('-') || selected.is_some() {
+                    return None;
+                }
+                let (owner, repo) = value.trim_matches('"').split_once('/')?;
+                if !safe_component(owner) || !safe_component(repo) {
+                    return None;
+                }
+                selected = Some(Resource {
+                    owner: owner.to_string(),
+                    repo: repo.to_string(),
+                });
+            }
+            _ => {}
+        }
+    }
+    selected
+}
+
+/// Split a search string on whitespace outside double quotes. Grouping
+/// parentheses outside quotes are refused.
+fn search_tokens(q: &str) -> Option<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    for ch in q.chars() {
+        match ch {
+            '"' => {
+                quoted = !quoted;
+                current.push(ch);
+            }
+            '(' | ')' if !quoted => return None,
+            ch if ch.is_whitespace() && !quoted => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            ch => current.push(ch),
+        }
+    }
+    if quoted {
+        return None;
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    Some(tokens)
 }
 
 fn is_positive_decimal(value: &str) -> bool {
@@ -221,6 +362,68 @@ fn has_only_keys(input: &serde_json::Map<String, serde_json::Value>, allowed: &[
 
 fn has_exact_keys(input: &serde_json::Map<String, serde_json::Value>, expected: &[&str]) -> bool {
     input.len() == expected.len() && has_only_keys(input, expected)
+}
+
+/// Rewrite GitHub's REST pagination `Link` header so each page URL points
+/// back at the Trust host the client used instead of `api.github.com`,
+/// which a sandbox cannot reach.
+///
+/// GitHub often emits next-page links in the `/repositories/{id}/...` form.
+/// When that link's tail matches the forwarded `/repos/{owner}/{repo}/...`
+/// path, the named form is restored so Trust can still bind the repository.
+pub fn rewrite_link_header(
+    value: &str,
+    origin: &str,
+    base: &str,
+    client_path: &str,
+    upstream_path: &str,
+) -> String {
+    let prefix = client_path.strip_suffix(upstream_path).unwrap_or("");
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find('<') {
+        let Some(len) = rest[start + 1..].find('>') else {
+            break;
+        };
+        let target = &rest[start + 1..start + 1 + len];
+        out.push_str(&rest[..=start]);
+        match target
+            .strip_prefix(origin)
+            .filter(|path| path.starts_with('/'))
+        {
+            Some(path_and_query) => {
+                let (path, query) = match path_and_query.split_once('?') {
+                    Some((path, query)) => (path, Some(query)),
+                    None => (path_and_query, None),
+                };
+                out.push_str(base);
+                out.push_str(prefix);
+                out.push_str(&named_repository_path(path, upstream_path));
+                if let Some(query) = query {
+                    out.push('?');
+                    out.push_str(query);
+                }
+            }
+            None => out.push_str(target),
+        }
+        out.push('>');
+        rest = &rest[start + 1 + len + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn named_repository_path(path: &str, upstream_path: &str) -> String {
+    let link = path.split('/').collect::<Vec<_>>();
+    let upstream = upstream_path.split('/').collect::<Vec<_>>();
+    match (link.as_slice(), upstream.as_slice()) {
+        (["", "repositories", id, link_tail @ ..], ["", "repos", _, _, upstream_tail @ ..])
+            if is_positive_decimal(id) && link_tail == upstream_tail =>
+        {
+            upstream_path.to_string()
+        }
+        _ => path.to_string(),
+    }
 }
 
 pub fn is_graphql_path(path: &str) -> bool {
@@ -267,6 +470,10 @@ pub fn classify_graphql(body: &[u8]) -> Result<GithubCliGraphqlOperation, Graphq
             } else if query.name.as_deref() == Some("PullRequestStatusChecks") {
                 validate_status_checks_query(query, &request.variables)?;
                 Ok(GithubCliGraphqlOperation::StatusChecks)
+            } else if is_viewer_login_query(&query.selection_set.items) {
+                Ok(GithubCliGraphqlOperation::Viewer)
+            } else if is_search_query(query) {
+                search_repository(query, &request.variables).map(GithubCliGraphqlOperation::Search)
             } else {
                 repository_from_query(query, &request.variables)
                     .map(GithubCliGraphqlOperation::RepositoryQuery)
@@ -297,11 +504,79 @@ pub fn classify_graphql(body: &[u8]) -> Result<GithubCliGraphqlOperation, Graphq
                     validate_comment_mutation(mutation, &request.variables)?;
                     Ok(GithubCliGraphqlOperation::CreateComment)
                 }
+                "resolveReviewThread" => {
+                    validate_review_thread_mutation(mutation, &request.variables)?;
+                    Ok(GithubCliGraphqlOperation::ResolveReviewThread)
+                }
+                "convertPullRequestToDraft" => {
+                    validate_pull_request_draft(mutation, &request.variables)?;
+                    Ok(GithubCliGraphqlOperation::ConvertPullRequestToDraft)
+                }
+                "enablePullRequestAutoMerge" => {
+                    validate_auto_merge(mutation, &request.variables)?;
+                    Ok(GithubCliGraphqlOperation::EnableAutoMerge)
+                }
+                "enqueuePullRequest" => {
+                    validate_enqueue(mutation, &request.variables)?;
+                    Ok(GithubCliGraphqlOperation::EnqueuePullRequest)
+                }
                 _ => Err(GraphqlRequestError::UnsupportedOperation),
+            }
+        }
+        OperationDefinition::SelectionSet(selection_set) => {
+            // `query { viewer { login } }` is the only anonymous shorthand
+            // operation Trust understands.
+            if is_viewer_login_query(&selection_set.items) {
+                Ok(GithubCliGraphqlOperation::Viewer)
+            } else {
+                Err(GraphqlRequestError::UnsupportedOperation)
             }
         }
         _ => Err(GraphqlRequestError::UnsupportedOperation),
     }
+}
+
+/// Best-effort `name/rootField` label for logging a GraphQL request, whether
+/// or not Trust accepts it. Never includes variables.
+pub fn graphql_operation_label(body: &[u8]) -> Option<String> {
+    let request: GraphqlRequest = serde_json::from_slice(body).ok()?;
+    let document = parse_query::<String>(&request.query).ok()?;
+    let labels = document
+        .definitions
+        .iter()
+        .filter_map(|definition| {
+            let (kind, name, selection_set) = match definition {
+                Definition::Operation(OperationDefinition::Query(query)) => {
+                    ("query", query.name.as_deref(), &query.selection_set)
+                }
+                Definition::Operation(OperationDefinition::Mutation(mutation)) => (
+                    "mutation",
+                    mutation.name.as_deref(),
+                    &mutation.selection_set,
+                ),
+                Definition::Operation(OperationDefinition::Subscription(subscription)) => (
+                    "subscription",
+                    subscription.name.as_deref(),
+                    &subscription.selection_set,
+                ),
+                Definition::Operation(OperationDefinition::SelectionSet(selection_set)) => {
+                    ("query", None, selection_set)
+                }
+                Definition::Fragment(_) => return None,
+            };
+            let fields = selection_set
+                .items
+                .iter()
+                .filter_map(|selection| match selection {
+                    Selection::Field(field) => Some(field.name.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            Some(format!("{kind} {}/{fields}", name.unwrap_or("<anonymous>")))
+        })
+        .collect::<Vec<_>>();
+    (!labels.is_empty()).then(|| labels.join("; "))
 }
 
 /// Compatibility helper for callers that only accept repository-rooted query
@@ -318,8 +593,88 @@ pub fn repository_from_graphql(body: &[u8]) -> Result<Resource, GraphqlRequestEr
         | GithubCliGraphqlOperation::UpdatePullRequest
         | GithubCliGraphqlOperation::MarkPullRequestReady
         | GithubCliGraphqlOperation::CreateComment
-        | GithubCliGraphqlOperation::UpdateLabels => Err(GraphqlRequestError::UnsupportedOperation),
+        | GithubCliGraphqlOperation::UpdateLabels
+        | GithubCliGraphqlOperation::ResolveReviewThread
+        | GithubCliGraphqlOperation::ConvertPullRequestToDraft
+        | GithubCliGraphqlOperation::EnableAutoMerge
+        | GithubCliGraphqlOperation::EnqueuePullRequest
+        | GithubCliGraphqlOperation::Viewer
+        | GithubCliGraphqlOperation::Search(_) => Err(GraphqlRequestError::UnsupportedOperation),
     }
+}
+
+/// `viewer { login }` with no aliases, arguments, or directives.
+fn is_viewer_login_query(items: &[Selection<'_, String>]) -> bool {
+    let [Selection::Field(viewer)] = items else {
+        return false;
+    };
+    if viewer.name != "viewer"
+        || viewer.alias.is_some()
+        || !viewer.arguments.is_empty()
+        || !viewer.directives.is_empty()
+    {
+        return false;
+    }
+    matches!(
+        viewer.selection_set.items.as_slice(),
+        [Selection::Field(login)]
+            if login.name == "login"
+                && login.alias.is_none()
+                && login.arguments.is_empty()
+                && login.directives.is_empty()
+                && login.selection_set.items.is_empty()
+    )
+}
+
+fn is_search_query(query: &Query<'_, String>) -> bool {
+    matches!(
+        query.selection_set.items.as_slice(),
+        [Selection::Field(field)] if field.name == "search"
+    )
+}
+
+/// Bind the `search(query: $q, type: $type, ...)` root used by
+/// `gh pr list --search/--label/--author` to the repository named by its
+/// single `repo:` qualifier.
+fn search_repository(
+    query: &Query<'_, String>,
+    variables: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Resource, GraphqlRequestError> {
+    let [Selection::Field(field)] = query.selection_set.items.as_slice() else {
+        return Err(GraphqlRequestError::InvalidSearch);
+    };
+    if query.name.is_none() || field.alias.is_some() || !field.directives.is_empty() {
+        return Err(GraphqlRequestError::InvalidSearch);
+    }
+    let mut search_string = None;
+    let mut search_type = None;
+    for (name, value) in &field.arguments {
+        let resolved = match value {
+            Value::Variable(variable) => variables.get(variable).cloned(),
+            Value::String(value) => Some(serde_json::Value::String(value.clone())),
+            Value::Enum(value) => Some(serde_json::Value::String(value.clone())),
+            Value::Int(_) | Value::Null => None,
+            _ => return Err(GraphqlRequestError::InvalidSearch),
+        };
+        match name.as_str() {
+            "query" => search_string = resolved,
+            "type" => search_type = resolved,
+            "first" | "last" | "after" | "before" => {}
+            _ => return Err(GraphqlRequestError::InvalidSearch),
+        }
+    }
+    if !search_type
+        .as_ref()
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| matches!(value, "ISSUE" | "ISSUE_ADVANCED"))
+    {
+        return Err(GraphqlRequestError::InvalidSearch);
+    }
+    search_string
+        .as_ref()
+        .and_then(serde_json::Value::as_str)
+        .and_then(search_query_repository)
+        .ok_or(GraphqlRequestError::InvalidSearch)
 }
 
 /// GitHub CLI treats a custom `GH_HOST` as GitHub Enterprise and asks this
@@ -727,12 +1082,18 @@ fn validate_pull_request_update(
 ) -> Result<(), GraphqlRequestError> {
     let input =
         mutation_input(mutation, variables).ok_or(GraphqlRequestError::InvalidPullRequestUpdate)?;
+    // `gh pr create --label` applies labels through a follow-up
+    // `updatePullRequest` carrying only `labelIds`.
     if input.len() < 2
-        || !has_only_keys(input, &["pullRequestId", "title", "body"])
+        || !has_only_keys(input, &["pullRequestId", "title", "body", "labelIds"])
         || !input.get("pullRequestId").is_some_and(valid_node_id)
-        || !input.contains_key("title") && !input.contains_key("body")
         || input.get("title").is_some_and(|value| !value.is_string())
         || input.get("body").is_some_and(|value| !value.is_string())
+        || input.get("labelIds").is_some_and(|value| {
+            !value
+                .as_array()
+                .is_some_and(|ids| !ids.is_empty() && ids.iter().all(valid_node_id))
+        })
     {
         return Err(GraphqlRequestError::InvalidPullRequestUpdate);
     }
@@ -749,6 +1110,95 @@ fn validate_pull_request_ready(
         || !input.get("pullRequestId").is_some_and(valid_node_id)
     {
         return Err(GraphqlRequestError::InvalidPullRequestReady);
+    }
+    Ok(())
+}
+
+fn validate_review_thread_mutation(
+    mutation: &Mutation<'_, String>,
+    variables: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), GraphqlRequestError> {
+    let input = mutation_input(mutation, variables)
+        .ok_or(GraphqlRequestError::InvalidReviewThreadMutation)?;
+    if !has_exact_keys(input, &["threadId"]) || !input.get("threadId").is_some_and(valid_node_id) {
+        return Err(GraphqlRequestError::InvalidReviewThreadMutation);
+    }
+    Ok(())
+}
+
+fn validate_pull_request_draft(
+    mutation: &Mutation<'_, String>,
+    variables: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), GraphqlRequestError> {
+    let input =
+        mutation_input(mutation, variables).ok_or(GraphqlRequestError::InvalidPullRequestDraft)?;
+    if !has_exact_keys(input, &["pullRequestId"])
+        || !input.get("pullRequestId").is_some_and(valid_node_id)
+    {
+        return Err(GraphqlRequestError::InvalidPullRequestDraft);
+    }
+    Ok(())
+}
+
+/// A full SHA-1 or SHA-256 git object ID. Requiring it means GitHub merges
+/// only the exact head commit the agent checked.
+fn valid_git_object_id(value: &serde_json::Value) -> bool {
+    value.as_str().is_some_and(|oid| {
+        matches!(oid.len(), 40 | 64) && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
+
+/// `gh pr merge --auto --match-head-commit <sha>`. Merge queues receive the
+/// same mutation. Commit author overrides are not accepted.
+fn validate_auto_merge(
+    mutation: &Mutation<'_, String>,
+    variables: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), GraphqlRequestError> {
+    let input =
+        mutation_input(mutation, variables).ok_or(GraphqlRequestError::InvalidMergeMutation)?;
+    if !has_only_keys(
+        input,
+        &[
+            "pullRequestId",
+            "expectedHeadOid",
+            "mergeMethod",
+            "commitHeadline",
+            "commitBody",
+        ],
+    ) || !input.get("pullRequestId").is_some_and(valid_node_id)
+        || !input
+            .get("expectedHeadOid")
+            .is_some_and(valid_git_object_id)
+        || input
+            .get("mergeMethod")
+            .is_some_and(|value| !matches!(value.as_str(), Some("MERGE" | "SQUASH" | "REBASE")))
+        || input
+            .get("commitHeadline")
+            .is_some_and(|value| !value.is_string())
+        || input
+            .get("commitBody")
+            .is_some_and(|value| !value.is_string())
+    {
+        return Err(GraphqlRequestError::InvalidMergeMutation);
+    }
+    Ok(())
+}
+
+/// Add a pull request to the merge queue at the pinned head. `jump` (skipping
+/// ahead of queued pull requests) is not accepted.
+fn validate_enqueue(
+    mutation: &Mutation<'_, String>,
+    variables: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), GraphqlRequestError> {
+    let input =
+        mutation_input(mutation, variables).ok_or(GraphqlRequestError::InvalidMergeMutation)?;
+    if !has_exact_keys(input, &["pullRequestId", "expectedHeadOid"])
+        || !input.get("pullRequestId").is_some_and(valid_node_id)
+        || !input
+            .get("expectedHeadOid")
+            .is_some_and(valid_git_object_id)
+    {
+        return Err(GraphqlRequestError::InvalidMergeMutation);
     }
     Ok(())
 }
@@ -806,7 +1256,7 @@ mod tests {
     #[test]
     fn rejects_global_or_ambiguous_queries() {
         let global = request(
-            "query Viewer { viewer { login } }",
+            "query Viewer { viewer { login email } }",
             json!({"owner": "example-org", "repo": "example-repo"}),
         );
         assert_eq!(
@@ -1031,14 +1481,19 @@ mod tests {
                 json!({"pullRequestId": "PR_kwDOExample"}),
             ),
             (
-                "convertPullRequestToDraft",
-                "ConvertPullRequestToDraftInput",
+                "mergePullRequest",
+                "MergePullRequestInput",
+                json!({"pullRequestId": "PR_kwDOExample", "mergeMethod": "SQUASH"}),
+            ),
+            (
+                "disablePullRequestAutoMerge",
+                "DisablePullRequestAutoMergeInput",
                 json!({"pullRequestId": "PR_kwDOExample"}),
             ),
             (
-                "enablePullRequestAutoMerge",
-                "EnablePullRequestAutoMergeInput",
-                json!({"pullRequestId": "PR_kwDOExample", "mergeMethod": "SQUASH"}),
+                "unresolveReviewThread",
+                "UnresolveReviewThreadInput",
+                json!({"threadId": "PRRT_kwDOExample"}),
             ),
             (
                 "addPullRequestReview",
@@ -1220,5 +1675,376 @@ mod tests {
                 Err(RestRequestError::InvalidBody)
             );
         }
+    }
+    const HEAD_OID: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn classifies_review_draft_and_merge_mutations() {
+        let cases = [
+            (
+                "mutation ResolveReviewThread($input: ResolveReviewThreadInput!) { \
+                 resolveReviewThread(input: $input) { thread { id isResolved } } }",
+                json!({"input": {"threadId": "PRRT_kwDOExample"}}),
+                GithubCliGraphqlOperation::ResolveReviewThread,
+            ),
+            (
+                "mutation ConvertToDraft($input: ConvertPullRequestToDraftInput!) { \
+                 convertPullRequestToDraft(input: $input) { pullRequest { id } } }",
+                json!({"input": {"pullRequestId": "PR_kwDOExample"}}),
+                GithubCliGraphqlOperation::ConvertPullRequestToDraft,
+            ),
+            // `gh pr merge --auto --match-head-commit` on a merge-queue branch
+            // omits the merge method.
+            (
+                "mutation PullRequestAutoMerge($input: EnablePullRequestAutoMergeInput!) { \
+                 enablePullRequestAutoMerge(input: $input) { clientMutationId } }",
+                json!({"input": {"pullRequestId": "PR_kwDOExample", "expectedHeadOid": HEAD_OID}}),
+                GithubCliGraphqlOperation::EnableAutoMerge,
+            ),
+            (
+                "mutation PullRequestAutoMerge($input: EnablePullRequestAutoMergeInput!) { \
+                 enablePullRequestAutoMerge(input: $input) { clientMutationId } }",
+                json!({"input": {
+                    "pullRequestId": "PR_kwDOExample",
+                    "expectedHeadOid": HEAD_OID,
+                    "mergeMethod": "SQUASH",
+                    "commitHeadline": "Land it",
+                    "commitBody": ""
+                }}),
+                GithubCliGraphqlOperation::EnableAutoMerge,
+            ),
+            (
+                "mutation Enqueue($input: EnqueuePullRequestInput!) { \
+                 enqueuePullRequest(input: $input) { mergeQueueEntry { id } } }",
+                json!({"input": {"pullRequestId": "PR_kwDOExample", "expectedHeadOid": HEAD_OID}}),
+                GithubCliGraphqlOperation::EnqueuePullRequest,
+            ),
+        ];
+        for (query, variables, operation) in cases {
+            assert_eq!(classify_graphql(&request(query, variables)), Ok(operation));
+        }
+    }
+
+    #[test]
+    fn rejects_unpinned_or_widened_merge_mutations() {
+        let auto_merge = "mutation PullRequestAutoMerge($input: EnablePullRequestAutoMergeInput!) { \
+                          enablePullRequestAutoMerge(input: $input) { clientMutationId } }";
+        let enqueue = "mutation Enqueue($input: EnqueuePullRequestInput!) { \
+                       enqueuePullRequest(input: $input) { mergeQueueEntry { id } } }";
+        for (query, input) in [
+            (
+                auto_merge,
+                json!({"pullRequestId": "PR_kwDOExample", "mergeMethod": "SQUASH"}),
+            ),
+            (
+                auto_merge,
+                json!({"pullRequestId": "PR_kwDOExample", "expectedHeadOid": "abc123"}),
+            ),
+            (
+                auto_merge,
+                json!({
+                    "pullRequestId": "PR_kwDOExample",
+                    "expectedHeadOid": HEAD_OID,
+                    "mergeMethod": "FAST_FORWARD"
+                }),
+            ),
+            (
+                auto_merge,
+                json!({
+                    "pullRequestId": "PR_kwDOExample",
+                    "expectedHeadOid": HEAD_OID,
+                    "authorEmail": "someone@example.com"
+                }),
+            ),
+            (enqueue, json!({"pullRequestId": "PR_kwDOExample"})),
+            (
+                enqueue,
+                json!({"pullRequestId": "PR_kwDOExample", "expectedHeadOid": HEAD_OID, "jump": true}),
+            ),
+        ] {
+            assert_eq!(
+                classify_graphql(&request(query, json!({"input": input}))),
+                Err(GraphqlRequestError::InvalidMergeMutation),
+                "{input}"
+            );
+        }
+
+        let thread_extra = request(
+            "mutation ResolveReviewThread($input: ResolveReviewThreadInput!) { \
+             resolveReviewThread(input: $input) { thread { id } } }",
+            json!({"input": {"threadId": "PRRT_kwDOExample", "clientMutationId": "x"}}),
+        );
+        assert_eq!(
+            classify_graphql(&thread_extra),
+            Err(GraphqlRequestError::InvalidReviewThreadMutation)
+        );
+    }
+
+    #[test]
+    fn accepts_gh_pr_create_label_metadata_update() {
+        let query = "mutation PullRequestCreateMetadata($input: UpdatePullRequestInput!) { \
+                     updatePullRequest(input: $input) { clientMutationId } }";
+        assert_eq!(
+            classify_graphql(&request(
+                query,
+                json!({"input": {"pullRequestId": "PR_kwDOExample", "labelIds": ["LA_kwDOOne"]}}),
+            )),
+            Ok(GithubCliGraphqlOperation::UpdatePullRequest)
+        );
+        for input in [
+            json!({"pullRequestId": "PR_kwDOExample", "labelIds": []}),
+            json!({"pullRequestId": "PR_kwDOExample", "labelIds": ["LA_kwDOOne"], "assigneeIds": ["U_x"]}),
+            json!({"pullRequestId": "PR_kwDOExample"}),
+        ] {
+            assert_eq!(
+                classify_graphql(&request(query, json!({"input": input}))),
+                Err(GraphqlRequestError::InvalidPullRequestUpdate),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn classifies_only_the_bare_viewer_login_query() {
+        for query in [
+            "query UserCurrent { viewer { login } }",
+            "query { viewer { login } }",
+            "{ viewer { login } }",
+        ] {
+            assert_eq!(
+                classify_graphql(&request(query, json!({}))),
+                Ok(GithubCliGraphqlOperation::Viewer),
+                "{query}"
+            );
+        }
+        for query in [
+            "query UserCurrent { viewer { login email } }",
+            "query UserCurrent { me: viewer { login } }",
+            "query UserCurrent { viewer { login: email } }",
+            "{ viewer { repositories(first: 10) { nodes { name } } } }",
+        ] {
+            assert_ne!(
+                classify_graphql(&request(query, json!({}))),
+                Ok(GithubCliGraphqlOperation::Viewer),
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn binds_search_to_a_single_repo_qualifier() {
+        let resource = Resource {
+            owner: "example-org".into(),
+            repo: "example-repo".into(),
+        };
+        for q in [
+            "repo:example-org/example-repo is:pr is:open",
+            "is:pr label:\"needs review\" REPO:example-org/example-repo author:pitsandbox[bot]",
+            "fix flaky \"org:other\" repo:example-org/example-repo",
+        ] {
+            assert_eq!(search_query_repository(q), Some(resource.clone()), "{q}");
+        }
+        for q in [
+            "is:pr is:open",
+            "repo:example-org/example-repo repo:example-org/other",
+            "repo:example-org/example-repo OR repo:example-org/other",
+            "repo:example-org/example-repo org:other",
+            "-repo:example-org/example-repo",
+            "repo:example-org/example-repo user:someone",
+            "(repo:example-org/example-repo) is:pr",
+            "repo:example-org",
+            "repo:example-org/example-repo \"unterminated",
+        ] {
+            assert_eq!(search_query_repository(q), None, "{q}");
+        }
+    }
+
+    #[test]
+    fn classifies_gh_pr_list_search_query() {
+        let query = "fragment pr on PullRequest{number title} \
+                     query PullRequestSearch($q: String!, $type: SearchType!, $limit: Int!, $endCursor: String) { \
+                     search(query: $q, type: $type, first: $limit, after: $endCursor) { \
+                     issueCount nodes { ...pr } pageInfo { hasNextPage endCursor } } }";
+        assert_eq!(
+            classify_graphql(&request(
+                query,
+                json!({
+                    "q": "is:pr label:ready repo:example-org/example-repo",
+                    "type": "ISSUE",
+                    "limit": 30,
+                    "endCursor": null
+                }),
+            )),
+            Ok(GithubCliGraphqlOperation::Search(Resource {
+                owner: "example-org".into(),
+                repo: "example-repo".into()
+            }))
+        );
+        for variables in [
+            json!({"q": "is:pr label:ready", "type": "ISSUE", "limit": 30}),
+            json!({"q": "repo:example-org/example-repo", "type": "REPOSITORY", "limit": 30}),
+        ] {
+            assert_eq!(
+                classify_graphql(&request(query, variables)),
+                Err(GraphqlRequestError::InvalidSearch)
+            );
+        }
+    }
+
+    #[test]
+    fn binds_rest_issue_search() {
+        assert_eq!(
+            rest_search_repository(
+                "/api/v3/search/issues",
+                Some("q=repo%3Aexample-org%2Fexample-repo+is%3Apr&per_page=100"),
+            ),
+            Some(Ok(Resource {
+                owner: "example-org".into(),
+                repo: "example-repo".into()
+            }))
+        );
+        assert_eq!(
+            rest_search_repository("/api/v3/search/issues", Some("q=is%3Apr")),
+            Some(Err(GraphqlRequestError::InvalidSearch))
+        );
+        assert_eq!(
+            rest_search_repository(
+                "/api/v3/search/issues",
+                Some("q=repo%3Aexample-org%2Fexample-repo&q=org%3Aother"),
+            ),
+            Some(Err(GraphqlRequestError::InvalidSearch))
+        );
+        assert_eq!(
+            rest_search_repository("/api/v3/repos/o/r/pulls", None),
+            None
+        );
+    }
+
+    #[test]
+    fn classifies_bounded_issue_label_rest_writes() {
+        assert_eq!(
+            classify_rest_request(
+                "POST",
+                "/api/v3/repos/example-org/example-repo/issues/42/labels"
+            ),
+            Ok(GithubCliRestOperation::AddIssueLabels)
+        );
+        assert_eq!(
+            classify_rest_request(
+                "DELETE",
+                "/api/v3/repos/example-org/example-repo/issues/42/labels/preview%3Aweb"
+            ),
+            Ok(GithubCliRestOperation::RemoveIssueLabel)
+        );
+        assert!(!GithubCliRestOperation::RemoveIssueLabel.requires_body());
+        for (method, path) in [
+            (
+                "PUT",
+                "/api/v3/repos/example-org/example-repo/issues/42/labels",
+            ),
+            (
+                "DELETE",
+                "/api/v3/repos/example-org/example-repo/issues/42/labels",
+            ),
+            (
+                "DELETE",
+                "/api/v3/repos/example-org/example-repo/labels/name",
+            ),
+        ] {
+            assert_eq!(
+                classify_rest_request(method, path),
+                Err(RestRequestError::Unsupported),
+                "{method} {path}"
+            );
+        }
+        let valid = serde_json::to_vec(&json!({"labels": ["review:claude"]})).unwrap();
+        assert_eq!(
+            validate_rest_body(GithubCliRestOperation::AddIssueLabels, &valid),
+            Ok(())
+        );
+        for body in [
+            json!(["review:claude"]),
+            json!({"labels": []}),
+            json!({"labels": [""]}),
+            json!({"labels": ["x"], "extra": 1}),
+        ] {
+            assert_eq!(
+                validate_rest_body(
+                    GithubCliRestOperation::AddIssueLabels,
+                    &serde_json::to_vec(&body).unwrap()
+                ),
+                Err(RestRequestError::InvalidBody),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrites_pagination_links_to_the_trust_host() {
+        let link = "<https://api.github.com/repositories/1300192/issues/42/comments?per_page=100&page=2>; rel=\"next\", \
+                    <https://api.github.com/repositories/1300192/issues/42/comments?per_page=100&page=5>; rel=\"last\"";
+        assert_eq!(
+            rewrite_link_header(
+                link,
+                "https://api.github.com",
+                "https://github-cli.proxy.internal",
+                "/api/v3/repos/example-org/example-repo/issues/42/comments",
+                "/repos/example-org/example-repo/issues/42/comments",
+            ),
+            "<https://github-cli.proxy.internal/api/v3/repos/example-org/example-repo/issues/42/comments?per_page=100&page=2>; rel=\"next\", \
+             <https://github-cli.proxy.internal/api/v3/repos/example-org/example-repo/issues/42/comments?per_page=100&page=5>; rel=\"last\""
+        );
+
+        assert_eq!(
+            rewrite_link_header(
+                "<https://api.github.com/search/issues?q=repo%3Ao%2Fr&page=2>; rel=\"next\"",
+                "https://api.github.com",
+                "http://gh.test:8080",
+                "/search/issues",
+                "/search/issues",
+            ),
+            "<http://gh.test:8080/search/issues?q=repo%3Ao%2Fr&page=2>; rel=\"next\""
+        );
+
+        // Different tails and foreign hosts are not mapped to the request repo.
+        assert_eq!(
+            rewrite_link_header(
+                "<https://api.github.com/repositories/1/pulls?page=2>; rel=\"next\", <https://evil.example/x>; rel=\"x\"",
+                "https://api.github.com",
+                "https://trust",
+                "/api/v3/repos/o/r/issues",
+                "/repos/o/r/issues",
+            ),
+            "<https://trust/api/v3/repositories/1/pulls?page=2>; rel=\"next\", <https://evil.example/x>; rel=\"x\""
+        );
+        // `https://api.github.com.evil` must not match the origin prefix.
+        assert_eq!(
+            rewrite_link_header(
+                "<https://api.github.com.evil/x>; rel=\"next\"",
+                "https://api.github.com",
+                "https://trust",
+                "/api/v3/x",
+                "/x",
+            ),
+            "<https://api.github.com.evil/x>; rel=\"next\""
+        );
+    }
+
+    #[test]
+    fn labels_graphql_operations_without_variables() {
+        assert_eq!(
+            graphql_operation_label(&request(
+                "mutation ResolveReviewThread($input: ResolveReviewThreadInput!) { \
+                 resolveReviewThread(input: $input) { thread { id } } }",
+                json!({"input": {"threadId": "secret-ish"}}),
+            ))
+            .as_deref(),
+            Some("mutation ResolveReviewThread/resolveReviewThread")
+        );
+        assert_eq!(
+            graphql_operation_label(&request("{ viewer { login } }", json!({}))).as_deref(),
+            Some("query <anonymous>/viewer")
+        );
+        assert_eq!(graphql_operation_label(b"not json"), None);
     }
 }

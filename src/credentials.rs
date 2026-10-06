@@ -434,6 +434,7 @@ mod tests {
             app_id: 1,
             private_key_secret_ref: "key".into(),
             api_base: "https://api.github.com".into(),
+            bot: None,
             installations: vec![
                 GithubInstallation {
                     owner: "Org-One".into(),
@@ -492,6 +493,7 @@ mod tests {
             app_id: 123,
             private_key_secret_ref: "github-key".into(),
             api_base: format!("http://{address}"),
+            bot: None,
             installations: vec![
                 GithubInstallation {
                     owner: "org-one".into(),
@@ -696,6 +698,7 @@ mod tests {
             app_id: 123,
             private_key_secret_ref: "github-key".into(),
             api_base: format!("http://{address}"),
+            bot: None,
             installations: vec![
                 GithubInstallation {
                     owner: "org-one".into(),

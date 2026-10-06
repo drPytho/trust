@@ -26,8 +26,9 @@ gh pr create --repo "$GH_REPO" --base main --head agent-branch --title "Scoped P
 
 The GitHub App installation token must request at least `contents: read`,
 `pull_requests: write`, `issues: write`, `actions: read`, `checks: read`, and
-`statuses: read` for the full capability set below. Trust can only narrow the
-permissions already granted to the installed App.
+`statuses: read` for the full capability set below. Auto-merge and the merge
+queue also need `contents: write`. Trust can only narrow the permissions
+already granted to the installed App.
 
 The CLI sends `Authorization: token <JWT>`; that scheme is accepted only by
 `github-cli-repo` mode. Trust validates the JWT, derives the exact repository,
@@ -42,34 +43,65 @@ What is allowed, and what fails closed:
   URL; a network-restricted sandbox must also route that follow-up request
   through Trust's forward proxy using an explicitly allowed destination or
   the temporary `outbound-audit` discovery scope.
-- **REST writes**: only label creation/update, top-level issue or pull-request
+- **Pagination**: Trust rewrites each upstream URL in a REST `Link` header to
+  the Trust host the client used, so `gh api --paginate` and other clients
+  follow page 2 and later through Trust. GitHub's `/repositories/{id}/...`
+  link form is mapped back to the request's `/repos/{owner}/{repo}/...` path
+  so the next page binds to the same repository.
+- **REST writes**: only label creation/update, adding labels to or removing
+  one label from an issue or pull request, top-level issue or pull-request
   comments, and replies to inline pull-request review comments are accepted.
   JSON bodies have operation-specific key and value validation. Label updates
   may change only color and description; renaming or deleting labels is not
   allowed.
+- **Search**: `GET /search/issues` (`gh search prs/issues`) and the GraphQL
+  `search(type: ISSUE)` query used by `gh pr list --search/--label/--author`.
+  The query string must contain exactly one `repo:owner/name` qualifier, which
+  binds the request to that repository's scope. `org:`, `user:`, `owner:`,
+  negated `repo:`, `OR`, and parentheses are rejected because they could widen
+  results beyond the repository.
+- **Identity**: `GET /api/v3/user` and `viewer { login }` are answered
+  locally from `github_app.bot` (see
+  [CONFIGURATION.md](CONFIGURATION.md#github-app-credentials)), because GitHub
+  refuses them to installation tokens. They require a `github-cli` grant and
+  are refused when no bot is configured.
 - **GraphQL reads**: named queries whose root fields all select the same
   repository through variables, plus the exact status-check query used by
   `gh pr checks`.
 - **GraphQL writes**: `createPullRequest`, adding/removing labels, updating
-  only a pull request's title/body, marking a draft ready for review, and
-  adding a discussion comment. These operations carry opaque node IDs, so
+  a pull request's title, body, or labels, marking a draft ready for review,
+  converting a pull request back to draft, adding a discussion comment, and
+  resolving a review thread. These operations carry opaque node IDs, so
   trust requires exactly one exact `github-cli:owner/repo` scope and uses it
   to obtain a repository-restricted installation token; GitHub rejects node
   IDs from any other repository.
+- **Auto-merge and merge queue**: `enablePullRequestAutoMerge` and
+  `enqueuePullRequest`, with the same single-repository binding. Both must pin
+  `expectedHeadOid` to a full commit SHA, so GitHub only merges the exact
+  commit the agent checked (`gh pr merge --auto --match-head-commit <sha>`).
+  Commit author overrides and queue jumping are rejected. A direct
+  `mergePullRequest` is still denied. On a branch without a merge queue, `gh
+  pr merge --auto` sends a direct merge when the pull request is already
+  mergeable, so that case fails.
 - **Enterprise probes**: `gh` runs feature detection against a custom host;
   trust answers only the exact static `/api/v3/meta`, `Issue_fields`,
   `PullRequest_fields`, and `PullRequest_fields2` probes locally, after the
-  same exact-scope check.
-- **Everything else** — merge or auto-merge, approvals, closing/reopening,
-  converting a ready pull request back to draft, changing its base branch,
-  workflow dispatch/rerun/cancel, comment or label deletion, branch/repository
-  administration, other mutations or REST writes, global queries, generic
-  node lookups, search, multiple operations, and bodies over 64 KiB — is
-  denied.
+  same exact-scope check. `PullRequest_fields` advertises `isInMergeQueue` so
+  `gh pr merge` uses its merge-queue path.
+- **Everything else**: direct merge, disabling auto-merge, approvals,
+  closing/reopening, unresolving review threads, changing a pull request's
+  base branch, workflow dispatch/rerun/cancel, comment or label deletion,
+  branch/repository administration, other mutations or REST writes, global
+  queries, generic node lookups, unbound search, multiple operations, and
+  bodies over 64 KiB are denied. Rejection logs include the method, path,
+  deny reason, and the GraphQL operation name and root field (never
+  variables).
 
 This supports the routine sandbox workflow: inspect repository and CI state,
-create or update a pull request, mark it ready, create and apply labels, and
-post review follow-ups. Repository governance remains outside the sandbox.
+create or update a pull request, mark it ready or move it back to draft,
+create and apply labels, post and resolve review follow-ups, and land a
+pinned commit through auto-merge or the merge queue. Other repository
+governance stays outside the sandbox.
 
 ## Routing gh's git subprocess
 

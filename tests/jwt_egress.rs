@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use pingora::prelude::*;
 use trust::config::{
-    CredentialSource, Injection, InjectionScheme, Origin, Upstream, UpstreamKind, UpstreamMode,
+    CredentialSource, GithubBotIdentity, Injection, InjectionScheme, Origin, Upstream,
+    UpstreamKind, UpstreamMode,
 };
 use trust::credentials::{
     CredentialError, CredentialProvider, ResolutionOutcome, ResolvedCredential,
@@ -52,8 +53,18 @@ impl CredentialProvider for RecordingCredentials {
 }
 
 fn start_mock_upstream() -> (u16, Arc<Mutex<Vec<String>>>) {
+    start_mock_upstream_with_response(|_| {
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
+    })
+}
+
+/// `response` receives the mock's own port, for absolute upstream URLs.
+fn start_mock_upstream_with_response(
+    response: fn(u16) -> Vec<u8>,
+) -> (u16, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    let response = response(port);
     let received = Arc::new(Mutex::new(Vec::<String>::new()));
     let sink = received.clone();
     std::thread::spawn(move || {
@@ -91,8 +102,7 @@ fn start_mock_upstream() -> (u16, Arc<Mutex<Vec<String>>>) {
             sink.lock()
                 .unwrap()
                 .push(String::from_utf8_lossy(&request).to_string());
-            let _ = stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            let _ = stream.write_all(&response);
         }
     });
     (port, received)
@@ -866,7 +876,7 @@ fn github_cli_repository_capabilities_are_bounded_and_scoped() {
     );
     assert_eq!(pull_request_feature_response.0, 200);
     assert!(pull_request_feature_response.1.contains(
-        r#"{"data":{"PullRequest":{"fields":[]},"StatusCheckRollupContextConnection":{"fields":[]}}}"#
+        r#"{"data":{"PullRequest":{"fields":[{"name":"isInMergeQueue"}]},"StatusCheckRollupContextConnection":{"fields":[]}}}"#
     ));
 
     let workflow_run_fields = serde_json::json!({
@@ -1080,7 +1090,8 @@ fn github_cli_repository_capabilities_are_bounded_and_scoped() {
         );
     }
 
-    // Merge governance and base-branch changes remain blocked.
+    // Auto-merge without a pinned head commit and base-branch changes remain
+    // blocked.
     let destructive = serde_json::json!({
         "query": "mutation Blocked($input: EnablePullRequestAutoMergeInput!) { enablePullRequestAutoMerge(input: $input) { pullRequest { id } } }",
         "variables": {"input": {
@@ -1123,7 +1134,8 @@ fn github_cli_repository_capabilities_are_bounded_and_scoped() {
         403
     );
 
-    // Global GraphQL operations fail before reaching the upstream.
+    // Global GraphQL operations fail before reaching the upstream. Without a
+    // configured bot identity, `viewer` is refused as well.
     let global = serde_json::json!({
         "query": "query Viewer { viewer { login } }",
         "variables": {"owner": "example-org", "repo": "example-repo"}
@@ -1209,6 +1221,348 @@ fn github_cli_repository_capabilities_are_bounded_and_scoped() {
             "/repos/example-org/example-repo",
             "/repos/example-org/example-repo",
         ]
+    );
+}
+
+fn start_github_cli_proxy(
+    mock_port: u16,
+    keystore: Arc<Keystore>,
+    resolved_paths: Arc<Mutex<Vec<String>>>,
+    bot: Option<GithubBotIdentity>,
+) -> u16 {
+    let mut upstream = (*scoped_upstream(mock_port)).clone();
+    upstream.name = "github-cli".into();
+    upstream.resource = Some(ResourceKind::GithubCliRepo);
+    upstream.listen_host = "github-cli.test".into();
+    let service = ProxyService::with_credentials_and_metrics(
+        Router::new(&[Arc::new(upstream)]),
+        Verifier::new("trust".into(), "trust-proxy".into()),
+        keystore,
+        Arc::new(RecordingCredentials { resolved_paths }),
+        Arc::new(MirrorStore::new("/tmp")),
+        Arc::new(SyncManager::new()),
+        Arc::new(ProxyMetrics::new()),
+    )
+    .with_github_bot(bot);
+    let proxy_port = free_port();
+    let addr = format!("127.0.0.1:{proxy_port}");
+    std::thread::spawn(move || {
+        let mut server = Server::new(None).unwrap();
+        server.bootstrap();
+        let mut proxy = http_proxy_service(&server.configuration, service);
+        proxy.add_tcp(&addr);
+        server.add_service(proxy);
+        server.run_forever();
+    });
+    for _ in 0..50 {
+        if TcpStream::connect(("127.0.0.1", proxy_port)).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    proxy_port
+}
+
+#[test]
+fn github_cli_build_sandbox_workflow() {
+    // The mock answers like GitHub's REST pagination: the next page link uses
+    // the `/repositories/{id}` form on the upstream origin.
+    let (mock_port, upstream_reqs) = start_mock_upstream_with_response(|port| {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nLink: <http://127.0.0.1:{port}/repositories/42/issues/7/comments?per_page=100&page=2>; rel=\"next\"\r\nConnection: close\r\n\r\nok"
+        )
+        .into_bytes()
+    });
+    let keystore = Arc::new(Keystore::new());
+    keystore.store(build_key_material(&signing_key_pem(), None).unwrap());
+    let km = keystore.load().unwrap();
+    let issuer = Issuer::new(
+        "trust".into(),
+        "trust-proxy".into(),
+        Duration::from_secs(3600),
+    );
+    let mint = |scopes: &str| {
+        issuer
+            .mint(
+                &km,
+                "spiffe://example/sandbox/test",
+                &ScopeSet::parse(scopes).unwrap(),
+                jsonwebtoken::get_current_timestamp(),
+            )
+            .unwrap()
+    };
+    let token = mint("github-cli:example-org/example-repo");
+    let multi_token = mint("github-cli:example-org/example-repo github-cli:example-org/other");
+    let unrelated_token = mint("github:example-org/example-repo");
+
+    let resolved_paths = Arc::new(Mutex::new(Vec::new()));
+    let proxy_port = start_github_cli_proxy(
+        mock_port,
+        keystore.clone(),
+        resolved_paths.clone(),
+        Some(GithubBotIdentity {
+            login: "pitsandbox[bot]".into(),
+            id: 287698917,
+        }),
+    );
+    let auth = format!("token {token}");
+
+    // Identity is answered locally; GitHub refuses /user to installation tokens.
+    let user = raw_request_with_authorization(proxy_port, "github-cli.test", "/api/v3/user", &auth);
+    assert_eq!(user.0, 200);
+    assert!(
+        user.1
+            .ends_with(r#"{"id":287698917,"login":"pitsandbox[bot]","type":"Bot"}"#)
+    );
+    let viewer = raw_json_request(
+        proxy_port,
+        "github-cli.test",
+        "/api/graphql",
+        "token",
+        &multi_token,
+        r#"{"query":"query UserCurrent{viewer{login}}"}"#,
+    );
+    assert_eq!(viewer.0, 200);
+    assert!(
+        viewer
+            .1
+            .ends_with(r#"{"data":{"viewer":{"login":"pitsandbox[bot]"}}}"#)
+    );
+    assert_eq!(
+        raw_request_with_authorization(
+            proxy_port,
+            "github-cli.test",
+            "/api/v3/user",
+            &format!("token {unrelated_token}"),
+        )
+        .0,
+        403
+    );
+
+    // REST pages come back pointing at Trust, in the named repository form.
+    let comments = raw_request_with_authorization(
+        proxy_port,
+        "github-cli.test",
+        "/api/v3/repos/example-org/example-repo/issues/7/comments?per_page=100",
+        &auth,
+    );
+    assert_eq!(comments.0, 200);
+    let link = comments
+        .1
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("link:"))
+        .unwrap();
+    assert_eq!(
+        link.split_once(':').unwrap().1.trim(),
+        "<http://github-cli.test/api/v3/repos/example-org/example-repo/issues/7/comments?per_page=100&page=2>; rel=\"next\""
+    );
+
+    // Review, draft, and merge-queue mutations bind to the sole exact scope.
+    let head_oid = "0123456789abcdef0123456789abcdef01234567";
+    let mutations = [
+        serde_json::json!({
+            "query": "mutation ResolveReviewThread($input: ResolveReviewThreadInput!) { resolveReviewThread(input: $input) { thread { id } } }",
+            "variables": {"input": {"threadId": "PRRT_kwDOExample"}}
+        }),
+        serde_json::json!({
+            "query": "mutation ConvertToDraft($input: ConvertPullRequestToDraftInput!) { convertPullRequestToDraft(input: $input) { pullRequest { id } } }",
+            "variables": {"input": {"pullRequestId": "PR_kwDOExample"}}
+        }),
+        serde_json::json!({
+            "query": "mutation PullRequestAutoMerge($input: EnablePullRequestAutoMergeInput!) { enablePullRequestAutoMerge(input: $input) { clientMutationId } }",
+            "variables": {"input": {"pullRequestId": "PR_kwDOExample", "expectedHeadOid": head_oid}}
+        }),
+        serde_json::json!({
+            "query": "mutation Enqueue($input: EnqueuePullRequestInput!) { enqueuePullRequest(input: $input) { mergeQueueEntry { id } } }",
+            "variables": {"input": {"pullRequestId": "PR_kwDOExample", "expectedHeadOid": head_oid}}
+        }),
+        serde_json::json!({
+            "query": "mutation PullRequestCreateMetadata($input: UpdatePullRequestInput!) { updatePullRequest(input: $input) { clientMutationId } }",
+            "variables": {"input": {"pullRequestId": "PR_kwDOExample", "labelIds": ["LA_kwDOReady"]}}
+        }),
+    ]
+    .map(|body| body.to_string());
+    for body in &mutations {
+        assert_eq!(
+            raw_json_request(
+                proxy_port,
+                "github-cli.test",
+                "/api/graphql",
+                "token",
+                &token,
+                body
+            )
+            .0,
+            200,
+            "{body}"
+        );
+        assert_eq!(
+            raw_json_request(
+                proxy_port,
+                "github-cli.test",
+                "/api/graphql",
+                "token",
+                &multi_token,
+                body
+            )
+            .0,
+            403,
+            "{body}"
+        );
+    }
+    // Direct merges and unpinned auto-merge remain blocked.
+    for body in [
+        serde_json::json!({
+            "query": "mutation PullRequestMerge($input: MergePullRequestInput!) { mergePullRequest(input: $input) { clientMutationId } }",
+            "variables": {"input": {"pullRequestId": "PR_kwDOExample", "expectedHeadOid": head_oid}}
+        }),
+        serde_json::json!({
+            "query": "mutation PullRequestAutoMerge($input: EnablePullRequestAutoMergeInput!) { enablePullRequestAutoMerge(input: $input) { clientMutationId } }",
+            "variables": {"input": {"pullRequestId": "PR_kwDOExample", "mergeMethod": "SQUASH"}}
+        }),
+    ] {
+        assert_eq!(
+            raw_json_request(
+                proxy_port,
+                "github-cli.test",
+                "/api/graphql",
+                "token",
+                &token,
+                &body.to_string()
+            )
+            .0,
+            403
+        );
+    }
+
+    // Issue labels over REST stay bound to the path repository.
+    assert_eq!(
+        raw_json_rest_request(
+            proxy_port,
+            "github-cli.test",
+            "POST",
+            "/api/v3/repos/example-org/example-repo/issues/7/labels",
+            &auth,
+            r#"{"labels":["review:claude"]}"#,
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        raw_request_with_method_and_authorization(
+            proxy_port,
+            "github-cli.test",
+            "DELETE",
+            "/api/v3/repos/example-org/example-repo/issues/7/labels/review%3Aclaude",
+            &auth,
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        raw_json_rest_request(
+            proxy_port,
+            "github-cli.test",
+            "POST",
+            "/api/v3/repos/example-org/elsewhere/issues/7/labels",
+            &auth,
+            r#"{"labels":["review:claude"]}"#,
+        )
+        .0,
+        403
+    );
+
+    // Search must name exactly one granted repository. Multi-repo sandboxes
+    // may search any repository they hold.
+    let search = serde_json::json!({
+        "query": "fragment pr on PullRequest{number} query PullRequestSearch($q: String!, $type: SearchType!, $limit: Int!, $endCursor: String) { search(query: $q, type: $type, first: $limit, after: $endCursor) { issueCount nodes { ...pr } } }",
+        "variables": {"q": "is:pr label:ready repo:example-org/other", "type": "ISSUE", "limit": 30, "endCursor": null}
+    })
+    .to_string();
+    assert_eq!(
+        raw_json_request(
+            proxy_port,
+            "github-cli.test",
+            "/api/graphql",
+            "token",
+            &multi_token,
+            &search
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        raw_json_request(
+            proxy_port,
+            "github-cli.test",
+            "/api/graphql",
+            "token",
+            &token,
+            &search
+        )
+        .0,
+        403
+    );
+    assert_eq!(
+        raw_request_with_authorization(
+            proxy_port,
+            "github-cli.test",
+            "/api/v3/search/issues?q=repo%3Aexample-org%2Fexample-repo+is%3Apr",
+            &auth,
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        raw_request_with_authorization(
+            proxy_port,
+            "github-cli.test",
+            "/api/v3/search/issues?q=is%3Apr+author%3Asomeone",
+            &auth,
+        )
+        .0,
+        403
+    );
+
+    std::thread::sleep(Duration::from_millis(100));
+    let requests = upstream_reqs.lock().unwrap();
+    let request_lines = requests
+        .iter()
+        .map(|request| request.lines().next().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        request_lines,
+        [
+            "GET /repos/example-org/example-repo/issues/7/comments?per_page=100 HTTP/1.1",
+            "POST /graphql HTTP/1.1",
+            "POST /graphql HTTP/1.1",
+            "POST /graphql HTTP/1.1",
+            "POST /graphql HTTP/1.1",
+            "POST /graphql HTTP/1.1",
+            "POST /repos/example-org/example-repo/issues/7/labels HTTP/1.1",
+            "DELETE /repos/example-org/example-repo/issues/7/labels/review%3Aclaude HTTP/1.1",
+            "POST /graphql HTTP/1.1",
+            "GET /search/issues?q=repo%3Aexample-org%2Fexample-repo+is%3Apr HTTP/1.1",
+        ]
+    );
+    for (request, body) in requests[1..6].iter().zip(&mutations) {
+        assert!(request.ends_with(body.as_str()));
+    }
+    assert_eq!(
+        resolved_paths.lock().unwrap()[8..],
+        [
+            "/repos/example-org/other".to_string(),
+            "/repos/example-org/example-repo".to_string(),
+        ]
+    );
+
+    // Without a configured bot, identity requests still fail closed.
+    let unconfigured_port =
+        start_github_cli_proxy(mock_port, keystore, Arc::new(Mutex::new(Vec::new())), None);
+    assert_eq!(
+        raw_request_with_authorization(unconfigured_port, "github-cli.test", "/api/v3/user", &auth)
+            .0,
+        403
     );
 }
 
